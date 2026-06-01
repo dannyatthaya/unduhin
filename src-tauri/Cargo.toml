@@ -1,0 +1,61 @@
+[package]
+name = "unduhin-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Tauri shell for the Unduhin download manager."
+
+[lib]
+name = "unduhin_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "unduhin-app"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-clipboard-manager = "2"
+chrono = { workspace = true }
+
+engine = { path = "../crates/engine" }
+unduhin-core = { path = "../crates/core" }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+url = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+sysinfo = { version = "0.32", default-features = false, features = ["disk", "system"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# Match the version Tauri 2.11 already pulls in so `WebviewWindow::hwnd()`
+# returns the same `HWND` newtype the taskbar wrapper consumes.
+windows = { version = "0.61", features = [
+    "Win32_UI_Shell",
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+] }
+
+[features]
+default = []
+# `tauri-plugin-shell` etc. can be slotted in later; kept lean for now.

@@ -1,0 +1,63 @@
+[package]
+name = "unduhin-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Unduhin core: queue, persistence, categories, settings, event bus."
+build = "build.rs"
+
+[lib]
+name = "unduhin_core"
+path = "src/lib.rs"
+
+[dependencies]
+engine = { path = "../engine" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+url = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+futures = { workspace = true }
+sqlx = { workspace = true }
+chrono = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# Optional: TypeScript-type export for the wire contract. Gated
+# behind the `ts-rs-export` feature so normal builds don't pull it in.
+ts-rs = { version = "9", optional = true }
+
+[features]
+# Enables the `#[derive(TS)]` cfg_attrs on `crate::wire` types and the
+# `tests/export_wire_types.rs` test that writes the generated `.d.ts`
+# files. Run with `cargo test --features ts-rs-export export_wire_types`.
+ts-rs-export = ["dep:ts-rs"]
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# DPAPI (CryptProtectData / CryptUnprotectData) for encrypting captured
+# browser headers at rest. Match the version the Tauri shell already pins.
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+] }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = { workspace = true }
+anyhow = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+sha2 = { workspace = true }
+bytes = { workspace = true }
+url = { workspace = true }
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"

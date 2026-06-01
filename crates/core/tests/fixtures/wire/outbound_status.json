@@ -1,0 +1,13 @@
+{
+  "type": "status",
+  "downloads": [
+    {
+      "id": 1,
+      "url": "https://example.com/a.zip",
+      "filename": "a.zip",
+      "status": "active",
+      "totalBytes": 1024,
+      "downloadedBytes": 256
+    }
+  ]
+}

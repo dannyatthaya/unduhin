@@ -1,0 +1,307 @@
+{
+  "generated_at": "2026-06-01T08:52:23.2674420Z",
+  "rust": [
+    {
+      "name": "anyhow",
+      "version": "1.0.102",
+      "license": "MIT OR Apache-2.0",
+      "repository": "https://github.com/dtolnay/anyhow"
+    },
+    {
+      "name": "base64",
+      "version": "0.22.1",
+      "license": "MIT OR Apache-2.0",
+      "repository": "https://github.com/marshallpierce/rust-base64"
+    },
+    {
+      "name": "bytes",
+      "version": "1.11.1",
+      "license": "MIT",
+      "repository": "https://github.com/tokio-rs/bytes"
+    },
+    {
+      "name": "chrono",
+      "version": "0.4.44",
+      "license": "MIT OR Apache-2.0",
+      "repository": "https://github.com/chronotope/chrono"
+    },
+    {
+      "name": "clap",
+      "version": "4.6.1",
+      "license": "MIT OR Apache-2.0",
+      "repository": "https://github.com/clap-rs/clap"
+    },
+    {
+      "name": "futures",
+      "version": "0.3.32",
+      "license": "MIT OR Apache-2.0",
+      "repository": "https://github.com/rust-lang/futures-rs"
+    },
+    {
+      "name": "humantime",
+      "version": "2.3.0",
+      "license": "MIT OR Apache-2.0",
+      "repository": "https://github.com/chronotope/humantime"
+    },
+    {
+      "name": "indicatif",
+      "version": "0.17.11",
+      "license": "MIT",
+      "repository": "https://github.com/console-rs/indicatif"
+    },
+    {
+      "name": "reqwest",
+      "version": "0.13.3",
+      "license": "MIT OR Apache-2.0",
+      "repository": "https://github.com/seanmonstar/reqwest"
+    },
+    {
+      "name": "serde",
+      "version": "1.0.228",
+      "license": "MIT OR Apache-2.0",
+      "repository": "https://github.com/serde-rs/serde"
+    },
+    {
+      "name": "serde_json",
+      "version": "1.0.149",
+      "license": "MIT OR Apache-2.0",
+      "repository": "https://github.com/serde-rs/json"
+    },
+    {
+      "name": "sha2",
+      "version": "0.10.9",
+      "license": "MIT OR Apache-2.0",
+      "repository": "https://github.com/RustCrypto/hashes"
+    },
+    {
+      "name": "sqlx",
+      "version": "0.8.6",
+      "license": "MIT OR Apache-2.0",
+      "repository": "https://github.com/launchbadge/sqlx"
+    },
+    {
+      "name": "sysinfo",
+      "version": "0.32.1",
+      "license": "MIT",
+      "repository": "https://github.com/GuillaumeGomez/sysinfo"
+    },
+    {
+      "name": "tauri",
+      "version": "2.11.2",
+      "license": "Apache-2.0 OR MIT",
+      "repository": "https://github.com/tauri-apps/tauri"
+    },
+    {
+      "name": "tauri-plugin-autostart",
+      "version": "2.5.1",
+      "license": "Apache-2.0 OR MIT",
+      "repository": "https://github.com/tauri-apps/plugins-workspace"
+    },
+    {
+      "name": "tauri-plugin-clipboard-manager",
+      "version": "2.3.2",
+      "license": "Apache-2.0 OR MIT",
+      "repository": "https://github.com/tauri-apps/plugins-workspace"
+    },
+    {
+      "name": "tauri-plugin-dialog",
+      "version": "2.7.1",
+      "license": "Apache-2.0 OR MIT",
+      "repository": "https://github.com/tauri-apps/plugins-workspace"
+    },
+    {
+      "name": "tauri-plugin-notification",
+      "version": "2.3.3",
+      "license": "Apache-2.0 OR MIT",
+      "repository": "https://github.com/tauri-apps/plugins-workspace"
+    },
+    {
+      "name": "tauri-plugin-opener",
+      "version": "2.5.4",
+      "license": "Apache-2.0 OR MIT",
+      "repository": "https://github.com/tauri-apps/plugins-workspace"
+    },
+    {
+      "name": "tauri-plugin-process",
+      "version": "2.3.1",
+      "license": "Apache-2.0 OR MIT",
+      "repository": "https://github.com/tauri-apps/plugins-workspace"
+    },
+    {
+      "name": "tauri-plugin-single-instance",
+      "version": "2.4.2",
+      "license": "Apache-2.0 OR MIT",
+      "repository": "https://github.com/tauri-apps/plugins-workspace"
+    },
+    {
+      "name": "tauri-plugin-updater",
+      "version": "2.10.1",
+      "license": "Apache-2.0 OR MIT",
+      "repository": "https://github.com/tauri-apps/plugins-workspace"
+    },
+    {
+      "name": "thiserror",
+      "version": "2.0.18",
+      "license": "MIT OR Apache-2.0",
+      "repository": "https://github.com/dtolnay/thiserror"
+    },
+    {
+      "name": "tokio",
+      "version": "1.52.3",
+      "license": "MIT",
+      "repository": "https://github.com/tokio-rs/tokio"
+    },
+    {
+      "name": "tokio-util",
+      "version": "0.7.18",
+      "license": "MIT",
+      "repository": "https://github.com/tokio-rs/tokio"
+    },
+    {
+      "name": "tracing",
+      "version": "0.1.44",
+      "license": "MIT",
+      "repository": "https://github.com/tokio-rs/tracing"
+    },
+    {
+      "name": "tracing-subscriber",
+      "version": "0.3.23",
+      "license": "MIT",
+      "repository": "https://github.com/tokio-rs/tracing"
+    },
+    {
+      "name": "url",
+      "version": "2.5.8",
+      "license": "MIT OR Apache-2.0",
+      "repository": "https://github.com/servo/rust-url"
+    },
+    {
+      "name": "windows",
+      "version": "0.61.3",
+      "license": "MIT OR Apache-2.0",
+      "repository": "https://github.com/microsoft/windows-rs"
+    },
+    {
+      "name": "zip",
+      "version": "4.6.1",
+      "license": "MIT",
+      "repository": "https://github.com/zip-rs/zip2.git"
+    }
+  ],
+  "node": [
+    {
+      "name": "@tauri-apps/api",
+      "version": "2.11.0",
+      "license": "Apache-2.0 OR MIT",
+      "repository": "https://github.com/tauri-apps/tauri"
+    },
+    {
+      "name": "@tauri-apps/plugin-autostart",
+      "version": "2.5.1",
+      "license": "MIT OR Apache-2.0",
+      "repository": "https://github.com/tauri-apps/plugins-workspace"
+    },
+    {
+      "name": "@tauri-apps/plugin-clipboard-manager",
+      "version": "2.3.2",
+      "license": "MIT OR Apache-2.0",
+      "repository": "https://github.com/tauri-apps/plugins-workspace"
+    },
+    {
+      "name": "@tauri-apps/plugin-dialog",
+      "version": "2.7.1",
+      "license": "MIT OR Apache-2.0",
+      "repository": "https://github.com/tauri-apps/plugins-workspace"
+    },
+    {
+      "name": "@tauri-apps/plugin-notification",
+      "version": "2.3.3",
+      "license": "MIT OR Apache-2.0",
+      "repository": "https://github.com/tauri-apps/plugins-workspace"
+    },
+    {
+      "name": "@tauri-apps/plugin-opener",
+      "version": "2.5.4",
+      "license": "MIT OR Apache-2.0",
+      "repository": "https://github.com/tauri-apps/plugins-workspace"
+    },
+    {
+      "name": "@tauri-apps/plugin-process",
+      "version": "2.3.1",
+      "license": "MIT OR Apache-2.0",
+      "repository": "https://github.com/tauri-apps/plugins-workspace"
+    },
+    {
+      "name": "@tauri-apps/plugin-updater",
+      "version": "2.10.1",
+      "license": "MIT OR Apache-2.0",
+      "repository": "https://github.com/tauri-apps/plugins-workspace"
+    },
+    {
+      "name": "@vueuse/core",
+      "version": "11.3.0",
+      "license": "MIT",
+      "repository": "https://github.com/vueuse/vueuse"
+    },
+    {
+      "name": "class-variance-authority",
+      "version": "0.7.1",
+      "license": "Apache-2.0",
+      "repository": "https://github.com/joe-bell/cva"
+    },
+    {
+      "name": "clsx",
+      "version": "2.1.1",
+      "license": "MIT",
+      "repository": "lukeed/clsx"
+    },
+    {
+      "name": "lucide-vue-next",
+      "version": "0.460.0",
+      "license": "ISC",
+      "repository": "https://github.com/lucide-icons/lucide"
+    },
+    {
+      "name": "pinia",
+      "version": "2.3.1",
+      "license": "MIT",
+      "repository": "https://github.com/vuejs/pinia"
+    },
+    {
+      "name": "reka-ui",
+      "version": "2.9.8",
+      "license": "MIT",
+      "repository": "https://github.com/unovue/reka-ui"
+    },
+    {
+      "name": "tailwind-merge",
+      "version": "3.6.0",
+      "license": "MIT",
+      "repository": "https://github.com/dcastil/tailwind-merge"
+    },
+    {
+      "name": "vue",
+      "version": "3.5.34",
+      "license": "MIT",
+      "repository": "https://github.com/vuejs/core"
+    },
+    {
+      "name": "vue-draggable-plus",
+      "version": "0.6.1",
+      "license": "MIT",
+      "repository": "https://github.com/Alfred-Skyblue/vue-draggable-plus"
+    },
+    {
+      "name": "vue-i18n",
+      "version": "9.14.5",
+      "license": "MIT",
+      "repository": "https://github.com/intlify/vue-i18n"
+    },
+    {
+      "name": "vue-router",
+      "version": "4.6.4",
+      "license": "MIT",
+      "repository": "https://github.com/vuejs/router"
+    }
+  ]
+}

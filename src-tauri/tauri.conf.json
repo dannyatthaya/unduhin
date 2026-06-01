@@ -1,0 +1,68 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Unduhin",
+  "version": "1.0.0",
+  "identifier": "com.unduhin.app",
+  "build": {
+    "beforeDevCommand": "bun run --cwd ../frontend dev",
+    "devUrl": "http://localhost:5173",
+    "beforeBuildCommand": "bun run --cwd ../frontend build",
+    "frontendDist": "../frontend/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Unduhin",
+        "width": 1320,
+        "height": 820,
+        "minWidth": 1240,
+        "minHeight": 600,
+        "resizable": true,
+        "decorations": false,
+        "transparent": false,
+        "visible": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "nsis",
+      "msi"
+    ],
+    "icon": [
+      "icons/icon.ico",
+      "icons/icon.png"
+    ],
+    "publisher": "Unduhin",
+    "shortDescription": "A focused, segmented downloader for Windows.",
+    "longDescription": "Unduhin is a Windows download manager with reliable multi-segment downloading and a polished UI.",
+    "homepage": "https://github.com/dannyatthaya/unduhin",
+    "category": "Productivity",
+    "resources": {
+      "native-host/unduhin-native-host.exe": "native-host/unduhin-native-host.exe",
+      "native-host/com.unduhin.host.json": "native-host/com.unduhin.host.json"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "installerHooks": "./nsis-hooks/hooks.nsi",
+        "displayLanguageSelector": false
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "active": true,
+      "dialog": false,
+      "endpoints": [
+        "https://github.com/dannyatthaya/unduhin/releases/latest/download/latest-stable.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEE0RjkzQTA1RkNCQ0EyOTgKUldTWW9yejhCVHI1cE9jeUFNTWt3QmhlMEdZaVd1dVl5cmh1OWNHMWNCN0ZCdDl3TnU3OWhuWFIK"
+    }
+  }
+}

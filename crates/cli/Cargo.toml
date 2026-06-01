@@ -1,0 +1,26 @@
+[package]
+name = "cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Unduhin command-line interface."
+
+[[bin]]
+name = "unduhin"
+path = "src/main.rs"
+
+[dependencies]
+engine = { path = "../engine" }
+unduhin-core = { path = "../core" }
+tokio = { workspace = true }
+url = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+indicatif = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+humantime = { workspace = true }

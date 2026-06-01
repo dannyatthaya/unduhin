@@ -1,0 +1,14 @@
+{
+  "type": "downloadMedia",
+  "stream": {
+    "kind": "hls",
+    "manifestUrl": "https://example.com/master.m3u8",
+    "pageUrl": "https://example.com/watch",
+    "tabId": 11,
+    "suggestedFilename": "episode-1",
+    "referrer": null,
+    "userAgent": null,
+    "cookieHeader": null,
+    "requestHeaders": []
+  }
+}

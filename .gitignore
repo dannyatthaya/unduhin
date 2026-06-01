@@ -1,0 +1,45 @@
+# Rust / Cargo
+/target
+/target-tmp
+**/*.rs.bk
+*.pdb
+
+# Test artifacts
+*.unduhin-meta
+*.unduhin-meta.tmp
+
+# Local SQLite databases (the app's runtime DB lives outside the repo,
+# but ad-hoc test DBs can land here when --db is pointed at .)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# IDE
+/.vscode/*
+!/.vscode/settings.json
+!/.vscode/tasks.json
+!/.vscode/launch.json
+!/.vscode/extensions.json
+/.idea/
+*.iml
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Local Claude Code state
+/.claude
+
+# Environment variables
+.env
+
+unduhin-updater.key
+unduhin-updater.key.pub
+
+# The native-host binary is staged into src-tauri/native-host/
+# by build.rs from a separate target dir. The committed siblings are the
+# manifest template (com.unduhin.host.json) and the README; the binary
+# itself is built and copied on every cargo tauri build.
+/src-tauri/native-host/*.exe

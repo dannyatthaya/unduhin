@@ -1,0 +1,275 @@
+/* Popup styling. Design tokens mirror `frontend/src/style.css` so the
+   extension chrome looks like the same product. The popup is sized to
+   Chrome's 360px sweet spot for action UI. */
+
+:root {
+  --background: 0 0% 100%;
+  --foreground: 222 17% 14%;
+  --muted: 220 14% 96%;
+  --muted-foreground: 220 9% 46%;
+  --card: 0 0% 100%;
+  --primary: 221 83% 53%;
+  --primary-foreground: 0 0% 100%;
+  --border: 220 13% 91%;
+  --success: 142 64% 38%;
+  --warning: 38 86% 47%;
+  --danger: 0 72% 51%;
+  --radius: 0.625rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: 222 24% 9%;
+    --foreground: 220 16% 94%;
+    --muted: 222 18% 14%;
+    --muted-foreground: 220 12% 72%;
+    --card: 222 22% 13%;
+    --primary: 217 91% 62%;
+    --primary-foreground: 222 24% 9%;
+    --border: 222 16% 24%;
+    --success: 142 60% 50%;
+    --warning: 38 78% 52%;
+    --danger: 0 72% 60%;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  font-family: ui-sans-serif, system-ui, "Segoe UI", sans-serif;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+body {
+  width: 360px;
+  max-height: 480px;
+  background: hsl(var(--background));
+  color: hsl(var(--foreground));
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.bridge-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  background: hsl(var(--muted));
+  border-bottom: 1px solid hsl(var(--border));
+  font-weight: 500;
+}
+
+.bridge-status__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: hsl(var(--muted-foreground));
+  flex-shrink: 0;
+}
+
+.bridge-status[data-status="connected"] .bridge-status__dot {
+  background: hsl(var(--success));
+  box-shadow: 0 0 0 3px hsl(var(--success) / 0.18);
+}
+
+.bridge-status[data-status="reconnecting"] .bridge-status__dot {
+  background: hsl(var(--warning));
+  box-shadow: 0 0 0 3px hsl(var(--warning) / 0.18);
+}
+
+.bridge-status[data-status="disconnected"] .bridge-status__dot {
+  background: hsl(var(--danger));
+  box-shadow: 0 0 0 3px hsl(var(--danger) / 0.18);
+}
+
+.card {
+  padding: 12px 14px;
+  border-bottom: 1px solid hsl(var(--border));
+  overflow-y: auto;
+}
+
+.card:last-of-type {
+  border-bottom: none;
+}
+
+.card__title {
+  margin: 0 0 8px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-weight: 600;
+  color: hsl(var(--muted-foreground));
+}
+
+.card__heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.card__heading .card__title {
+  margin: 0;
+}
+
+.empty {
+  margin: 4px 0;
+  color: hsl(var(--muted-foreground));
+  font-size: 12px;
+}
+
+.media-list,
+.recent-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.media-list__item,
+.recent-list__item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: hsl(var(--card));
+  border: 1px solid hsl(var(--border));
+  border-radius: calc(var(--radius) - 2px);
+}
+
+.media-list__main,
+.recent-list__main {
+  flex: 1;
+  min-width: 0;
+}
+
+.media-list__name,
+.recent-list__name {
+  display: block;
+  font-weight: 500;
+  font-size: 12.5px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  overflow: hidden;
+}
+
+.media-list__meta,
+.recent-list__meta {
+  display: block;
+  font-size: 11px;
+  color: hsl(var(--muted-foreground));
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.recent-list__status {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: hsl(var(--muted));
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: lowercase;
+  letter-spacing: 0;
+  color: hsl(var(--muted-foreground));
+}
+
+.recent-list__status[data-status="completed"] {
+  background: hsl(var(--success) / 0.15);
+  color: hsl(var(--success));
+}
+
+.recent-list__status[data-status="failed"] {
+  background: hsl(var(--danger) / 0.15);
+  color: hsl(var(--danger));
+}
+
+.recent-list__status[data-status="paused"] {
+  background: hsl(var(--warning) / 0.15);
+  color: hsl(var(--warning));
+}
+
+.button {
+  appearance: none;
+  border: 1px solid hsl(var(--border));
+  background: hsl(var(--primary));
+  color: hsl(var(--primary-foreground));
+  border-color: hsl(var(--primary));
+  padding: 5px 10px;
+  border-radius: calc(var(--radius) - 4px);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.button:hover:not(:disabled) {
+  filter: brightness(1.05);
+}
+
+.link-button {
+  appearance: none;
+  background: none;
+  border: none;
+  color: hsl(var(--primary));
+  padding: 0;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.link-button:hover {
+  text-decoration: underline;
+}
+
+.footer {
+  display: flex;
+  justify-content: flex-end;
+  padding: 8px 14px;
+  background: hsl(var(--muted));
+  border-top: 1px solid hsl(var(--border));
+}
+
+.toast {
+  position: fixed;
+  bottom: 56px;
+  left: 14px;
+  right: 14px;
+  padding: 8px 12px;
+  background: hsl(var(--foreground));
+  color: hsl(var(--background));
+  border-radius: calc(var(--radius) - 2px);
+  font-size: 12px;
+  text-align: center;
+  opacity: 0;
+  transform: translateY(6px);
+  transition:
+    opacity 150ms ease-out,
+    transform 150ms ease-out;
+  pointer-events: none;
+}
+
+.toast.is-visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.toast[data-tone="error"] {
+  background: hsl(var(--danger));
+  color: white;
+}

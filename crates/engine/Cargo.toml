@@ -1,0 +1,33 @@
+[package]
+name = "engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Unduhin download engine — multi-segment HTTP downloader with resume."
+
+[dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+reqwest = { workspace = true }
+url = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+anyhow = { workspace = true }
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"

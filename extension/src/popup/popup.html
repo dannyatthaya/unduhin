@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Unduhin</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header class="bridge-status" data-status="reconnecting">
+      <span class="bridge-status__dot" aria-hidden="true"></span>
+      <span class="bridge-status__label" id="status-label">Connecting…</span>
+    </header>
+
+    <section class="card" aria-labelledby="media-title">
+      <h2 id="media-title" class="card__title">Media on this page</h2>
+      <ul class="media-list" id="media-list" hidden></ul>
+      <p class="empty" id="media-empty">No downloadable media detected on this page.</p>
+    </section>
+
+    <section class="card" aria-labelledby="recent-title">
+      <div class="card__heading">
+        <h2 id="recent-title" class="card__title">Recent downloads</h2>
+        <button type="button" id="refresh-button" class="link-button" title="Refresh status">
+          Refresh
+        </button>
+      </div>
+      <ul class="recent-list" id="recent-list" hidden></ul>
+      <p class="empty" id="recent-empty">No recent downloads.</p>
+    </section>
+
+    <footer class="footer">
+      <button type="button" id="options-link" class="link-button">Options</button>
+    </footer>
+
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Unduhin — Options</title>
+    <link rel="stylesheet" href="options.css" />
+  </head>
+  <body>
+    <div class="layout">
+      <aside class="nav" role="tablist" aria-label="Options sections">
+        <header class="nav__brand">
+          <span class="nav__title">Unduhin</span>
+          <span class="nav__subtitle">Browser integration</span>
+        </header>
+        <button type="button" class="nav__item is-active" data-section="general" role="tab">
+          General
+        </button>
+        <button type="button" class="nav__item" data-section="filters" role="tab">
+          Filters
+        </button>
+        <button type="button" class="nav__item" data-section="hosts" role="tab">
+          Hosts
+        </button>
+        <button type="button" class="nav__item" data-section="media" role="tab">
+          Media
+        </button>
+        <button type="button" class="nav__item" data-section="debug" role="tab">
+          Debug
+        </button>
+      </aside>
+
+      <main class="main">
+        <section class="panel is-active" data-section="general">
+          <header class="panel__header">
+            <h1 class="panel__title">General</h1>
+            <p class="panel__subtitle">Global toggles and the native host name.</p>
+          </header>
+          <div class="field field--row">
+            <div class="field__main">
+              <label for="setting-enabled" class="field__label">Enable extension</label>
+              <p class="field__hint">
+                When off, browser downloads pass through untouched.
+              </p>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="setting-enabled" data-setting="enabled" />
+              <span class="switch__slider"></span>
+            </label>
+          </div>
+          <div class="field">
+            <label for="setting-host" class="field__label">Native host name</label>
+            <p class="field__hint">
+              The registered Native Messaging host. Only change this if you
+              installed Unduhin with a custom host name.
+            </p>
+            <input
+              type="text"
+              id="setting-host"
+              data-setting="nativeHostName"
+              autocomplete="off"
+              spellcheck="false"
+            />
+            <p class="field__error" data-error-for="nativeHostName" hidden></p>
+          </div>
+        </section>
+
+        <section class="panel" data-section="filters" hidden>
+          <header class="panel__header">
+            <h1 class="panel__title">Filters</h1>
+            <p class="panel__subtitle">
+              Decide which downloads Unduhin captures. Empty fields are
+              treated as "no filter".
+            </p>
+          </header>
+          <div class="field">
+            <label for="setting-min-size" class="field__label">Minimum file size (MB)</label>
+            <p class="field__hint">
+              Smaller files pass through to the browser. Set to 0 to capture
+              everything.
+            </p>
+            <input
+              type="number"
+              id="setting-min-size"
+              data-setting="minSizeMb"
+              min="0"
+              step="0.1"
+              inputmode="decimal"
+            />
+            <p class="field__error" data-error-for="minSizeMb" hidden></p>
+          </div>
+          <div class="field">
+            <label for="setting-allowlist" class="field__label">
+              Extension allowlist
+            </label>
+            <p class="field__hint">
+              Comma-separated. When set, only these extensions are intercepted.
+              Leave blank to allow everything not on the blocklist.
+            </p>
+            <textarea
+              id="setting-allowlist"
+              data-setting="extensionAllowlist"
+              data-list-style="comma"
+              rows="2"
+              placeholder="zip, iso, mp4"
+            ></textarea>
+          </div>
+          <div class="field">
+            <label for="setting-blocklist" class="field__label">
+              Extension blocklist
+            </label>
+            <p class="field__hint">
+              Comma-separated. These extensions are always passed through.
+            </p>
+            <textarea
+              id="setting-blocklist"
+              data-setting="extensionBlocklist"
+              data-list-style="comma"
+              rows="2"
+              placeholder="html, pdf, txt, json"
+            ></textarea>
+          </div>
+        </section>
+
+        <section class="panel" data-section="hosts" hidden>
+          <header class="panel__header">
+            <h1 class="panel__title">Hosts</h1>
+            <p class="panel__subtitle">
+              Per-host overrides. One host per line. Supports a leading
+              <code>*.</code> wildcard (e.g. <code>*.example.com</code>).
+            </p>
+          </header>
+          <div class="field">
+            <label for="setting-blocked-hosts" class="field__label">Blocked hosts</label>
+            <p class="field__hint">Never intercept from these hosts.</p>
+            <textarea
+              id="setting-blocked-hosts"
+              data-setting="blockedHosts"
+              data-list-style="lines"
+              rows="4"
+              placeholder="github.com&#10;*.internal.corp"
+            ></textarea>
+          </div>
+          <div class="field">
+            <label for="setting-always-hosts" class="field__label">
+              Always-intercept hosts
+            </label>
+            <p class="field__hint">
+              Bypass size + extension filters for these hosts.
+            </p>
+            <textarea
+              id="setting-always-hosts"
+              data-setting="alwaysInterceptHosts"
+              data-list-style="lines"
+              rows="4"
+              placeholder="drive.google.com&#10;*.mediafire.com"
+            ></textarea>
+          </div>
+        </section>
+
+        <section class="panel" data-section="media" hidden>
+          <header class="panel__header">
+            <h1 class="panel__title">Media</h1>
+            <p class="panel__subtitle">Streaming manifest detection.</p>
+          </header>
+          <div class="field field--row">
+            <div class="field__main">
+              <label for="setting-hls" class="field__label">Detect HLS streams</label>
+              <p class="field__hint">
+                Watch for <code>.m3u8</code> manifests so the popup can offer
+                a download.
+              </p>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="setting-hls" data-setting="detectHls" />
+              <span class="switch__slider"></span>
+            </label>
+          </div>
+          <div class="field field--row">
+            <div class="field__main">
+              <label for="setting-dash" class="field__label">Detect DASH streams</label>
+              <p class="field__hint">Watch for <code>.mpd</code> manifests.</p>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="setting-dash" data-setting="detectDash" />
+              <span class="switch__slider"></span>
+            </label>
+          </div>
+        </section>
+
+        <section class="panel" data-section="debug" hidden>
+          <header class="panel__header">
+            <h1 class="panel__title">Debug</h1>
+            <p class="panel__subtitle">
+              Diagnostics for the service worker. Output goes to the
+              extension's background console.
+            </p>
+          </header>
+          <div class="field field--row">
+            <div class="field__main">
+              <label for="setting-verbose" class="field__label">
+                Verbose logging
+              </label>
+              <p class="field__hint">
+                Logs every webRequest, interceptor decision, and bridge
+                state change. Off by default — chatty.
+              </p>
+            </div>
+            <label class="switch">
+              <input
+                type="checkbox"
+                id="setting-verbose"
+                data-setting="verboseLogging"
+              />
+              <span class="switch__slider"></span>
+            </label>
+          </div>
+        </section>
+
+        <footer class="footer">
+          <span class="toast" id="save-toast" aria-live="polite">Saved</span>
+        </footer>
+      </main>
+    </div>
+    <script type="module" src="options.js"></script>
+  </body>
+</html>

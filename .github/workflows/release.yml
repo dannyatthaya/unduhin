@@ -1,0 +1,121 @@
+name: Release
+
+on:
+  # Primary release path is local: scripts/release.ps1 -Publish.
+  # This workflow is kept only as a manual fallback for when the dev box
+  # is unavailable. The tag trigger is intentionally disabled so a local
+  # publish doesn't kick off a redundant (and very slow) CI build.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Semver to release (no v prefix)"
+        required: true
+      channel:
+        description: "Update channel"
+        required: true
+        default: "stable"
+        type: choice
+        options: [stable, beta]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build & release
+    runs-on: windows-latest
+    env:
+      VERSION:  ${{ github.event.inputs.version || github.ref_name }}
+      CHANNEL:  ${{ github.event.inputs.channel || 'stable' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Strip leading "v" from tag (if present)
+        shell: pwsh
+        run: |
+          $v = "${{ env.VERSION }}"
+          if ($v.StartsWith("v")) { $v = $v.Substring(1) }
+          echo "VERSION=$v" >> $env:GITHUB_ENV
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2"
+
+      - name: Install cargo-edit (for version sync)
+        run: cargo install cargo-edit
+
+      - name: Sync version
+        shell: pwsh
+        run: pwsh scripts/bump-version.ps1 -Version $env:VERSION
+
+      - name: Install frontend deps
+        run: npm --prefix frontend ci
+
+      - name: Generate licences manifest
+        shell: pwsh
+        run: pwsh scripts/generate-licences.ps1
+
+      - name: Run tests
+        run: cargo test --workspace
+
+      - name: Build (NSIS + MSI)
+        env:
+          TAURI_SIGNING_PRIVATE_KEY:           ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD:  ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: cargo tauri build --bundles nsis,msi
+
+      - name: Sign artefacts (no-op without thumbprint)
+        if: ${{ vars.SIGN_CERT_THUMBPRINT != '' }}
+        shell: pwsh
+        run: pwsh scripts/sign-artifacts.ps1 -Thumbprint $env:SIGN_CERT_THUMBPRINT
+        env:
+          SIGN_CERT_THUMBPRINT: ${{ vars.SIGN_CERT_THUMBPRINT }}
+
+      - name: Build updater manifest
+        shell: pwsh
+        run: |
+          $bundleRoot = "target\release\bundle\nsis"
+          $archive = Get-ChildItem -Path $bundleRoot -Filter "*.nsis.zip" | Select-Object -First 1
+          if (-not $archive) { throw "no .nsis.zip artefact produced — updater plugin disabled?" }
+          $sig = Get-ChildItem -Path $bundleRoot -Filter "$($archive.Name).sig" | Select-Object -First 1
+          if (-not $sig) { throw "no signature file next to $($archive.Name)" }
+          $base = "https://github.com/${{ github.repository }}/releases/download/v$env:VERSION"
+          pwsh scripts/build-update-manifest.ps1 `
+            -Version $env:VERSION `
+            -Channel $env:CHANNEL `
+            -ArtifactPath $archive.FullName `
+            -SigPath $sig.FullName `
+            -ReleaseUrlBase $base `
+            -Notes "See release notes on GitHub." `
+            -OutFile "target\release\bundle\latest-$env:CHANNEL.json"
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.VERSION }}
+          name: Unduhin v${{ env.VERSION }}
+          generate_release_notes: true
+          files: |
+            target/release/bundle/nsis/*.exe
+            target/release/bundle/nsis/*.nsis.zip
+            target/release/bundle/nsis/*.nsis.zip.sig
+            target/release/bundle/msi/*.msi
+            target/release/bundle/latest-*.json

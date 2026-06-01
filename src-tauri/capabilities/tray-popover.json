@@ -1,0 +1,20 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "tray-popover",
+  "description": "Borderless 280x220 always-on-top popover surfaced from the system tray.",
+  "windows": [
+    "tray-popover"
+  ],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:window:default",
+    "core:window:allow-hide",
+    "core:window:allow-show",
+    "core:window:allow-set-focus",
+    "core:window:allow-set-position",
+    "core:window:allow-unminimize",
+    "core:webview:default",
+    "core:app:default"
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "type": "download",
+  "job": {
+    "finalUrl": "https://cdn.example.com/file.zip",
+    "originalUrl": "https://example.com/download",
+    "referrer": "https://example.com/page",
+    "filename": "file.zip",
+    "mime": "application/zip",
+    "size": 123456,
+    "cookieHeader": "session=abc; csrf=xyz",
+    "userAgent": "Mozilla/5.0 (X11)",
+    "requestHeaders": [
+      { "name": "Accept", "value": "*/*" }
+    ],
+    "tabId": 7,
+    "pageUrl": "https://example.com/page"
+  }
+}

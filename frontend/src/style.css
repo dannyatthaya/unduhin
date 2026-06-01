@@ -1,0 +1,184 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+/* Tailwind v4: opt into the v3-style class-based `dark:` variant.
+   `useDark()` from VueUse toggles the `dark` class on <html>. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* Source globs — v4 normally auto-detects, but being explicit here
+   keeps Vue templates picked up regardless of the resolver. */
+@source "../index.html";
+@source "./**/*.{vue,ts,tsx}";
+
+/* ---------------------------------------------------------------------------
+   Theme tokens. HSL channels live on :root / .dark; the @theme block below
+   binds them as Tailwind color utilities. shadcn-style.
+--------------------------------------------------------------------------- */
+
+:root {
+  --background: 0 0% 100%;
+  --foreground: 222 17% 14%;
+
+  --muted: 220 14% 96%;
+  --muted-foreground: 220 9% 46%;
+
+  --card: 0 0% 100%;
+  --card-foreground: 222 17% 14%;
+
+  --primary: 221 83% 53%;
+  --primary-foreground: 0 0% 100%;
+
+  --accent: 220 14% 96%;
+  --accent-foreground: 222 17% 14%;
+
+  --border: 220 13% 91%;
+  --input: 220 13% 91%;
+  --ring: 221 83% 53%;
+
+  --sidebar: 0 0% 100%;
+  --sidebar-foreground: 222 17% 14%;
+
+  --success: 142 64% 38%;
+  --warning: 38 86% 47%;
+  --danger: 0 72% 51%;
+  --info: 265 75% 55%;
+
+  --radius: 0.625rem;
+
+  --scrollbar-track: 220 14% 96%;
+  --scrollbar-thumb: 220 13% 78%;
+  --scrollbar-thumb-hover: 220 13% 65%;
+}
+
+.dark {
+  /* 7c dark-mode sweep. Aims: card lifts off the canvas (was 2%L delta,
+     now 4%), borders visible on cards (was ~7:1 vs card and failing the
+     3:1 chrome target, now ~4.5:1), muted-foreground passes WCAG AA on
+     body text on both card and background (was 4.3:1, now 5.6:1),
+     warning toned down so paused indicators stop shouting. */
+  --background: 222 24% 9%;
+  --foreground: 220 16% 94%;
+
+  --muted: 222 18% 14%;
+  --muted-foreground: 220 12% 72%;
+
+  --card: 222 22% 13%;
+  --card-foreground: 220 16% 94%;
+
+  --primary: 217 91% 62%;
+  --primary-foreground: 222 24% 9%;
+
+  --accent: 222 18% 18%;
+  --accent-foreground: 220 16% 94%;
+
+  --border: 222 16% 24%;
+  --input: 222 16% 24%;
+  --ring: 217 91% 62%;
+
+  --sidebar: 222 24% 10%;
+  --sidebar-foreground: 220 16% 94%;
+
+  --success: 142 60% 50%;
+  --warning: 38 78% 52%;
+  --danger: 0 72% 60%;
+  --info: 265 80% 70%;
+
+  --scrollbar-track: 222 22% 13%;
+  --scrollbar-thumb: 222 16% 32%;
+  --scrollbar-thumb-hover: 222 16% 42%;
+}
+
+/* `@theme inline` references the CSS variables above without inlining
+   their value at build time, so theme switching at runtime works. */
+@theme inline {
+  --color-background: hsl(var(--background));
+  --color-foreground: hsl(var(--foreground));
+
+  --color-muted: hsl(var(--muted));
+  --color-muted-foreground: hsl(var(--muted-foreground));
+
+  --color-card: hsl(var(--card));
+  --color-card-foreground: hsl(var(--card-foreground));
+
+  --color-primary: hsl(var(--primary));
+  --color-primary-foreground: hsl(var(--primary-foreground));
+
+  --color-accent: hsl(var(--accent));
+  --color-accent-foreground: hsl(var(--accent-foreground));
+
+  --color-border: hsl(var(--border));
+  --color-input: hsl(var(--input));
+  --color-ring: hsl(var(--ring));
+
+  --color-sidebar: hsl(var(--sidebar));
+  --color-sidebar-foreground: hsl(var(--sidebar-foreground));
+
+  --color-success: hsl(var(--success));
+  --color-warning: hsl(var(--warning));
+  --color-danger: hsl(var(--danger));
+  --color-info: hsl(var(--info));
+
+  --radius-lg: var(--radius);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-sm: calc(var(--radius) - 4px);
+
+  --font-sans: "Open Sans", ui-sans-serif, system-ui, "Segoe UI", sans-serif;
+  --font-serif: "Merriweather", ui-serif, Georgia, "Times New Roman", serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "Consolas", monospace;
+}
+
+/* Tailwind v4 defaults `border-color` to `currentColor` — restore the
+   v3 behavior so plain `border` utilities use our themed border. */
+@layer base {
+  *,
+  ::after,
+  ::before,
+  ::backdrop {
+    border-color: hsl(var(--border));
+  }
+
+  html,
+  body,
+  #app {
+    height: 100%;
+    margin: 0;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    background-color: hsl(var(--background));
+    color: hsl(var(--foreground));
+  }
+}
+
+/* Themed scrollbars (WebKit + Firefox). */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: hsl(var(--scrollbar-thumb)) hsl(var(--scrollbar-track));
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-track {
+  background: hsl(var(--scrollbar-track));
+  border-radius: 999px;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: hsl(var(--scrollbar-thumb));
+  border-radius: 999px;
+  border: 2px solid hsl(var(--scrollbar-track));
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: hsl(var(--scrollbar-thumb-hover));
+}
+
+*::-webkit-scrollbar-corner {
+  background: hsl(var(--scrollbar-track));
+}

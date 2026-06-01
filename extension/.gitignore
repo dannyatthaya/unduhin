@@ -1,0 +1,9 @@
+node_modules/
+dist/
+
+# Local RSA-2048 key whose public half is baked into `manifest.json#key`.
+# The committed key in the manifest is enough for Chrome to derive the
+# stable dev extension ID; the private key only matters if you ever pack
+# a .crx, which we don't do in dev. Keep it out of git so the repo never
+# carries an unencrypted private key.
+.dev-key.pem

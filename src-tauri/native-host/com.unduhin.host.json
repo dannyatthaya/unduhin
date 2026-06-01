@@ -1,0 +1,9 @@
+{
+  "name": "com.unduhin.host",
+  "description": "Unduhin native messaging host",
+  "path": "PLACEHOLDER_ABS_PATH",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://blbgjagjodpiiclpecohlfhebgddkejn/"
+  ]
+}
