@@ -346,7 +346,10 @@ async fn full_download_matches_sha256() -> Result<()> {
 
     let summary = download(opts, CancellationToken::new(), None).await?;
     assert_eq!(summary.bytes, server.payload().len() as u64);
-    assert_eq!(summary.segments, 4);
+    // Slow-start: a tiny local file finishes before the ramp adds any
+    // connections, so it stays at one segment. Multi-segment assembly is
+    // covered by `re_segments_*` and the ramp tests.
+    assert!(summary.segments >= 1);
     assert!(!summary.resumed);
 
     let bytes = std::fs::read(&out)?;
@@ -460,7 +463,7 @@ async fn segment_progress_carries_speed_state_and_eventual_done() -> Result<()> 
     // model. Catches any drift introduced by the refactor.
     let bytes = std::fs::read(&out)?;
     assert_eq!(sha256_hex(&bytes), sha256_hex(server.payload()));
-    assert_eq!(summary.segments, 4);
+    assert!(summary.segments >= 1);
 
     let segment_events: Vec<_> = events
         .iter()
@@ -505,15 +508,18 @@ async fn segment_progress_carries_speed_state_and_eventual_done() -> Result<()> 
     // race against worker completion, so run_transfer also emits a
     // synthetic final Done per segment — this assertion locks both
     // paths in.
-    let mut done_seen = [false; 4];
+    let mut done_seen = vec![false; summary.segments];
     for (idx, _, state, _, _) in &segment_events {
         if matches!(state, SegmentRuntimeState::Done) {
-            done_seen[*idx] = true;
+            if let Some(slot) = done_seen.get_mut(*idx) {
+                *slot = true;
+            }
         }
     }
     assert!(
         done_seen.iter().all(|b| *b),
-        "expected Done for all 4 segments, got {done_seen:?}"
+        "expected Done for all {} segments, got {done_seen:?}",
+        summary.segments
     );
 
     server.stop().await;
@@ -732,11 +738,13 @@ async fn single_use_token_downloads_in_one_get() -> Result<()> {
 }
 
 #[tokio::test]
-async fn falls_back_to_single_stream_when_segments_rejected() -> Result<()> {
-    // The pixeldrain/Cloudflare case: range-capable, the verify probe and a
-    // single connection are fine, but the parallel offset segments are 403'd
-    // (per-file connection cap). The engine must catch the rejection and
-    // retry over one connection instead of failing the whole download.
+async fn offset_range_rejection_still_completes() -> Result<()> {
+    // The pixeldrain/Cloudflare shape: range-capable, the verify probe
+    // (bytes=0-0) and a single connection are fine, but offset ranges are
+    // 403'd (per-file connection cap). Slow-start covers this for free: the
+    // first connection covers the whole file from offset 0, and any ramp
+    // probe for an offset range is refused, so the download completes on a
+    // single connection (byte-exact) rather than failing.
     let server = TestServer::start(ServerMode::RejectOffsetRanges).await?;
     let tmp = tempfile::tempdir()?;
     let out = tmp.path().join("rejected.bin");
@@ -744,7 +752,7 @@ async fn falls_back_to_single_stream_when_segments_rejected() -> Result<()> {
 
     let summary = download(opts, CancellationToken::new(), None).await?;
     assert_eq!(summary.bytes, server.payload().len() as u64);
-    assert_eq!(summary.segments, 1, "must collapse to a single connection");
+    assert_eq!(summary.segments, 1, "completes on a single connection");
 
     let bytes = std::fs::read(&out)?;
     assert_eq!(sha256_hex(&bytes), sha256_hex(server.payload()));

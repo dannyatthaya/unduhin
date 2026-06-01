@@ -136,10 +136,27 @@ pub async fn download_with_control(
     let truly_segmented = wants_segments && verify_range_support(&client, &opts.url).await?;
 
     if truly_segmented {
-        // Fast path: many connections, each fetching its own byte range.
-        // Drop the initial (non-range) body; the workers issue ranged GETs.
+        // Slow-start: begin with ONE connection over the whole file and let
+        // the transfer ramp up toward `opts.segments`, backing off if the
+        // host refuses a new connection. Starting at one (then adding,
+        // confirm-before-commit) avoids the all-at-once burst that trips
+        // per-IP connection caps (pixeldrain/Cloudflare). Drop the initial
+        // non-range body; worker 0 issues its own ranged GET.
         drop(resp);
-        let meta = build_initial_meta(&opts, &info, true);
+        let total = info.content_length.unwrap_or(0);
+        let meta = Meta::new(
+            opts.url.to_string(),
+            opts.output.clone(),
+            info.content_length,
+            info.etag.clone(),
+            info.last_modified.clone(),
+            true,
+            vec![Segment {
+                index: 0,
+                start: 0,
+                end: total,
+            }],
+        );
         meta.save(&meta_path).await?;
         preallocate(&opts.output, meta.total_bytes).await?;
         let content_type = info.content_type.clone();
@@ -158,14 +175,15 @@ pub async fn download_with_control(
             control_rx,
             content_type,
             None,
+            Some(opts.segments),
         )
         .await
         {
             Err(ref e) if looks_like_concurrency_limit(e) => {
-                // The host rejected the parallel connections (e.g. pixeldrain
-                // behind Cloudflare 403s the excess) — but a single
-                // connection, like a browser, works. Retry single-stream;
-                // the `preallocate` inside truncates the partial segments.
+                // Even the first ranged connection was refused (some hosts
+                // 403 every Range yet serve one plain GET, like a browser).
+                // Fall back to single-stream; `preallocate` truncates any
+                // partial bytes.
                 tracing::warn!(
                     error = %e,
                     "segmented transfer rejected; retrying single-stream"
@@ -194,6 +212,7 @@ pub async fn download_with_control(
         control_rx,
         content_type,
         Some(resp),
+        None,
     )
     .await
 }
@@ -226,6 +245,7 @@ async fn single_stream_download(
         None,
         content_type,
         Some(resp),
+        None,
     )
     .await
 }
@@ -346,7 +366,7 @@ pub async fn resume_at_with_control(
 
     let content_type = info.content_type.clone();
     run_transfer(
-        client, opts, meta, meta_path, cancel, tx, true, control_rx, content_type, None,
+        client, opts, meta, meta_path, cancel, tx, true, control_rx, content_type, None, None,
     )
     .await
 }

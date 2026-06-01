@@ -46,6 +46,12 @@ use crate::segment::Segment;
 
 pub(crate) const TICK_INTERVAL: Duration = Duration::from_millis(250);
 pub(crate) const SPEED_ALPHA: f64 = 0.3;
+
+/// Slow-start cadence: when ramping toward the target connection count, add
+/// at most one connection per interval. Each add is confirm-before-commit
+/// (see [`try_probe_and_split`]), so we never burst — the gap just paces
+/// how quickly a healthy host reaches full parallelism (~target × interval).
+const RAMP_INTERVAL: Duration = Duration::from_millis(500);
 const WRITE_CHUNK_FLUSH_BYTES: u64 = 64 * 1024;
 
 /// A worker that produced zero bytes for at least this long is reported
@@ -85,6 +91,11 @@ pub(crate) async fn run_transfer(
     mut control_rx: Option<mpsc::Receiver<Control>>,
     content_type: Option<String>,
     prefetched: Option<reqwest::Response>,
+    // When `Some(n)`, slow-start: begin with the segments already in `meta`
+    // (normally one) and ramp the connection count up toward `n`, backing
+    // off if the host refuses a new connection. `None` keeps the fixed
+    // plan in `meta` (resume / single-stream).
+    ramp_target: Option<usize>,
 ) -> Result<DownloadSummary> {
     let total = meta.total_bytes;
     let initial_segment_count = meta.segments.len();
@@ -107,7 +118,11 @@ pub(crate) async fn run_transfer(
         backoff: opts.backoff,
         ranges_supported,
         senders: Mutex::new(Vec::with_capacity(initial_segment_count)),
-        prefetched: Mutex::new(prefetched),
+        prefetched: Mutex::new(
+            prefetched
+                .map(|r| std::collections::HashMap::from([(0usize, r)]))
+                .unwrap_or_default(),
+        ),
     });
 
     let mut workers: JoinSet<Result<()>> = JoinSet::new();
@@ -151,6 +166,7 @@ pub(crate) async fn run_transfer(
         &cancel,
         &mut workers,
         &mut control_rx,
+        ramp_target,
     )
     .await
     {
@@ -250,7 +266,17 @@ async fn supervisor_loop(
     cancel: &CancellationToken,
     workers: &mut JoinSet<Result<()>>,
     control_rx: &mut Option<mpsc::Receiver<Control>>,
+    ramp_target: Option<usize>,
 ) -> Result<()> {
+    // Auto-ramp state. Only active for range-capable fresh downloads that
+    // asked for more than one connection; disabled the moment the user
+    // drives segmentation manually (they take over).
+    let target = ramp_target.unwrap_or(0);
+    let mut ramping = shared.ranges_supported && target > 1;
+    let mut ramp_timer = tokio::time::interval(RAMP_INTERVAL);
+    ramp_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ramp_timer.tick().await; // consume the immediate first tick → first add is delayed
+
     loop {
         if workers.is_empty() {
             return Ok(());
@@ -271,6 +297,7 @@ async fn supervisor_loop(
             ctrl = recv_optional(control_rx) => {
                 match ctrl {
                     Some(Control::SetSegments { n, ack }) => {
+                        ramping = false; // manual override wins
                         let res = apply_set_segments(
                             shared, client, url, cancel, workers, n,
                         ).await;
@@ -281,6 +308,16 @@ async fn supervisor_loop(
                         // it but keep driving workers to completion.
                         *control_rx = None;
                     }
+                }
+            }
+            _ = ramp_timer.tick(), if ramping => {
+                if active_worker_count(shared).await >= target
+                    || !try_probe_and_split(shared, client, url, cancel, workers).await
+                {
+                    // Reached the target, or the host refused another
+                    // connection (cap) / the probe failed — stop growing
+                    // and let the established connections finish.
+                    ramping = false;
                 }
             }
         }
@@ -418,6 +455,115 @@ async fn try_split_one(
     Ok(true)
 }
 
+/// Confirm-before-commit split, used by the auto-ramp. Unlike
+/// [`try_split_one`] (which shrinks the donor *then* lets the new worker
+/// fetch), this opens the new connection FIRST and only commits the split
+/// once the server answers `206`. So a connection the host refuses (its
+/// concurrency cap) costs nothing — no range is orphaned and the donor
+/// keeps going untouched. Returns `true` when a connection was added,
+/// `false` when the ramp should stop (no splittable donor, refusal, or a
+/// probe error — all non-fatal; the established connections finish).
+async fn try_probe_and_split(
+    shared: &Arc<SharedState>,
+    client: &Client,
+    url: &Url,
+    cancel: &CancellationToken,
+    workers: &mut JoinSet<Result<()>>,
+) -> bool {
+    // Pick a donor and a split point WITHOUT mutating the plan yet.
+    let (donor_idx, midpoint, original_end, validator) = {
+        let m = shared.meta.lock().await;
+        let senders = shared.senders.lock().await;
+        let Some(donor_idx) = pick_donor(&m, &senders) else {
+            return false;
+        };
+        let s = &m.segments[donor_idx];
+        let start = s.segment.start;
+        let original_end = s.segment.end;
+        let bd = s.bytes_downloaded;
+        let remaining = original_end.saturating_sub(start + bd);
+        if remaining < 2 {
+            return false;
+        }
+        let midpoint = start + bd + remaining / 2;
+        let validator = m.etag.clone().or_else(|| m.last_modified.clone());
+        (donor_idx, midpoint, original_end, validator)
+    };
+
+    // Open the tail range and confirm 206 before touching the plan.
+    let mut req = client
+        .get(url.clone())
+        .header(RANGE, format!("bytes={}-{}", midpoint, original_end - 1));
+    if let Some(v) = validator.as_deref() {
+        if let Ok(value) = reqwest::header::HeaderValue::from_str(v) {
+            req = req.header(IF_RANGE, value);
+        }
+    }
+    let resp = tokio::select! {
+        _ = cancel.cancelled() => return false,
+        r = req.send() => match r {
+            Ok(r) => r,
+            Err(_) => return false, // probe failed → stop ramping (non-fatal)
+        },
+    };
+    if resp.status() != StatusCode::PARTIAL_CONTENT {
+        // 403/429/… (cap reached) or 200 (range ignored) → stop ramping.
+        return false;
+    }
+
+    // Confirmed. Commit: shrink the donor (the donor worker may have read
+    // past `midpoint` while we probed — the new worker simply rewrites that
+    // overlap with identical bytes, as live-split already does), register
+    // the new segment, hand it the open 206 body, and spawn its worker.
+    let new_index = {
+        let mut m = shared.meta.lock().await;
+        m.segments[donor_idx].segment.end = midpoint;
+        let new_index = m.segments.len();
+        m.segments.push(SegmentState {
+            segment: Segment {
+                index: new_index,
+                start: midpoint,
+                end: original_end,
+            },
+            bytes_downloaded: 0,
+        });
+        new_index
+    };
+    shared.prefetched.lock().await.insert(new_index, resp);
+
+    let (tx_seg, rx_seg) = mpsc::channel::<Segment>(16);
+    let new_segment = Segment {
+        index: new_index,
+        start: midpoint,
+        end: original_end,
+    };
+    if tx_seg.send(new_segment).await.is_err() {
+        shared.prefetched.lock().await.remove(&new_index);
+        return false;
+    }
+    {
+        let mut senders = shared.senders.lock().await;
+        while senders.len() < new_index {
+            senders.push(None);
+        }
+        if senders.len() == new_index {
+            senders.push(Some(tx_seg));
+        } else {
+            senders[new_index] = Some(tx_seg);
+        }
+    }
+    spawn_worker(
+        workers,
+        client.clone(),
+        url.clone(),
+        new_index,
+        rx_seg,
+        shared.clone(),
+        cancel.clone(),
+    );
+    true
+}
+
 fn pick_donor(meta: &Meta, senders: &[Option<mpsc::Sender<Segment>>]) -> Option<usize> {
     let mut best: Option<(usize, u64)> = None;
     for (i, sender) in senders.iter().enumerate() {
@@ -478,14 +624,16 @@ pub(crate) struct SharedState {
     pub(crate) backoff: Backoff,
     pub(crate) ranges_supported: bool,
     pub(crate) senders: Mutex<Vec<Option<mpsc::Sender<Segment>>>>,
-    /// Body of the engine's initial GET, handed to the lone single-stream
-    /// worker so it streams from the request the engine already opened
-    /// instead of issuing a second GET. `None` for segmented / resume
-    /// transfers. Taken exactly once by the index-0 worker's first
-    /// attempt; a retry (or any other worker) sees `None` and opens a
-    /// fresh request. This is what lets one-time-token hosts succeed: a
-    /// browser makes one GET, and so do we.
-    pub(crate) prefetched: Mutex<Option<reqwest::Response>>,
+    /// Already-open response bodies, keyed by segment index, handed to a
+    /// worker so it streams from a request the engine already opened
+    /// instead of issuing another GET. Two producers: index 0 for the
+    /// single-stream initial no-range GET (so a one-time-token host is
+    /// fetched in exactly one request, like a browser), and ramp indices
+    /// for the confirmed `206` from a probe-split (see
+    /// [`try_probe_and_split`]). Each entry is taken once, on that worker's
+    /// first attempt (`already == 0`); a retry finds it gone and opens a
+    /// fresh request.
+    pub(crate) prefetched: Mutex<std::collections::HashMap<usize, reqwest::Response>>,
 }
 
 /// Per-worker state owned by the ticker. The classification rules need
@@ -796,12 +944,12 @@ async fn try_segment(
         ));
     }
 
-    // Single-stream first attempt: stream the body from the GET the engine
-    // already opened (the initial probe-and-fetch) rather than issuing a
-    // second request. A retry — or any segmented worker — finds it gone
-    // (`None`) and falls back to a fresh `req.send()`.
-    let resp = if !shared.ranges_supported && index == 0 && already == 0 {
-        match shared.prefetched.lock().await.take() {
+    // First attempt for this segment: if the engine already opened a
+    // response for it (single-stream initial GET, or a confirmed ramp
+    // probe), stream from that instead of issuing another request. A retry
+    // finds the slot empty and opens a fresh request.
+    let resp = if already == 0 {
+        match shared.prefetched.lock().await.remove(&index) {
             Some(prefetched) => prefetched,
             None => req.send().await?,
         }
