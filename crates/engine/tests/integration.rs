@@ -70,6 +70,20 @@ enum ServerMode {
     /// before any bytes are sent — gives a cancellation test enough
     /// wall-clock to actually fire mid-transfer.
     Slow { delay_ms: u64 },
+    /// One-time / session-bound link: the FIRST request (any method)
+    /// returns the full body; every later request returns an empty 200.
+    /// No `Accept-Ranges` — a single-stream, browser-like host. Models
+    /// one-click file hosts (e.g. fuckingfast.co) where a HEAD probe
+    /// would spend the token before the real GET.
+    SingleUseToken,
+    /// Always 404 — exercises the non-success mapping in `initial_get`
+    /// before any file is created on disk.
+    NotFound,
+    /// Range-capable, but refuses ranged GETs whose start offset is > 0
+    /// with 403 — mimics a per-file concurrent-connection cap (pixeldrain
+    /// behind Cloudflare): the verify probe (`bytes=0-0`) and a single
+    /// connection succeed, but the parallel offset segments are rejected.
+    RejectOffsetRanges,
 }
 
 #[derive(Clone)]
@@ -91,16 +105,19 @@ async fn handle(
     req: Request<Incoming>,
     state: ServerState,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    state.requests.fetch_add(1, Ordering::SeqCst);
+    let req_no = state.requests.fetch_add(1, Ordering::SeqCst);
     let total = state.payload.len() as u64;
     let mut resp = Response::builder()
         .header(ETAG, ETAG_VALUE)
         .header(LAST_MODIFIED, LAST_MODIFIED_VALUE);
 
-    // All modes here advertise range support; the `IgnoreRangeReturn200`
-    // mode is specifically the buggy-server case where the advertisement
-    // lies and Range requests are silently treated as full-body GETs.
-    resp = resp.header(ACCEPT_RANGES, "bytes");
+    // Range-aware modes advertise range support; `IgnoreRangeReturn200`
+    // lies about it (Range requests get full-body 200s). `SingleUseToken`
+    // and `NotFound` are single-stream and deliberately omit
+    // `Accept-Ranges`.
+    if !matches!(state.mode, ServerMode::SingleUseToken | ServerMode::NotFound) {
+        resp = resp.header(ACCEPT_RANGES, "bytes");
+    }
 
     if req.method() == Method::HEAD {
         let r = resp
@@ -122,6 +139,56 @@ async fn handle(
         .map(|s| s.to_string());
 
     match (range_hdr.as_deref(), state.mode) {
+        (_, ServerMode::NotFound) => {
+            let r = resp
+                .status(StatusCode::NOT_FOUND)
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            Ok(r)
+        }
+        (_, ServerMode::SingleUseToken) => {
+            // The token is spent by the first request (whatever the
+            // method). A second request — e.g. a transfer GET after a HEAD
+            // probe spent the token — sees an empty 200, which the
+            // completion gate would reject as 0 bytes.
+            let body = if req_no == 0 {
+                Bytes::from(state.payload.as_ref().clone())
+            } else {
+                Bytes::new()
+            };
+            let r = resp
+                .status(StatusCode::OK)
+                .header(CONTENT_LENGTH, body.len() as u64)
+                .body(Full::new(body))
+                .unwrap();
+            Ok(r)
+        }
+        (Some(r), ServerMode::RejectOffsetRanges) => {
+            let Some((start, end)) = parse_range(r, total) else {
+                let r = resp
+                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .body(Full::new(Bytes::new()))
+                    .unwrap();
+                return Ok(r);
+            };
+            if start > 0 {
+                // Concurrent offset segment — refuse it. The first segment
+                // (start 0) and the verify probe (bytes=0-0) are allowed.
+                let r = resp
+                    .status(StatusCode::FORBIDDEN)
+                    .body(Full::new(Bytes::new()))
+                    .unwrap();
+                return Ok(r);
+            }
+            let slice = state.payload[start as usize..=end as usize].to_vec();
+            let r = resp
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(CONTENT_LENGTH, slice.len() as u64)
+                .header(CONTENT_RANGE, format!("bytes {}-{}/{}", start, end, total))
+                .body(Full::new(Bytes::from(slice)))
+                .unwrap();
+            Ok(r)
+        }
         (Some(r), ServerMode::IgnoreRangeReturn200) => {
             // Server silently returns the whole body. The engine should
             // detect this during pre-flight verification and fall back to
@@ -630,5 +697,143 @@ async fn falls_back_to_single_stream_on_200() -> Result<()> {
     let bytes = std::fs::read(&out)?;
     assert_eq!(sha256_hex(&bytes), sha256_hex(server.payload()));
     server.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn single_use_token_downloads_in_one_get() -> Result<()> {
+    // The regression test for one-click / one-time-link hosts: the engine
+    // must fetch with a single browser-like GET, never a HEAD probe that
+    // would spend the token and leave the real GET empty.
+    let server = TestServer::start(ServerMode::SingleUseToken).await?;
+    let tmp = tempfile::tempdir()?;
+    let out = tmp.path().join("token.bin");
+    let opts = opts_for(server.url("/dl/token"), out.clone(), 8);
+
+    let summary = download(opts, CancellationToken::new(), None).await?;
+    assert_eq!(summary.bytes, server.payload().len() as u64);
+    // No Accept-Ranges → single-stream, streamed from the initial GET.
+    assert_eq!(summary.segments, 1);
+
+    let bytes = std::fs::read(&out)?;
+    assert_eq!(sha256_hex(&bytes), sha256_hex(server.payload()));
+
+    // The crux: exactly one request. A HEAD-first probe would be request
+    // #1 (spending the token) and the transfer GET request #2 (empty body
+    // → 0 bytes → completion-gate failure).
+    assert_eq!(
+        server.state.requests.load(Ordering::SeqCst),
+        1,
+        "expected exactly one request (no HEAD probe)"
+    );
+
+    server.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn falls_back_to_single_stream_when_segments_rejected() -> Result<()> {
+    // The pixeldrain/Cloudflare case: range-capable, the verify probe and a
+    // single connection are fine, but the parallel offset segments are 403'd
+    // (per-file connection cap). The engine must catch the rejection and
+    // retry over one connection instead of failing the whole download.
+    let server = TestServer::start(ServerMode::RejectOffsetRanges).await?;
+    let tmp = tempfile::tempdir()?;
+    let out = tmp.path().join("rejected.bin");
+    let opts = opts_for(server.url("/r.bin"), out.clone(), 8);
+
+    let summary = download(opts, CancellationToken::new(), None).await?;
+    assert_eq!(summary.bytes, server.payload().len() as u64);
+    assert_eq!(summary.segments, 1, "must collapse to a single connection");
+
+    let bytes = std::fs::read(&out)?;
+    assert_eq!(sha256_hex(&bytes), sha256_hex(server.payload()));
+    server.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn not_found_maps_to_error_without_creating_file() -> Result<()> {
+    let server = TestServer::start(ServerMode::NotFound).await?;
+    let tmp = tempfile::tempdir()?;
+    let out = tmp.path().join("missing.bin");
+    let opts = opts_for(server.url("/missing.bin"), out.clone(), 4);
+
+    let result = download(opts, CancellationToken::new(), None).await;
+    assert!(result.is_err(), "404 must fail the download");
+    assert!(
+        !out.exists(),
+        "no output file should be created when the initial GET fails"
+    );
+
+    server.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn captured_user_agent_wins_over_engine_default() -> Result<()> {
+    // Tier 2B: with no explicit UA override, the browser's captured
+    // User-Agent (forwarded via extra_headers) must be the one actually
+    // sent — not the engine's compiled-in default — and sent exactly once.
+    // This keeps UA-bound anti-bot cookies (e.g. cf_clearance) valid.
+    let observed = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+    let observed_for_handler = observed.clone();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accept = listener.accept() => {
+                    let Ok((stream, _)) = accept else { break };
+                    let observed = observed_for_handler.clone();
+                    tokio::spawn(async move {
+                        let io = TokioIo::new(stream);
+                        let svc = service_fn(move |req: Request<Incoming>| {
+                            let observed = observed.clone();
+                            async move {
+                                let mut snap = observed.lock().await;
+                                for v in req.headers().get_all(hyper::header::USER_AGENT) {
+                                    if let Ok(s) = v.to_str() {
+                                        snap.push(s.to_string());
+                                    }
+                                }
+                                Ok::<_, Infallible>(
+                                    Response::builder()
+                                        .status(StatusCode::OK)
+                                        .header(CONTENT_LENGTH, 0)
+                                        .header(ACCEPT_RANGES, "bytes")
+                                        .body(Full::new(Bytes::new()))
+                                        .unwrap(),
+                                )
+                            }
+                        });
+                        let _ = http1::Builder::new().serve_connection(io, svc).await;
+                    });
+                }
+            }
+        }
+    });
+
+    let browser_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120";
+    let extra = vec![("User-Agent".to_string(), browser_ua.to_string())];
+    // `user_agent` param is None — the captured header must win.
+    let client =
+        engine::http::build_client(Duration::from_secs(5), Duration::from_secs(5), None, &extra)?;
+    let url: Url = format!("http://{addr}/probe").parse().unwrap();
+    let _ = engine::probe(&client, &url).await?;
+
+    let snap = observed.lock().await;
+    assert_eq!(
+        snap.as_slice(),
+        std::slice::from_ref(&browser_ua.to_string()),
+        "exactly one User-Agent, the captured browser one (got {snap:?})"
+    );
+    drop(snap);
+
+    let _ = shutdown_tx.send(());
+    let _ = server.await;
     Ok(())
 }

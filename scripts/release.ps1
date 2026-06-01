@@ -191,17 +191,21 @@ Write-Host "      extension zipped → $extZipPath" -ForegroundColor DarkGray
 # 7. Updater manifest
 Write-Host "[8/8] updater manifest" -ForegroundColor DarkGray
 $bundleRoot = "target\release\bundle\nsis"
-# Filter by the version being released. Without this, stale .nsis.zip
-# files from prior builds in the same target dir win Select-Object
-# -First 1 and the manifest points at the wrong asset.
-$archive = Get-ChildItem -Path $bundleRoot -Filter "*_${Version}_*.nsis.zip" -ErrorAction SilentlyContinue | Select-Object -First 1
+# Tauri v2 with `createUpdaterArtifacts: true` (the modern, non-v1Compatible
+# format) signs the NSIS installer directly: the updater artifact is the
+# `-setup.exe` itself and its signature is `<setup>.exe.sig`. (The legacy
+# `.nsis.zip` is only emitted under `createUpdaterArtifacts: "v1Compatible"`.)
+# Filter by the version being released so stale `-setup.exe` files from
+# prior builds in the same target dir don't win Select-Object -First 1 and
+# point the manifest at the wrong asset.
+$archive = Get-ChildItem -Path $bundleRoot -Filter "*_${Version}_*-setup.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
 $sig     = if ($archive) {
     Get-ChildItem -Path $bundleRoot -Filter "$($archive.Name).sig" -ErrorAction SilentlyContinue | Select-Object -First 1
 } else { $null }
 
 if (-not $archive -or -not $sig) {
-    Write-Warning "No .nsis.zip + .sig pair found under $bundleRoot — manifest step skipped."
-    Write-Warning "Are the updater plugin and a signing key configured in tauri.conf.json?"
+    Write-Warning "No -setup.exe + .sig pair found under $bundleRoot — manifest step skipped."
+    Write-Warning "Is createUpdaterArtifacts enabled and a signing key (TAURI_SIGNING_PRIVATE_KEY) configured?"
 } else {
     & "$PSScriptRoot\build-update-manifest.ps1" `
         -Version $Version `
@@ -279,9 +283,11 @@ $bundleRoot = "target\release\bundle"
 if (Test-Path $nsisDir) {
     # Filter by the version being released so previous builds left in
     # target\release\bundle\ don't get uploaded alongside the current one.
-    $assets += Get-ChildItem -Path $nsisDir -Filter "*_${Version}_*.exe"          -File -ErrorAction SilentlyContinue
-    $assets += Get-ChildItem -Path $nsisDir -Filter "*_${Version}_*.nsis.zip"     -File -ErrorAction SilentlyContinue
-    $assets += Get-ChildItem -Path $nsisDir -Filter "*_${Version}_*.nsis.zip.sig" -File -ErrorAction SilentlyContinue
+    # The signed `-setup.exe` IS the updater artefact; its `.exe.sig` is
+    # uploaded too so users can verify the download out of band (the
+    # updater itself reads the signature embedded in latest-<channel>.json).
+    $assets += Get-ChildItem -Path $nsisDir -Filter "*_${Version}_*-setup.exe"     -File -ErrorAction SilentlyContinue
+    $assets += Get-ChildItem -Path $nsisDir -Filter "*_${Version}_*-setup.exe.sig" -File -ErrorAction SilentlyContinue
 }
 if (Test-Path $msiDir) {
     $assets += Get-ChildItem -Path $msiDir -Filter "*_${Version}_*.msi" -File -ErrorAction SilentlyContinue

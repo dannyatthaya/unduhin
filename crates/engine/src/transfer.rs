@@ -83,6 +83,8 @@ pub(crate) async fn run_transfer(
     tx: Option<broadcast::Sender<ProgressEvent>>,
     resumed: bool,
     mut control_rx: Option<mpsc::Receiver<Control>>,
+    content_type: Option<String>,
+    prefetched: Option<reqwest::Response>,
 ) -> Result<DownloadSummary> {
     let total = meta.total_bytes;
     let initial_segment_count = meta.segments.len();
@@ -105,6 +107,7 @@ pub(crate) async fn run_transfer(
         backoff: opts.backoff,
         ranges_supported,
         senders: Mutex::new(Vec::with_capacity(initial_segment_count)),
+        prefetched: Mutex::new(prefetched),
     });
 
     let mut workers: JoinSet<Result<()>> = JoinSet::new();
@@ -236,6 +239,7 @@ pub(crate) async fn run_transfer(
         bytes,
         segments: final_segment_count,
         resumed,
+        content_type,
     })
 }
 
@@ -474,6 +478,14 @@ pub(crate) struct SharedState {
     pub(crate) backoff: Backoff,
     pub(crate) ranges_supported: bool,
     pub(crate) senders: Mutex<Vec<Option<mpsc::Sender<Segment>>>>,
+    /// Body of the engine's initial GET, handed to the lone single-stream
+    /// worker so it streams from the request the engine already opened
+    /// instead of issuing a second GET. `None` for segmented / resume
+    /// transfers. Taken exactly once by the index-0 worker's first
+    /// attempt; a retry (or any other worker) sees `None` and opens a
+    /// fresh request. This is what lets one-time-token hosts succeed: a
+    /// browser makes one GET, and so do we.
+    pub(crate) prefetched: Mutex<Option<reqwest::Response>>,
 }
 
 /// Per-worker state owned by the ticker. The classification rules need
@@ -784,7 +796,18 @@ async fn try_segment(
         ));
     }
 
-    let resp = req.send().await?;
+    // Single-stream first attempt: stream the body from the GET the engine
+    // already opened (the initial probe-and-fetch) rather than issuing a
+    // second request. A retry — or any segmented worker — finds it gone
+    // (`None`) and falls back to a fresh `req.send()`.
+    let resp = if !shared.ranges_supported && index == 0 && already == 0 {
+        match shared.prefetched.lock().await.take() {
+            Some(prefetched) => prefetched,
+            None => req.send().await?,
+        }
+    } else {
+        req.send().await?
+    };
     let status = resp.status();
     if shared.ranges_supported {
         // A `200` on a ranged request means the server dropped the Range —

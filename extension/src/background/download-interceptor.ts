@@ -1,10 +1,17 @@
 // Download interceptor.
 //
-// `chrome.downloads.onDeterminingFilename` fires after the browser has
-// decided to start a download. We don't (and can't) cancel it before it
-// starts via this hook — the browser begins the download and we cancel
-// it immediately after. The user-visible result is a brief blip on the
-// shelf followed by the row disappearing (we chain `erase` for that).
+// We intercept on `chrome.downloads.onCreated` — the EARLIEST download
+// event. `onCreated` fires before `onDeterminingFilename`, which in turn
+// fires before Chrome shows the "Save As" prompt; cancelling here (rather
+// than at the later `onDeterminingFilename`, which does NOT reliably
+// suppress that dialog) stops the browser before any dialog or bytes.
+//
+// Flow for a captured download: decide (`shouldIntercept`) → if the app is
+// reachable, cancel the browser's copy immediately → hand the job to the
+// native app. If the app is unreachable we leave the download to the
+// browser as a fallback (and never cancel). For `ask-first` we cancel
+// up front to kill the dialog, prompt, and re-issue the browser download
+// if the user declines.
 //
 // The decision is split in two: `shouldIntercept` in `intercept-rules.ts`
 // is pure and exhaustively tested; this module wires it to the chrome
@@ -54,30 +61,73 @@ const NOTIFICATION_ICON =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNgAAIAAAUAAarVyFEAAAAASUVORK5CYII=";
 
 /**
- * Some hosts (pixeldrain.com, Google Drive interstitials) fire
- * `onDeterminingFilename` more than once for the same logical click —
- * an initial HTML pre-roll plus the eventual CDN URL share the same
- * `DownloadItem.id`. We must only run the cancel/forward/erase pipeline
- * once per id; the second fire's `cancel` would otherwise reject with
- * "Download must be in progress" once Chrome has already torn down the
- * record. The set is short-lived (cleared after the handler finishes),
- * so SW eviction can't leak it.
+ * Guards against handling the same `DownloadItem.id` twice (defensive —
+ * `onCreated` fires once per id, but a stray duplicate would otherwise
+ * re-run the cancel/forward pipeline and the second `cancel` would reject
+ * once Chrome has torn the record down). Short-lived: cleared after the
+ * handler finishes, so SW eviction can't leak it.
  */
 const handlingIds = new Set<number>();
 
+/**
+ * URLs we deliberately re-issued to the browser (after an `ask-first`
+ * decline, or when a hand-off failed post-cancel). The resulting
+ * `onCreated` for that URL is passed through once instead of being
+ * re-intercepted — without this guard an `ask-first` decline would loop
+ * forever (cancel → re-download → prompt → decline → …).
+ */
+const letThrough = new Set<string>();
+
 export function installDownloadInterceptor(deps: InterceptorDeps): void {
-  chrome.downloads.onDeterminingFilename.addListener((item) => {
+  chrome.downloads.onCreated.addListener((item) => {
+    // Only act on freshly-started downloads. `onCreated` can also fire for
+    // history rows restored on startup (state "complete"/"interrupted") —
+    // never cancel those.
+    if (item.state !== "in_progress") return;
     if (handlingIds.has(item.id)) {
-      log.debug("dedup: skipping duplicate onDeterminingFilename for", item.id);
+      log.debug("dedup: skipping duplicate onCreated for", item.id);
       return;
     }
     handlingIds.add(item.id);
-    // We never call `suggest()` — accepting the browser's default filename
-    // is fine because we immediately cancel + erase. The handler runs
-    // async; chrome.downloads doesn't wait for it.
-    void handleItem(item, deps).finally(() => handlingIds.delete(item.id));
+    void handleItem(item, deps)
+      .catch((err) => log.warn("handleItem failed", err))
+      .finally(() => handlingIds.delete(item.id));
   });
-  log.info("download-interceptor installed");
+  log.info("download-interceptor installed (onCreated)");
+}
+
+/** Cancel the browser's copy of `id`, then erase it from the shelf when
+ * `hideShelf` is set. Both swallow errors (and clear `lastError`): a
+ * cancel that loses a race is benign, and erase is cosmetic. */
+async function cancelBrowserDownload(id: number, hideShelf: boolean): Promise<void> {
+  try {
+    await chrome.downloads.cancel(id);
+  } catch (err) {
+    void chrome.runtime.lastError;
+    log.warn("downloads.cancel failed", err);
+  }
+  if (hideShelf) {
+    try {
+      await chrome.downloads.erase({ id });
+    } catch {
+      void chrome.runtime.lastError;
+    }
+  }
+}
+
+/** Re-issue a browser download we previously cancelled (ask-first decline,
+ * or a hand-off that failed after we already cancelled). Marked in
+ * `letThrough` so the resulting `onCreated` isn't re-intercepted. */
+async function redownloadInBrowser(url: string): Promise<void> {
+  if (url.length === 0) return;
+  letThrough.add(url);
+  try {
+    await chrome.downloads.download({ url });
+  } catch (err) {
+    letThrough.delete(url);
+    void chrome.runtime.lastError;
+    log.warn("re-download fallback failed", err);
+  }
 }
 
 async function handleItem(
@@ -87,6 +137,13 @@ async function handleItem(
   const settings = deps.settings.current();
   const url = pickUrl(item);
   const filename = pickFilename(item);
+
+  // A download we re-issued ourselves (post-decline / post-failure
+  // fallback): let the browser keep it exactly once.
+  if (letThrough.delete(url)) {
+    log.debug("passthrough: re-issued browser download", url);
+    return;
+  }
 
   const decision = shouldIntercept({
     url,
@@ -113,10 +170,44 @@ async function handleItem(
     return;
   }
 
-  // ask-first: build the job up front (we may need to send it twice
-  // — once for the prompt, once for the actual download) and let the
-  // Tauri prompt resolve before we touch chrome.downloads.
   const referrer = item.referrer && item.referrer.length > 0 ? item.referrer : null;
+
+  // ask-first: cancel up front so no "Save As" dialog appears while the
+  // prompt is open, then ask. On decline, hand the download back to the
+  // browser. We build the job first because the prompt needs it.
+  if (decision.kind === "ask") {
+    const job = await buildJob({
+      item,
+      url,
+      filename,
+      referrer,
+      cached: deps.headerCache.getHeadersFor(url) ?? [],
+      forwardCookies: settings.forwardCookies,
+    });
+    await cancelBrowserDownload(item.id, settings.hideShelf);
+    const choice = await deps.askHandoff(newAskId(), job);
+    if (choice !== "capture") {
+      log.debug("ask-first: user declined → re-download in browser", url);
+      await redownloadInBrowser(url);
+      return;
+    }
+    try {
+      await deps.bridge.send({ type: "download", job });
+    } catch (err) {
+      log.warn("bridge.send(download) failed after cancel; re-downloading", err);
+      await notifyNotRunningOnce();
+      await redownloadInBrowser(url);
+    }
+    return;
+  }
+
+  // Immediate intercept: cancel the browser's copy NOW — at `onCreated`
+  // this lands before Chrome reaches the "Save As" prompt, so no dialog
+  // appears and nothing is written to the Downloads folder. Then hand the
+  // job to the app. The app already proved reachable (`isHealthy`), so a
+  // post-cancel send failure is rare; if it happens we re-download in the
+  // browser rather than silently drop the file.
+  await cancelBrowserDownload(item.id, settings.hideShelf);
   const job = await buildJob({
     item,
     url,
@@ -125,75 +216,12 @@ async function handleItem(
     cached: deps.headerCache.getHeadersFor(url) ?? [],
     forwardCookies: settings.forwardCookies,
   });
-
-  if (decision.kind === "ask") {
-    const id = newAskId();
-    const choice = await deps.askHandoff(id, job);
-    if (choice !== "capture") {
-      log.debug("ask-first: user declined → passthrough", url);
-      return;
-    }
-  }
-
-  // The browser download has been running this whole time — in ask-first
-  // mode for as long as the (up to 60s) prompt was open. If it already
-  // finished, `chrome.downloads.cancel` is a no-op (the file stays) and
-  // downloading again in Unduhin would leave two copies. Accept the
-  // browser's copy and stop. (Bug: ask-first can produce a duplicate file.)
-  if (await isDownloadComplete(item.id)) {
-    log.debug("browser download already finished → keeping it, not re-downloading", url);
-    return;
-  }
-
-  // Hand the job to the native host *before* cancelling the browser
-  // download. If the host is unreachable (crash / pipe drop during the
-  // build/prompt window), the browser download simply proceeds as a
-  // fallback and we notify once — previously we cancelled first and a
-  // failed send lost the download entirely. (Bug: interrupted handoff
-  // loses the download.)
   try {
     await deps.bridge.send({ type: "download", job });
   } catch (err) {
-    log.warn("bridge.send(download) failed; leaving download to the browser", err);
+    log.warn("bridge.send(download) failed after cancel; re-downloading", err);
     await notifyNotRunningOnce();
-    return;
-  }
-
-  // The host accepted the job — now cancel the browser's copy.
-  try {
-    await chrome.downloads.cancel(item.id);
-  } catch (err) {
-    // Chrome's promise-form `cancel` also sets `chrome.runtime.lastError`
-    // as a side effect; reading it here clears the slot so the runtime
-    // doesn't log "Unchecked runtime.lastError" on the next tick. A cancel
-    // failure here (e.g. the item completed in the race) is benign: Unduhin
-    // owns the job and at worst there's a harmless duplicate.
-    void chrome.runtime.lastError;
-    log.warn("downloads.cancel failed after handoff", err);
-  }
-
-  // Respect `hideShelf`. When false, leave the cancelled row on
-  // the shelf so the user has a visible breadcrumb to revisit.
-  if (settings.hideShelf) {
-    try {
-      await chrome.downloads.erase({ id: item.id });
-    } catch {
-      void chrome.runtime.lastError;
-    }
-  }
-}
-
-/** Whether the browser download `id` has already finished. Used to avoid
- * re-downloading a file the browser already saved (cancelling a completed
- * download is a no-op, so without this check Unduhin would make a second
- * copy). Returns false on any lookup error. */
-async function isDownloadComplete(id: number): Promise<boolean> {
-  try {
-    const [found] = await chrome.downloads.search({ id });
-    return found?.state === "complete";
-  } catch {
-    void chrome.runtime.lastError;
-    return false;
+    await redownloadInBrowser(url);
   }
 }
 
@@ -220,7 +248,7 @@ async function buildJob(input: BuildJobInput): Promise<DownloadJob> {
     .map((h) => ({ name: h.name, value: typeof h.value === "string" ? h.value : "" }));
   return {
     finalUrl: input.url,
-    originalUrl: input.item.url || input.url,
+    originalUrl: stripFragment(input.item.url) || input.url,
     referrer: input.referrer,
     filename: input.filename.length > 0 ? input.filename : null,
     mime: input.item.mime && input.item.mime.length > 0 ? input.item.mime : null,
@@ -241,8 +269,23 @@ function newAskId(): string {
 }
 
 function pickUrl(item: chrome.downloads.DownloadItem): string {
-  if (item.finalUrl && item.finalUrl.length > 0) return item.finalUrl;
-  return item.url ?? "";
+  const raw = item.finalUrl && item.finalUrl.length > 0 ? item.finalUrl : (item.url ?? "");
+  return stripFragment(raw);
+}
+
+/**
+ * Drop the `#fragment`. Fragments are never sent over the wire, so a URL
+ * like `https://host/id#filename.rar` is stored in the header cache (keyed
+ * by the wire URL `https://host/id`) and requested by the engine without
+ * it. Stripping here keeps the cache/cookie lookups and the URL we hand to
+ * the engine aligned with that wire URL — otherwise the captured
+ * `Sec-Fetch-*` / client-hint headers miss the cache and never reach the
+ * engine. One-click hosts that pass the filename as a fragment relied on
+ * this mismatch failing silently.
+ */
+function stripFragment(url: string): string {
+  const hash = url.indexOf("#");
+  return hash >= 0 ? url.slice(0, hash) : url;
 }
 
 function pickFilename(item: chrome.downloads.DownloadItem): string {

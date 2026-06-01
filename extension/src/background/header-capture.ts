@@ -98,15 +98,21 @@ export function installHeaderCapture(): HeaderCache {
 
   return {
     getHeadersFor(url) {
-      const entry = cache.get(url);
+      // Fragments never reach the wire, so the cache is keyed by the
+      // fragment-less `details.url`. Strip defensively in case a caller
+      // passes a `#fragment` URL (e.g. a one-click host that encodes the
+      // filename there) so the lookup still hits.
+      const hash = url.indexOf("#");
+      const key = hash >= 0 ? url.slice(0, hash) : url;
+      const entry = cache.get(key);
       if (!entry) return null;
       if (entry.expiresAt < Date.now()) {
-        cache.delete(url);
+        cache.delete(key);
         return null;
       }
       // Touch on read so the entry doesn't get evicted while it's still hot.
-      cache.delete(url);
-      cache.set(url, entry);
+      cache.delete(key);
+      cache.set(key, entry);
       // Return a shallow copy so callers can't mutate the cached slot.
       return entry.headers.map((h) => ({ ...h }));
     },

@@ -615,6 +615,35 @@ async fn run_worker(
 
     match result {
         Ok(summary) => {
+            // Completion gate: the HTTP engine reports a
+            // transfer as "complete" even when the server returned 0 bytes
+            // or an HTML landing page — common with one-click file hosts
+            // whose captured bare URL needs a browser session/token to
+            // resolve. Refuse to call that a success; mark it Failed with a
+            // clear message and discard the bogus artefact. Scoped to the
+            // engine path: yt-dlp rows always produce a real media file.
+            if record.media_info.is_none() {
+                if let Some(reason) = http_completion_rejection(&summary) {
+                    if matches!(
+                        current_status(&pool, id).await.ok(),
+                        Some(Status::Active | Status::Muxing)
+                    ) {
+                        tracing::warn!(
+                            id,
+                            bytes = summary.bytes,
+                            %reason,
+                            "queue: rejecting download at completion gate"
+                        );
+                        // Drop the empty/HTML file and its sidecar so a retry
+                        // starts clean and the user isn't left with a bogus
+                        // 0 B file on disk.
+                        let _ = tokio::fs::remove_file(&output_path).await;
+                        let _ = tokio::fs::remove_file(&meta_path).await;
+                        mark_worker_failed(&pool, &events, id, &reason).await;
+                    }
+                    return;
+                }
+            }
             // If a user cancel landed at the very last moment, the DB row
             // may already say "cancelled" — only flip to completed if the
             // row is still in a running state. `Muxing` is included
@@ -853,6 +882,9 @@ async fn run_ytdlp(
                 bytes: bytes_on_disk,
                 segments: 1,
                 resumed: false,
+                // yt-dlp writes a real media file to disk; the HTML/empty
+                // completion gate is an HTTP-engine concern only.
+                content_type: None,
             })
         }
         Err(ytdlp::YtdlpError::Process { message, .. }) if message == "cancelled" => {
@@ -898,6 +930,61 @@ async fn current_status(pool: &SqlitePool, id: DownloadId) -> crate::error::Resu
     let row = row.ok_or(crate::error::CoreError::DownloadNotFound(id))?;
     let s: String = row.get("status");
     s.parse()
+}
+
+/// Decide whether an HTTP-engine download the engine reported as
+/// "complete" should actually be failed. One-click file hosts (and any
+/// link that needs a live browser session/token to resolve) routinely
+/// answer the captured bare URL with a 0-byte body or an HTML landing
+/// page in place of the real file. The engine cannot tell that apart
+/// from a genuine transfer — when no `Content-Length` was advertised it
+/// treats whatever arrived (including nothing) as the whole file — so
+/// without this gate the row flips to `Completed` at 0 B and a failed
+/// download masquerades as a success (silent data loss).
+///
+/// Returns `Some(reason)` when the download must be marked `Failed`
+/// instead of `Completed`, or `None` when it looks like a real file.
+/// Scoped to the engine path by the caller — yt-dlp rows always write a
+/// real media file to disk.
+fn http_completion_rejection(summary: &engine::DownloadSummary) -> Option<String> {
+    if summary.bytes == 0 {
+        return Some(
+            "server returned an empty response (0 bytes); this link may need to be \
+             opened in the browser to resolve"
+                .to_string(),
+        );
+    }
+    // An HTML body where a file was expected is the other common
+    // one-click-host failure: the captured URL resolves to a landing /
+    // click-through page, not the bytes. Only treat it as a failure when
+    // the target file isn't itself an HTML document.
+    let is_html = summary
+        .content_type
+        .as_deref()
+        .map(|ct| {
+            ct.split(';')
+                .next()
+                .unwrap_or(ct)
+                .trim()
+                .eq_ignore_ascii_case("text/html")
+        })
+        .unwrap_or(false);
+    if is_html {
+        let ext = summary
+            .output
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        let expects_html = matches!(ext.as_deref(), Some("html") | Some("htm"));
+        if !expects_html {
+            return Some(
+                "server returned an HTML page instead of the requested file; this link \
+                 may need to be opened in the browser to resolve"
+                    .to_string(),
+            );
+        }
+    }
+    None
 }
 
 async fn mark_worker_failed(
@@ -1013,5 +1100,54 @@ mod tests {
         // Monotonic input stays monotonic after bucket-averaging.
         assert!(out.windows(2).all(|w| w[0] <= w[1]));
         assert!(*out.first().unwrap() < *out.last().unwrap());
+    }
+
+    fn summary(bytes: u64, output: &str, content_type: Option<&str>) -> engine::DownloadSummary {
+        engine::DownloadSummary {
+            url: "https://example.com/x".parse().unwrap(),
+            output: std::path::PathBuf::from(output),
+            bytes,
+            segments: 1,
+            resumed: false,
+            content_type: content_type.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn completion_gate_rejects_zero_bytes() {
+        // a 0-byte "completed" download is silent data loss.
+        let r = http_completion_rejection(&summary(0, "file.zip", Some("application/zip")));
+        assert!(r.is_some(), "0 bytes must be rejected");
+        assert!(r.unwrap().contains("empty"));
+    }
+
+    #[test]
+    fn completion_gate_rejects_html_when_file_expected() {
+        // One-click hosts answer with a landing page; the target isn't HTML.
+        let r = http_completion_rejection(&summary(
+            5_000,
+            "movie.mp4",
+            Some("text/html; charset=utf-8"),
+        ));
+        assert!(r.is_some(), "HTML body for a non-HTML target must be rejected");
+        assert!(r.unwrap().contains("HTML"));
+    }
+
+    #[test]
+    fn completion_gate_allows_real_file() {
+        // A non-empty body with a sensible content-type is a real download.
+        assert!(
+            http_completion_rejection(&summary(5_000, "movie.mp4", Some("video/mp4"))).is_none()
+        );
+        // Missing content-type is fine as long as bytes arrived.
+        assert!(http_completion_rejection(&summary(5_000, "movie.mp4", None)).is_none());
+    }
+
+    #[test]
+    fn completion_gate_allows_html_when_html_expected() {
+        // The user genuinely wanted the page (filename ends in .html).
+        assert!(
+            http_completion_rejection(&summary(5_000, "page.html", Some("text/html"))).is_none()
+        );
     }
 }

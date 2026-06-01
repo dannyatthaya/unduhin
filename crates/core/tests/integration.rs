@@ -19,7 +19,9 @@ use chrono::Timelike;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
-use hyper::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, ETAG, LAST_MODIFIED, RANGE};
+use hyper::header::{
+    ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, LAST_MODIFIED, RANGE,
+};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
@@ -101,6 +103,35 @@ async fn handle(
 ) -> std::result::Result<Response<Body>, Infallible> {
     state.requests.fetch_add(1, Ordering::SeqCst);
     let total = state.payload.len() as u64;
+
+    // Bug-repro paths (KNOWN_BUGS #2/#3): one-click file hosts answer the
+    // captured bare URL with an empty body or an HTML landing page instead
+    // of the real file. Both HEAD (the engine's probe) and GET must report
+    // the same thing, so these branches ignore the method and return a
+    // uniform response.
+    match req.uri().path() {
+        // 200 OK, Content-Length: 0, no body — the "expired token" case.
+        "/empty" => {
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_LENGTH, 0u64)
+                .body(full_body(Bytes::new()))
+                .unwrap());
+        }
+        // 200 OK with an HTML interstitial where a file was expected.
+        "/landing" => {
+            let html =
+                b"<!doctype html><html><body>click to download</body></html>".to_vec();
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "text/html; charset=utf-8")
+                .header(CONTENT_LENGTH, html.len() as u64)
+                .body(full_body(Bytes::from(html)))
+                .unwrap());
+        }
+        _ => {}
+    }
+
     let resp = Response::builder()
         .header(ETAG, "\"unduhin-core-test\"")
         .header(LAST_MODIFIED, "Wed, 21 Oct 2026 07:28:00 GMT")
@@ -669,6 +700,105 @@ async fn queue_emptied_does_not_fire_during_brief_gap() -> Result<()> {
     assert_eq!(
         count, 1,
         "expected exactly one QueueEmptied across the drain → refill → drain sequence, saw {count}"
+    );
+
+    core.shutdown().await?;
+    server.stop().await;
+    Ok(())
+}
+
+/// KNOWN_BUGS #2: a one-click host whose captured URL resolves to a
+/// 0-byte body server-side must NOT land as `Completed` at 0 B (silent
+/// data loss). The queue's completion gate has to turn it into `Failed`.
+#[tokio::test]
+async fn empty_body_download_fails_instead_of_completing() -> Result<()> {
+    let server = TestServer::start(
+        ServerMode {
+            delay_ms: 0,
+            chunk_size: 64 * 1024,
+        },
+        1024,
+    )
+    .await?;
+    let dir = tempfile::tempdir()?;
+    let (core, _) = fresh_core(&dir).await?;
+    let out_dir = dir.path().join("out");
+    std::fs::create_dir_all(&out_dir)?;
+
+    let id = core
+        .add_download(AddDownload {
+            url: server.url("/empty"),
+            filename: Some("movie.mkv".into()),
+            output_path: Some(out_dir.join("movie.mkv")),
+            category: Some(CategorySelector::Name("Other".into())),
+            priority: 0,
+            segments: Some(1),
+            media_info: None,
+            headers: None,
+            source: DownloadSource::Manual,
+        })
+        .await?;
+    core.start().await?;
+
+    wait_for_status(&core, id, Status::Failed, Duration::from_secs(15)).await?;
+    let rec = core.get_download(id).await?;
+    assert_eq!(rec.status, Status::Failed);
+    assert!(
+        rec.error.as_deref().unwrap_or("").contains("empty"),
+        "expected an empty-response error, got: {:?}",
+        rec.error
+    );
+    // The bogus 0-byte artefact must not be left on disk.
+    assert!(
+        !out_dir.join("movie.mkv").exists(),
+        "0-byte file should have been removed"
+    );
+
+    core.shutdown().await?;
+    server.stop().await;
+    Ok(())
+}
+
+/// KNOWN_BUGS #3: the same class of failure when the host returns an HTML
+/// landing page (non-zero body, `Content-Type: text/html`) in place of the
+/// requested file. Must be `Failed`, not `Completed`.
+#[tokio::test]
+async fn html_landing_page_download_fails_instead_of_completing() -> Result<()> {
+    let server = TestServer::start(
+        ServerMode {
+            delay_ms: 0,
+            chunk_size: 64 * 1024,
+        },
+        1024,
+    )
+    .await?;
+    let dir = tempfile::tempdir()?;
+    let (core, _) = fresh_core(&dir).await?;
+    let out_dir = dir.path().join("out");
+    std::fs::create_dir_all(&out_dir)?;
+
+    let id = core
+        .add_download(AddDownload {
+            url: server.url("/landing"),
+            filename: Some("movie.mkv".into()),
+            output_path: Some(out_dir.join("movie.mkv")),
+            category: Some(CategorySelector::Name("Other".into())),
+            priority: 0,
+            segments: Some(1),
+            media_info: None,
+            headers: None,
+            source: DownloadSource::Manual,
+        })
+        .await?;
+    core.start().await?;
+
+    wait_for_status(&core, id, Status::Failed, Duration::from_secs(15)).await?;
+    let rec = core.get_download(id).await?;
+    assert_eq!(rec.status, Status::Failed);
+    assert!(
+        rec.error.as_deref().unwrap_or("").contains("HTML"),
+        "expected an HTML-response error, got: {:?}",
+        rec.error
     );
 
     core.shutdown().await?;

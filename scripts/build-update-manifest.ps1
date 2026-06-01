@@ -12,14 +12,17 @@
           "platforms": {
             "windows-x86_64": {
               "signature": "<minisign-style base64 sig>",
-              "url":       "https://.../Unduhin_0.2.0_x64-setup.nsis.zip"
+              "url":       "https://.../Unduhin_0.2.0_x64-setup.exe"
             }
           }
         }
 
-    The update artefact is the ".nsis.zip" produced by the Tauri bundler
-    when the updater plugin is enabled. The corresponding signature file
-    is "<archive>.sig". Both are uploaded as release assets.
+    Under Tauri v2's modern updater format (`createUpdaterArtifacts: true`)
+    the NSIS installer is signed directly, so the update artefact is the
+    "-setup.exe" itself and its signature is "<setup>.exe.sig". (The legacy
+    ".nsis.zip" is only produced under `createUpdaterArtifacts:
+    "v1Compatible"`.) The signature is embedded into the manifest below; the
+    installer is uploaded as a release asset and referenced by `url`.
 
 .PARAMETER Version
     Bare semver, no "v" prefix.
@@ -28,7 +31,7 @@
     "stable" or "beta". Drives the output filename.
 
 .PARAMETER ArtifactPath
-    Path to the .nsis.zip update artefact produced by `tauri build`.
+    Path to the signed "-setup.exe" update artefact produced by `tauri build`.
 
 .PARAMETER SigPath
     Path to the corresponding .sig file. Read into the manifest verbatim.
@@ -66,18 +69,6 @@ $sig         = (Get-Content $SigPath -Raw).Trim()
 $pubDate     = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
 $assetUrl    = "$($ReleaseUrlBase.TrimEnd('/'))/$archiveName"
 
-$manifest = [ordered]@{
-    version   = $Version
-    notes     = $Notes
-    pub_date  = $pubDate
-    platforms = [ordered]@{
-        "windows-x86_64" = [ordered]@{
-            signature = $sig
-            url       = $assetUrl
-        }
-    }
-}
-
 if (-not $OutFile) {
     $OutFile = "target\release\bundle\latest-$Channel.json"
 }
@@ -85,7 +76,33 @@ if (-not $OutFile) {
 $dir = Split-Path $OutFile -Parent
 if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
 
-$json = ($manifest | ConvertTo-Json -Depth 6) + "`n"
+# Emit the manifest by hand instead of via ConvertTo-Json. Windows
+# PowerShell 5.1's serializer pretty-prints with 4-space indents, two
+# spaces after every colon, and closing braces aligned under the key —
+# valid JSON, but a non-standard layout that doesn't match what the Tauri
+# docs show or what the rest of the project uses. We still lean on
+# ConvertTo-Json for per-value escaping so any quotes / backslashes /
+# newlines in $Notes are encoded correctly; it just escapes one scalar
+# string at a time and we assemble the structure ourselves.
+function ConvertTo-JsonString([string]$value) {
+    # A lone string through ConvertTo-Json comes back as a fully quoted,
+    # escaped JSON string literal (e.g. `"a\"b"`), on a single line.
+    return ([string]$value | ConvertTo-Json -Compress)
+}
+
+$json = @"
+{
+  "version": $(ConvertTo-JsonString $Version),
+  "notes": $(ConvertTo-JsonString $Notes),
+  "pub_date": $(ConvertTo-JsonString $pubDate),
+  "platforms": {
+    "windows-x86_64": {
+      "signature": $(ConvertTo-JsonString $sig),
+      "url": $(ConvertTo-JsonString $assetUrl)
+    }
+  }
+}
+"@ + "`n"
 $utf8NoBom = New-Object System.Text.UTF8Encoding $false
 $abs = if ([System.IO.Path]::IsPathRooted($OutFile)) { $OutFile } else { Join-Path (Get-Location) $OutFile }
 [System.IO.File]::WriteAllText($abs, $json, $utf8NoBom)

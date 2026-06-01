@@ -89,7 +89,7 @@ async fn download_message_lands_with_captured_headers() {
     let buf = serde_json::to_vec(&msg).unwrap();
     write_frame(&mut client, &buf).await.expect("write frame");
 
-    let resp_buf = timeout(Duration::from_secs(2), read_frame(&mut client))
+    let resp_buf = timeout(Duration::from_secs(10), read_frame(&mut client))
         .await
         .expect("response timed out")
         .expect("read frame")
@@ -102,7 +102,7 @@ async fn download_message_lands_with_captured_headers() {
     assert!(id > 0, "ack id should be positive");
 
     // Drain events until we see DownloadAdded for our id.
-    let event = timeout(Duration::from_secs(2), async {
+    let event = timeout(Duration::from_secs(10), async {
         loop {
             match events.recv().await {
                 Ok(CoreEvent::DownloadAdded {
@@ -174,7 +174,13 @@ async fn ping_pong_over_pipe() {
 
     let ping = serde_json::to_vec(&Inbound::Ping).unwrap();
     write_frame(&mut client, &ping).await.unwrap();
-    let frame = timeout(Duration::from_secs(1), read_frame(&mut client))
+    // Generous timeout: under a full `cargo test --workspace` run the
+    // machine is saturated (many single-threaded tokio test runtimes plus
+    // real-download integration tests competing for CPU), and a 1s budget
+    // for the server task to schedule + reply was flaky. The pong itself
+    // is instant in isolation (~0.04s); this only guards against scheduler
+    // starvation, so err well on the high side.
+    let frame = timeout(Duration::from_secs(10), read_frame(&mut client))
         .await
         .expect("pong timed out")
         .expect("read frame")

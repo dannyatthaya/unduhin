@@ -733,9 +733,24 @@ fn headers_from_job(job: &unduhin_core::wire::DownloadJob) -> Vec<(String, Strin
         out.push(("User-Agent".to_string(), ua.clone()));
     }
     for h in &job.request_headers {
+        // `Cookie`/`Referer`/`User-Agent` already came from the job's
+        // dedicated fields above; skip any duplicate the extension also
+        // captured via `webRequest` so reqwest doesn't send two.
+        if is_prepended_header(&h.name) {
+            continue;
+        }
         out.push((h.name.clone(), h.value.clone()));
     }
     out
+}
+
+/// Header names that `headers_from_*` prepend from dedicated job fields and
+/// must therefore not be appended a second time from captured headers.
+#[cfg(windows)]
+fn is_prepended_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("cookie")
+        || name.eq_ignore_ascii_case("referer")
+        || name.eq_ignore_ascii_case("user-agent")
 }
 
 #[cfg(windows)]
@@ -751,6 +766,9 @@ fn headers_from_media(stream: &unduhin_core::wire::MediaStream) -> Vec<(String, 
         out.push(("User-Agent".to_string(), ua.clone()));
     }
     for h in &stream.request_headers {
+        if is_prepended_header(&h.name) {
+            continue;
+        }
         out.push((h.name.clone(), h.value.clone()));
     }
     out
@@ -784,6 +802,45 @@ mod tests {
         assert_eq!(h[1], ("Referer".into(), "https://x/page".into()));
         assert_eq!(h[2], ("User-Agent".into(), "ua/1.0".into()));
         assert_eq!(h[3], ("Accept".into(), "*/*".into()));
+    }
+
+    #[test]
+    fn dedups_captured_cookie_referer_ua() {
+        // The extension also captures Referer / User-Agent via webRequest;
+        // they must not be appended a second time after the dedicated
+        // fields. (Cookie is stripped before capture, but guard it too.)
+        let job = DownloadJob {
+            final_url: "https://x/y.zip".into(),
+            original_url: "https://x/y.zip".into(),
+            referrer: Some("https://x/page".into()),
+            filename: None,
+            mime: None,
+            size: None,
+            cookie_header: Some("a=b".into()),
+            user_agent: Some("ua/1.0".into()),
+            request_headers: vec![
+                RequestHeader {
+                    name: "referer".into(),
+                    value: "https://x/page".into(),
+                },
+                RequestHeader {
+                    name: "User-Agent".into(),
+                    value: "ua/1.0".into(),
+                },
+                RequestHeader {
+                    name: "Sec-Fetch-Dest".into(),
+                    value: "document".into(),
+                },
+            ],
+            tab_id: None,
+            page_url: None,
+        };
+        let h = headers_from_job(&job);
+        assert_eq!(h[0], ("Cookie".into(), "a=b".into()));
+        assert_eq!(h[1], ("Referer".into(), "https://x/page".into()));
+        assert_eq!(h[2], ("User-Agent".into(), "ua/1.0".into()));
+        assert_eq!(h[3], ("Sec-Fetch-Dest".into(), "document".into()));
+        assert_eq!(h.len(), 4, "duplicate Referer/User-Agent must be dropped");
     }
 
     #[test]

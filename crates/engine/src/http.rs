@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use reqwest::header::{
     HeaderMap, HeaderName, HeaderValue, ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH,
-    CONTENT_TYPE, ETAG, LAST_MODIFIED, RANGE,
+    CONTENT_TYPE, ETAG, LAST_MODIFIED, RANGE, USER_AGENT,
 };
 use reqwest::{Client, Response, StatusCode};
 use url::Url;
@@ -26,6 +26,11 @@ pub struct RemoteInfo {
     pub accept_ranges: bool,
     /// Best-effort filename derived from Content-Disposition or the URL path.
     pub filename_hint: Option<String>,
+    /// Raw `Content-Type` header (incl. any `; charset=` suffix), if the
+    /// server sent one. The completion gate in `core` uses this to reject
+    /// one-click file hosts that serve an HTML landing page instead of the
+    /// requested bytes.
+    pub content_type: Option<String>,
 }
 
 /// Header names the engine refuses to send on the caller's behalf. These
@@ -70,10 +75,24 @@ pub fn build_client(
     user_agent: Option<&str>,
     extra_headers: &[(String, String)],
 ) -> Result<Client> {
+    let mut headers = sanitize_headers(extra_headers);
+    // User-Agent gets a single, deterministic slot on the builder rather
+    // than riding along in `default_headers` (where it would compete with
+    // the builder's own UA). Precedence: an explicit `user_agent` override
+    // (the app's global setting) wins; otherwise the browser's captured
+    // `User-Agent` (forwarded in `extra_headers`) is used so the request
+    // matches what the page made — essential for hosts that bind a
+    // session / anti-bot cookie (e.g. `cf_clearance`) to the exact UA.
+    // Falling back to the compiled-in default last. Pulling it out of
+    // `headers` guarantees we never send two `User-Agent` values.
+    let captured_ua = headers
+        .remove(USER_AGENT)
+        .and_then(|v| v.to_str().ok().map(|s| s.to_string()));
     let ua = user_agent
         .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+        .or(captured_ua)
         .unwrap_or_else(|| concat!("unduhin/", env!("CARGO_PKG_VERSION")).to_string());
-    let headers = sanitize_headers(extra_headers);
     Client::builder()
         .connect_timeout(connect_timeout)
         .read_timeout(read_timeout)
@@ -172,6 +191,7 @@ pub(crate) fn parse_remote_info(original_url: &Url, resp: &Response) -> RemoteIn
         last_modified,
         accept_ranges,
         filename_hint,
+        content_type,
     }
 }
 

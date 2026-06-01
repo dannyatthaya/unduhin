@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use reqwest::header::RANGE;
-use reqwest::{Client, StatusCode};
+use reqwest::{Client, Response, StatusCode};
 use tokio::fs::OpenOptions;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -71,6 +71,11 @@ pub struct DownloadSummary {
     pub bytes: u64,
     pub segments: usize,
     pub resumed: bool,
+    /// `Content-Type` advertised by the server on the probe response, if
+    /// any. Carried through so the queue's completion gate can refuse to
+    /// mark an HTML landing page (served in place of the real file by
+    /// one-click hosts) as a successful download.
+    pub content_type: Option<String>,
 }
 
 /// Start a brand-new download. If a sidecar already exists for the output
@@ -112,22 +117,150 @@ pub async fn download_with_control(
         opts.user_agent.as_deref(),
         &opts.headers,
     )?;
-    let info = probe(&client, &opts.url).await?;
 
-    let truly_supports_ranges =
-        if info.accept_ranges && info.content_length.is_some() && opts.segments > 1 {
-            verify_range_support(&client, &opts.url).await?
-        } else {
-            false
-        };
-
-    let meta = build_initial_meta(&opts, &info, truly_supports_ranges);
+    // One plain GET — no HEAD — that doubles as the metadata probe and, for
+    // single-stream downloads, the body source. A browser makes exactly one
+    // request; so do we. This stops a throwaway HEAD from spending a
+    // one-time / session-bound token (common with one-click file hosts)
+    // before the real fetch, which previously left the transfer empty.
+    let (info, resp) = initial_get(&client, &opts.url).await?;
     let meta_path = Meta::sidecar_path(&opts.output);
+
+    // Only range-capable hosts with a known length earn the parallel
+    // segmented treatment. Confirm advertised range support is real (some
+    // servers send `Accept-Ranges: bytes` then ignore `Range`). That verify
+    // request only ever hits range-capable hosts — which by definition
+    // tolerate multiple requests — never one-time-token hosts.
+    let wants_segments =
+        info.accept_ranges && info.content_length.is_some() && opts.segments > 1;
+    let truly_segmented = wants_segments && verify_range_support(&client, &opts.url).await?;
+
+    if truly_segmented {
+        // Fast path: many connections, each fetching its own byte range.
+        // Drop the initial (non-range) body; the workers issue ranged GETs.
+        drop(resp);
+        let meta = build_initial_meta(&opts, &info, true);
+        meta.save(&meta_path).await?;
+        preallocate(&opts.output, meta.total_bytes).await?;
+        let content_type = info.content_type.clone();
+        // A child token: a worker failure inside `run_transfer` calls
+        // `cancel()`, and token clones share state — using the parent
+        // directly would cancel the fallback before it starts. The child is
+        // still cancelled if the *user* cancels the parent.
+        match run_transfer(
+            client.clone(),
+            opts.clone(),
+            meta,
+            meta_path.clone(),
+            cancel.child_token(),
+            tx.clone(),
+            false,
+            control_rx,
+            content_type,
+            None,
+        )
+        .await
+        {
+            Err(ref e) if looks_like_concurrency_limit(e) => {
+                // The host rejected the parallel connections (e.g. pixeldrain
+                // behind Cloudflare 403s the excess) — but a single
+                // connection, like a browser, works. Retry single-stream;
+                // the `preallocate` inside truncates the partial segments.
+                tracing::warn!(
+                    error = %e,
+                    "segmented transfer rejected; retrying single-stream"
+                );
+                return single_stream_download(&client, opts, &meta_path, cancel, tx).await;
+            }
+            other => return other,
+        }
+    }
+
+    // Single-stream: chosen up front (one-click host / unknown length / no
+    // ranges) or because the server lied about range support. Either way we
+    // can stream the body we already opened — exactly one GET total.
+    let meta = build_initial_meta(&opts, &info, false);
     meta.save(&meta_path).await?;
-
     preallocate(&opts.output, meta.total_bytes).await?;
+    let content_type = info.content_type.clone();
+    run_transfer(
+        client,
+        opts,
+        meta,
+        meta_path,
+        cancel,
+        tx,
+        false,
+        control_rx,
+        content_type,
+        Some(resp),
+    )
+    .await
+}
 
-    run_transfer(client, opts, meta, meta_path, cancel, tx, false, control_rx).await
+/// Download `opts` over a single connection, fetching the body with one
+/// fresh `GET`. Used both as the chosen path for non-segmentable hosts and
+/// as the fallback when a segmented attempt is rejected for opening too
+/// many connections. Live re-segmentation control is intentionally dropped
+/// here — a single stream has nothing to re-segment.
+async fn single_stream_download(
+    client: &Client,
+    opts: DownloadOptions,
+    meta_path: &Path,
+    cancel: CancellationToken,
+    tx: Option<broadcast::Sender<ProgressEvent>>,
+) -> Result<DownloadSummary> {
+    let (info, resp) = initial_get(client, &opts.url).await?;
+    let meta = build_initial_meta(&opts, &info, false);
+    meta.save(meta_path).await?;
+    preallocate(&opts.output, meta.total_bytes).await?;
+    let content_type = info.content_type.clone();
+    run_transfer(
+        client.clone(),
+        opts,
+        meta,
+        meta_path.to_path_buf(),
+        cancel,
+        tx,
+        false,
+        None,
+        content_type,
+        Some(resp),
+    )
+    .await
+}
+
+/// Whether a *segmented* transfer failure looks like the host rejecting
+/// concurrent connections (rather than a genuine fetch error). Such hosts
+/// (e.g. pixeldrain behind Cloudflare) serve a single connection fine, so
+/// the caller retries single-stream. Missing-resource statuses (404/410)
+/// are deliberately excluded — one connection won't conjure the file.
+fn looks_like_concurrency_limit(err: &EngineError) -> bool {
+    match err {
+        EngineError::TerminalStatus { status } | EngineError::TransientStatus { status } => {
+            matches!(*status, 403 | 429 | 503 | 509)
+        }
+        // A transient status that burned the whole retry budget under the
+        // parallel burst — the gentler single connection is worth a try.
+        EngineError::RetryExhausted { .. } => true,
+        _ => false,
+    }
+}
+
+/// Issue a single plain `GET` (no HEAD, no `Range`) and parse the metadata
+/// we care about from the response, returning the live response so the
+/// caller can stream its body (single-stream) or drop it and start ranged
+/// GETs (segmented). Non-success statuses map through the same
+/// [`crate::http::map_status_error`] as [`probe`], before any file is
+/// created on disk.
+async fn initial_get(client: &Client, url: &Url) -> Result<(RemoteInfo, Response)> {
+    let resp = client.get(url.clone()).send().await?;
+    let status = resp.status();
+    if !status.is_success() && status != StatusCode::PARTIAL_CONTENT {
+        return Err(crate::http::map_status_error(status.as_u16()));
+    }
+    let info = crate::http::parse_remote_info(url, &resp);
+    Ok((info, resp))
 }
 
 /// Resume a download from a sidecar metadata file. Validates ETag /
@@ -211,7 +344,11 @@ pub async fn resume_at_with_control(
         preallocate(&opts.output, meta.total_bytes).await?;
     }
 
-    run_transfer(client, opts, meta, meta_path, cancel, tx, true, control_rx).await
+    let content_type = info.content_type.clone();
+    run_transfer(
+        client, opts, meta, meta_path, cancel, tx, true, control_rx, content_type, None,
+    )
+    .await
 }
 
 /// Send a 1-byte ranged GET to confirm the server actually honors ranges
