@@ -426,6 +426,7 @@ async fn run_worker(
     // owns the producing side and we want to react in real time.
     let pump_pool = pool.clone();
     let pump_events = events.clone();
+    let pump_url = url.clone();
     let pump = tokio::spawn(async move {
         // yt-dlp downloads multi-stream formats (video + audio) one
         // stream at a time. Each stream's progress restarts from byte 0,
@@ -550,6 +551,32 @@ async fn run_worker(
                         state,
                     });
                 }
+                Ok(ProgressEvent::FilenameLearned { hint }) => {
+                    // The engine learned the real filename from the response
+                    // headers while the bytes are still flowing. Update the
+                    // row's display name + category now so the UI stops showing
+                    // the random URL slug — the on-disk file is relocated to
+                    // match at completion (`apply_engine_filename`).
+                    match download::mark_learned_filename(&pump_pool, id, &pump_url, &hint).await {
+                        Ok(Some(learned)) => {
+                            let _ = pump_events.send(CoreEvent::PathsChanged {
+                                id,
+                                filename: learned.filename,
+                                output_path: learned.output_path.to_string_lossy().into_owned(),
+                            });
+                            if learned.category_changed {
+                                let _ = pump_events.send(CoreEvent::CategoryChanged {
+                                    id,
+                                    category_id: learned.category_id,
+                                });
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::warn!(id, error = %e, "queue: mark_learned_filename failed");
+                        }
+                    }
+                }
                 Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
@@ -642,6 +669,36 @@ async fn run_worker(
                         mark_worker_failed(&pool, &events, id, &reason).await;
                     }
                     return;
+                }
+
+                // The authoritative download GET may have revealed a real
+                // filename (Content-Disposition / final-redirect URL) that
+                // the add-time HEAD probe couldn't see — single-use-token
+                // one-click hosts name the file only on the GET. Apply it
+                // now, renaming the slug-named file and reconciling the
+                // category. Conservative: only overrides our own URL-tail
+                // fallback, never a user-typed or add-time-probed name.
+                if let Some(hint) = summary.filename_hint.as_deref() {
+                    match download::apply_engine_filename(&pool, id, &url, hint).await {
+                        Ok(Some(renamed)) => {
+                            let _ = events.send(CoreEvent::PathsChanged {
+                                id,
+                                filename: renamed.filename,
+                                output_path: renamed.path.to_string_lossy().into_owned(),
+                            });
+                            if renamed.category_changed {
+                                let _ = events.send(CoreEvent::CategoryChanged {
+                                    id,
+                                    category_id: renamed.category_id,
+                                });
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => tracing::warn!(
+                            id, error = %e,
+                            "queue: failed to apply engine filename hint"
+                        ),
+                    }
                 }
             }
             // If a user cancel landed at the very last moment, the DB row
@@ -885,6 +942,9 @@ async fn run_ytdlp(
                 // yt-dlp writes a real media file to disk; the HTML/empty
                 // completion gate is an HTTP-engine concern only.
                 content_type: None,
+                // yt-dlp owns its own naming (`finalize_ytdlp_completion`
+                // above); no engine-learned hint to apply.
+                filename_hint: None,
             })
         }
         Err(ytdlp::YtdlpError::Process { message, .. }) if message == "cancelled" => {
@@ -1110,6 +1170,7 @@ mod tests {
             segments: 1,
             resumed: false,
             content_type: content_type.map(|s| s.to_string()),
+            filename_hint: None,
         }
     }
 

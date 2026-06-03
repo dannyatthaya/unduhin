@@ -90,6 +90,7 @@ pub(crate) async fn run_transfer(
     resumed: bool,
     mut control_rx: Option<mpsc::Receiver<Control>>,
     content_type: Option<String>,
+    filename_hint: Option<String>,
     prefetched: Option<reqwest::Response>,
     // When `Some(n)`, slow-start: begin with the segments already in `meta`
     // (normally one) and ramp the connection count up toward `n`, backing
@@ -110,6 +111,22 @@ pub(crate) async fn run_transfer(
             resumed_bytes,
         },
     );
+
+    // Surface the name learned from the response headers immediately, while
+    // the bytes are still flowing, so the UI can replace a random URL slug
+    // with the real filename (and re-categorize) mid-download instead of
+    // surprising the user at completion. The file on disk is left at its
+    // working path — the engine is still writing it; the physical
+    // rename/relocate happens once at completion from the same hint carried
+    // on `DownloadSummary::filename_hint`.
+    if let Some(hint) = filename_hint.as_deref().filter(|h| !h.is_empty()) {
+        emit(
+            tx.as_ref(),
+            ProgressEvent::FilenameLearned {
+                hint: hint.to_string(),
+            },
+        );
+    }
 
     let shared = Arc::new(SharedState {
         meta: Mutex::new(meta),
@@ -256,6 +273,7 @@ pub(crate) async fn run_transfer(
         segments: final_segment_count,
         resumed,
         content_type,
+        filename_hint,
     })
 }
 

@@ -46,6 +46,28 @@ export function shortenUrl(url: string, max = 32): string {
   }
 }
 
+// Cap a filename's length while keeping it recognizable. Direct-download
+// hosts hand out absurdly long opaque slugs (100+ chars) that, untruncated,
+// wrap the window title bar onto a second line. We elide the middle and
+// keep the extension visible — `abc…very…long…xyz.mkv` reads better than a
+// hard left-cut that loses the extension.
+export function truncateFilename(name: string, max = 64): string {
+  if (!name || name.length <= max) return name;
+  const ellipsis = "…";
+  const dot = name.lastIndexOf(".");
+  // Treat a trailing chunk as an extension only when it's short and not the
+  // whole string (so slugs containing dots aren't mistaken for one).
+  const ext =
+    dot > 0 && name.length - dot <= 6 ? name.slice(dot) : "";
+  const budget = max - ext.length - ellipsis.length;
+  if (budget <= 0) return `${name.slice(0, max - 1)}${ellipsis}`;
+  const head = Math.ceil(budget / 2);
+  const tail = budget - head;
+  const stem = name.slice(0, dot > 0 && ext ? dot : name.length);
+  const tailPart = tail > 0 ? stem.slice(stem.length - tail) : "";
+  return `${stem.slice(0, head)}${ellipsis}${tailPart}${ext}`;
+}
+
 export function extOf(filename: string): string {
   const i = filename.lastIndexOf(".");
   if (i < 0 || i === filename.length - 1) return "";

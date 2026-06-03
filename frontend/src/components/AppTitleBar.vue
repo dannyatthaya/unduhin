@@ -13,6 +13,7 @@ import { Minus, Square, Copy, X } from "lucide-vue-next";
 
 import { useDetailStore } from "@/stores/detail";
 import { useDownloadsStore } from "@/stores/downloads";
+import { truncateFilename } from "@/lib/format";
 
 const { t } = useI18n();
 const downloads = useDownloadsStore();
@@ -24,12 +25,12 @@ const subtitle = computed(() => {
   if (downloads.loading) return t("downloads.titlebarLoading");
   if (detail.openId != null) {
     const r = downloads.records.get(detail.openId);
-    if (r) return r.filename;
+    if (r) return truncateFilename(r.filename);
   }
   const active = downloads.all.filter(
     (d) => d.status === "active" || d.status === "muxing",
   );
-  if (active.length === 1) return active[0].filename;
+  if (active.length === 1) return truncateFilename(active[0].filename);
   const inflight = downloads.all.filter(
     (d) =>
       d.status === "active" ||
@@ -77,7 +78,7 @@ function close() {
   >
     <div
       data-tauri-drag-region
-      class="flex h-full flex-1 items-center gap-2 px-3"
+      class="flex h-full min-w-0 flex-1 items-center gap-2 px-3"
     >
       <svg
         class="h-3.5 w-3.5 shrink-0"
@@ -94,8 +95,8 @@ function close() {
           <rect x="44" y="98" width="40" height="5" rx="2.5" />
         </g>
       </svg>
-      <span class="text-xs font-semibold">Unduhin</span>
-      <span class="text-xs text-muted-foreground">— {{ subtitle }}</span>
+      <span class="shrink-0 text-xs font-semibold">Unduhin</span>
+      <span class="truncate text-xs text-muted-foreground">— {{ subtitle }}</span>
     </div>
 
     <div class="flex h-full">

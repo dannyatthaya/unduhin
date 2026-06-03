@@ -20,7 +20,9 @@ use engine::{
 };
 use http_body_util::Full;
 use hyper::body::Incoming;
-use hyper::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, ETAG, LAST_MODIFIED, RANGE};
+use hyper::header::{
+    ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, ETAG, LAST_MODIFIED, RANGE,
+};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
@@ -156,9 +158,13 @@ async fn handle(
             } else {
                 Bytes::new()
             };
+            // The real filename lives only in the GET's Content-Disposition
+            // (fuckingfast.co's shape): the URL path is an opaque token, so
+            // this header is the engine's one chance to learn the name.
             let r = resp
                 .status(StatusCode::OK)
                 .header(CONTENT_LENGTH, body.len() as u64)
+                .header(CONTENT_DISPOSITION, "attachment; filename=\"real-movie.mkv\"")
                 .body(Full::new(body))
                 .unwrap();
             Ok(r)
@@ -716,10 +722,43 @@ async fn single_use_token_downloads_in_one_get() -> Result<()> {
     let out = tmp.path().join("token.bin");
     let opts = opts_for(server.url("/dl/token"), out.clone(), 8);
 
-    let summary = download(opts, CancellationToken::new(), None).await?;
+    let (tx, mut rx) = tokio::sync::broadcast::channel::<ProgressEvent>(DEFAULT_CHANNEL_CAPACITY);
+    let collector = tokio::spawn(async move {
+        let mut events = Vec::new();
+        loop {
+            match rx.recv().await {
+                Ok(ev) => events.push(ev),
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            }
+        }
+        events
+    });
+
+    let summary = download(opts, CancellationToken::new(), Some(tx.clone())).await?;
+    drop(tx);
+    let events = collector.await?;
     assert_eq!(summary.bytes, server.payload().len() as u64);
     // No Accept-Ranges → single-stream, streamed from the initial GET.
     assert_eq!(summary.segments, 1);
+    // The filename the engine learned from the download response's
+    // Content-Disposition rides out on the summary so the queue can rename
+    // the slug-named file. This is the fix for the DDL filename symptom.
+    assert_eq!(summary.filename_hint.as_deref(), Some("real-movie.mkv"));
+    // And it is surfaced *mid-flight* as a `FilenameLearned` event (right
+    // after the headers) so the UI can show the real name while downloading.
+    let learned: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            ProgressEvent::FilenameLearned { hint } => Some(hint.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        learned,
+        vec!["real-movie.mkv"],
+        "expected one mid-flight FilenameLearned event with the real name"
+    );
 
     let bytes = std::fs::read(&out)?;
     assert_eq!(sha256_hex(&bytes), sha256_hex(server.payload()));

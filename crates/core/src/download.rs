@@ -617,6 +617,212 @@ pub(crate) async fn finalize_ytdlp_completion(
     ))
 }
 
+/// Outcome of [`apply_engine_filename`] when a rename/relocate happened.
+pub(crate) struct RenamedDownload {
+    pub filename: String,
+    pub path: PathBuf,
+    pub category_id: Option<crate::category::CategoryId>,
+    pub category_changed: bool,
+}
+
+/// Outcome of [`mark_learned_filename`] when a row's *display* metadata
+/// changed mid-download. The on-disk file is left untouched (still at
+/// `output_path`); the physical move is deferred to completion.
+pub(crate) struct LearnedFilename {
+    pub filename: String,
+    pub output_path: PathBuf,
+    pub category_id: Option<crate::category::CategoryId>,
+    pub category_changed: bool,
+}
+
+/// What a learned engine filename would assign to a row, after the
+/// "is this our slug?" guard. Shared by the mid-flight display update
+/// ([`mark_learned_filename`]) and the completion move
+/// ([`apply_engine_filename`]) so their guards can never drift apart.
+struct LearnedDecision {
+    /// Sanitized learned name.
+    new_name: String,
+    /// The row's current display filename (may already be the learned name
+    /// when this is the completion call following a mid-flight update).
+    current_display_name: String,
+    current_path: PathBuf,
+    current_category: Option<i64>,
+    new_category: Option<i64>,
+}
+
+/// Resolve what a learned `hint` implies for download `id`, or `None` when
+/// the row must be left alone.
+///
+/// One-click / single-use-token hosts (fuckingfast.co, pixeldrain) often
+/// reveal the real name only on the GET that fetches the bytes — too late
+/// for the add-time HEAD probe, which had to fall back to the random URL-path
+/// slug. The engine surfaces that name (on `ProgressEvent::FilenameLearned`
+/// mid-flight and `DownloadSummary::filename_hint` at completion); this
+/// computes the resulting name + category once for both.
+///
+/// Conservative by construction: it ignores hints that are themselves random
+/// slugs (no improvement), and only acts when the file's *on-disk* name is
+/// exactly the sanitized URL-path tail we ourselves saved — never a
+/// `Content-Disposition` name found at add time or a name the user typed. The
+/// on-disk name (not the display name) is the stable key, because the display
+/// name may already have been swapped to the learned name by a mid-flight
+/// update while the file still sits at its slug path.
+async fn decide_learned(
+    pool: &SqlitePool,
+    id: DownloadId,
+    url: &url::Url,
+    hint: &str,
+) -> Result<Option<LearnedDecision>> {
+    let new_name = sanitize_filename(hint);
+    if engine::filename::is_random_slug(&new_name) {
+        return Ok(None);
+    }
+
+    let row = sqlx::query("SELECT filename, output_path, category_id FROM downloads WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?
+        .ok_or(CoreError::DownloadNotFound(id))?;
+    let current_display_name: String = row.get("filename");
+    let current_path = PathBuf::from(row.get::<String, _>("output_path"));
+    let current_category: Option<i64> = row.get("category_id");
+
+    let physical_name = current_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_string();
+    // The on-disk file already carries the learned name — no rename, and no
+    // relocation either (the file may sit at a caller-chosen explicit path
+    // that we must not move when there's nothing to improve).
+    if new_name == physical_name {
+        return Ok(None);
+    }
+    let url_fallback = filename_from_url(url).map(|t| sanitize_filename(&t));
+    if url_fallback.as_deref() != Some(physical_name.as_str()) {
+        return Ok(None);
+    }
+
+    // Re-categorize only when the stored category is the one auto-routing for
+    // the slug would have picked — i.e. it wasn't a manual choice (nor an
+    // already-applied mid-flight update, which we treat the same: leave it).
+    let auto_for_slug = auto_categorize_for_filename(pool, &physical_name).await?;
+    let new_category = if current_category == auto_for_slug {
+        auto_categorize_for_filename(pool, &new_name).await?
+    } else {
+        current_category
+    };
+
+    Ok(Some(LearnedDecision {
+        new_name,
+        current_display_name,
+        current_path,
+        current_category,
+        new_category,
+    }))
+}
+
+/// Apply a filename the engine learned from the *response headers* to a row
+/// that is still downloading: update the row's display name and category so
+/// the UI shows the real name (and correct group) immediately, instead of the
+/// random URL slug it was saved under.
+///
+/// The file on disk is **not** moved — the engine still owns and is writing
+/// it; the physical rename/relocate happens at completion via
+/// [`apply_engine_filename`], which keys off the unchanged on-disk path.
+/// Returns `Ok(None)` when nothing changed (slug hint, a name we shouldn't
+/// override, or the display name already reflects the hint).
+pub(crate) async fn mark_learned_filename(
+    pool: &SqlitePool,
+    id: DownloadId,
+    url: &url::Url,
+    hint: &str,
+) -> Result<Option<LearnedFilename>> {
+    let Some(decision) = decide_learned(pool, id, url, hint).await? else {
+        return Ok(None);
+    };
+    // Idempotent: the display name already reflects the hint (event re-emitted
+    // on resume / restart). Nothing to update or announce.
+    if decision.current_display_name == decision.new_name {
+        return Ok(None);
+    }
+
+    // Display metadata only — `output_path` is deliberately left pointing at
+    // the working (slug) file the engine is still writing.
+    sqlx::query("UPDATE downloads SET filename = ?, category_id = ? WHERE id = ?")
+        .bind(&decision.new_name)
+        .bind(decision.new_category)
+        .bind(id)
+        .execute(pool)
+        .await?;
+
+    Ok(Some(LearnedFilename {
+        filename: decision.new_name,
+        output_path: decision.current_path,
+        category_id: decision.new_category,
+        category_changed: decision.new_category != decision.current_category,
+    }))
+}
+
+/// Apply a learned filename to a freshly-completed engine download: rename the
+/// on-disk file and reconcile its category, relocating it into the category's
+/// folder so the on-disk location agrees with the UI grouping.
+///
+/// Runs whether or not [`mark_learned_filename`] already updated the row's
+/// display metadata mid-flight — the file itself is still at its slug path, so
+/// this is what actually moves the bytes. See [`decide_learned`] for the
+/// guard. Returns `Ok(None)` when nothing changed.
+pub(crate) async fn apply_engine_filename(
+    pool: &SqlitePool,
+    id: DownloadId,
+    url: &url::Url,
+    hint: &str,
+) -> Result<Option<RenamedDownload>> {
+    let Some(decision) = decide_learned(pool, id, url, hint).await? else {
+        return Ok(None);
+    };
+    let LearnedDecision {
+        new_name,
+        current_path,
+        current_category,
+        new_category,
+        ..
+    } = decision;
+
+    // Relocate the working (slug-named) file to its final home: the category's
+    // folder + the learned name. `category_target_folder` mirrors the add-time
+    // `resolve_output_path`, so when the category is unchanged it resolves to
+    // the folder the file already lives in and the move degrades to an
+    // in-folder rename. Best-effort: on any IO failure `move_renamed` returns
+    // `current_path` unchanged, so we leave the DB pointing at the real file
+    // rather than a path that was never produced.
+    let dest_folder = category_target_folder(pool, new_category).await?;
+    let dest = move_renamed(&current_path, &dest_folder, std::ffi::OsStr::new(&new_name)).await;
+    if dest == current_path {
+        return Ok(None);
+    }
+    let final_name = dest
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&new_name)
+        .to_string();
+
+    sqlx::query("UPDATE downloads SET filename = ?, output_path = ?, category_id = ? WHERE id = ?")
+        .bind(&final_name)
+        .bind(dest.to_string_lossy().as_ref())
+        .bind(new_category)
+        .bind(id)
+        .execute(pool)
+        .await?;
+
+    Ok(Some(RenamedDownload {
+        filename: final_name,
+        path: dest,
+        category_id: new_category,
+        category_changed: new_category != current_category,
+    }))
+}
+
 /// Resolve the folder a download in `category_id` should live in: the
 /// category's configured folder, else the global default, else the current
 /// directory. Mirrors the folder selection in [`resolve_output_path`].
@@ -646,19 +852,27 @@ async fn category_target_folder(pool: &SqlitePool, category_id: Option<i64>) -> 
 /// Best-effort: on any IO failure returns `from` unchanged so the DB keeps
 /// pointing at the real file rather than a path that doesn't exist.
 async fn move_into_folder(from: &Path, dest_dir: &Path) -> PathBuf {
-    let file_name = match from.file_name() {
-        Some(n) => n.to_owned(),
-        None => return from.to_path_buf(),
-    };
+    match from.file_name() {
+        Some(name) => move_renamed(from, dest_dir, name).await,
+        None => from.to_path_buf(),
+    }
+}
+
+/// Move `from` into `dest_dir` under `new_name`, deduping on collision
+/// (`stem (n).ext`) and falling back to copy + delete for cross-volume moves.
+/// Returns the path the file ended up at, or `from` unchanged on any IO
+/// failure (so the DB keeps pointing at the real file rather than a path that
+/// doesn't exist). [`move_into_folder`] is the keep-the-current-name case.
+async fn move_renamed(from: &Path, dest_dir: &Path, new_name: &std::ffi::OsStr) -> PathBuf {
     if tokio::fs::create_dir_all(dest_dir).await.is_err() {
         return from.to_path_buf();
     }
-    let mut dest = dest_dir.join(&file_name);
+    let mut dest = dest_dir.join(new_name);
     if dest == from {
         return from.to_path_buf();
     }
     if tokio::fs::metadata(&dest).await.is_ok() {
-        dest = dedupe_path(dest_dir, &file_name).await;
+        dest = dedupe_path(dest_dir, new_name).await;
     }
     match tokio::fs::rename(from, &dest).await {
         Ok(()) => dest,
@@ -670,7 +884,7 @@ async fn move_into_folder(from: &Path, dest_dir: &Path) -> PathBuf {
             }
             Err(e) => {
                 tracing::warn!(error = %e, from = %from.display(), to = %dest.display(),
-                    "failed to move completed download into category folder");
+                    "failed to move completed download to learned path");
                 from.to_path_buf()
             }
         },
@@ -1472,5 +1686,291 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(total, 16_900_000);
+    }
+
+    /// Insert a row with an explicit url + on-disk path so the
+    /// `apply_engine_filename` URL-tail guard can be exercised.
+    async fn seed_row_with_url(
+        pool: &SqlitePool,
+        url: &str,
+        filename: &str,
+        output_path: &str,
+        category_id: Option<i64>,
+    ) -> i64 {
+        let row = sqlx::query(
+            "INSERT INTO downloads (url, filename, output_path, total_bytes, downloaded_bytes, \
+                                    status, category_id, priority, segments, created_at) \
+             VALUES (?, ?, ?, NULL, 0, 'active', ?, 0, 1, '2026-01-01T00:00:00Z') \
+             RETURNING id",
+        )
+        .bind(url)
+        .bind(filename)
+        .bind(output_path)
+        .bind(category_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        row.get("id")
+    }
+
+    #[tokio::test]
+    async fn apply_engine_filename_renames_slug_and_recategorizes() {
+        // The reported DDL symptom: the row was named after the random URL
+        // slug because the add-time probe couldn't see the real name. The
+        // download GET learned `clip.mp4` via Content-Disposition. With the
+        // Video category pointed at its own folder, the file is both renamed
+        // *and relocated* there so the on-disk location matches the UI.
+        let pool = fresh_pool().await;
+        let other = crate::category::find_by_name(&pool, "Other")
+            .await
+            .unwrap()
+            .unwrap();
+        let video = crate::category::find_by_name(&pool, "Video")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let other_dir = tmp.path().join("Other");
+        let video_dir = tmp.path().join("Video");
+        tokio::fs::create_dir_all(&other_dir).await.unwrap();
+        // Configure the Video category's folder (a user who set per-category
+        // download folders); the recategorized file should land here.
+        sqlx::query("UPDATE categories SET default_output_path = ? WHERE id = ?")
+            .bind(video_dir.to_string_lossy().as_ref())
+            .bind(video.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let slug = "BWImVeeBXzQpnkCSnOk7PLUjH";
+        let on_disk = other_dir.join(slug);
+        tokio::fs::write(&on_disk, b"video bytes").await.unwrap();
+        let url = format!("https://dl.fuckingfast.co/dl/{slug}");
+        let id = seed_row_with_url(&pool, &url, slug, on_disk.to_str().unwrap(), Some(other.id))
+            .await;
+
+        let renamed = apply_engine_filename(&pool, id, &url.parse().unwrap(), "clip.mp4")
+            .await
+            .unwrap()
+            .expect("a better name should rename");
+
+        let moved = video_dir.join("clip.mp4");
+        assert_eq!(renamed.filename, "clip.mp4");
+        assert!(renamed.category_changed);
+        assert_eq!(renamed.category_id, Some(video.id));
+        assert_eq!(renamed.path, moved);
+        // File physically relocated into the Video folder under the new name;
+        // the slug in the Other folder is gone.
+        assert!(tokio::fs::metadata(&moved).await.is_ok());
+        assert!(tokio::fs::metadata(&on_disk).await.is_err());
+
+        let row = sqlx::query("SELECT filename, output_path, category_id FROM downloads WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.get::<String, _>("filename"), "clip.mp4");
+        assert_eq!(
+            row.get::<String, _>("output_path"),
+            moved.to_string_lossy()
+        );
+        assert_eq!(row.get::<i64, _>("category_id"), video.id);
+    }
+
+    #[tokio::test]
+    async fn apply_engine_filename_renames_in_place_when_category_unchanged() {
+        // The learned name improves on the slug but its extension routes to
+        // the same category (`.dat` is in no category's rules → Other), so
+        // the file is renamed inside Other's folder, not relocated elsewhere.
+        let pool = fresh_pool().await;
+        let other = crate::category::find_by_name(&pool, "Other")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("downloads");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        // Point the Other category at this folder so it's where the file both
+        // started and stays (the realistic shape: a row lives in the folder
+        // its category resolves to).
+        sqlx::query("UPDATE categories SET default_output_path = ? WHERE id = ?")
+            .bind(dir.to_string_lossy().as_ref())
+            .bind(other.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let slug = "abc123def456";
+        let on_disk = dir.join(slug);
+        tokio::fs::write(&on_disk, b"x").await.unwrap();
+        let url = format!("https://host.example/d/{slug}");
+        let id = seed_row_with_url(&pool, &url, slug, on_disk.to_str().unwrap(), Some(other.id))
+            .await;
+
+        let renamed = apply_engine_filename(&pool, id, &url.parse().unwrap(), "data.dat")
+            .await
+            .unwrap()
+            .expect("a better name should still rename in place");
+
+        assert_eq!(renamed.filename, "data.dat");
+        assert!(!renamed.category_changed);
+        assert_eq!(renamed.category_id, Some(other.id));
+        // Renamed in the SAME folder, not relocated.
+        assert_eq!(renamed.path, dir.join("data.dat"));
+        assert!(tokio::fs::metadata(dir.join("data.dat")).await.is_ok());
+        assert!(tokio::fs::metadata(&on_disk).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn apply_engine_filename_respects_non_slug_name() {
+        // The stored name doesn't match the URL tail, so it came from a
+        // real source (a user choice or an add-time Content-Disposition).
+        // The engine hint must NOT clobber it.
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let on_disk = tmp.path().join("My Report.pdf");
+        tokio::fs::write(&on_disk, b"pdf").await.unwrap();
+        let url = "https://host.example.com/d/abc123xyz";
+        let id = seed_row_with_url(&pool, url, "My Report.pdf", on_disk.to_str().unwrap(), None)
+            .await;
+
+        let got = apply_engine_filename(&pool, id, &url.parse().unwrap(), "something-else.bin")
+            .await
+            .unwrap();
+        assert!(got.is_none(), "a deliberately-chosen name is never overridden");
+        assert!(tokio::fs::metadata(&on_disk).await.is_ok(), "file untouched");
+    }
+
+    #[tokio::test]
+    async fn apply_engine_filename_ignores_slug_hint() {
+        // Even when the stored name IS the URL slug, a hint that is itself a
+        // slug is no improvement and must be ignored (no needless rename).
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let slug = "LdFGH2vN9xKq";
+        let on_disk = tmp.path().join(slug);
+        tokio::fs::write(&on_disk, b"x").await.unwrap();
+        let url = format!("https://pixeldrain.com/api/file/{slug}");
+        let id = seed_row_with_url(&pool, &url, slug, on_disk.to_str().unwrap(), None).await;
+
+        let got = apply_engine_filename(&pool, id, &url.parse().unwrap(), "anotherSlug12345")
+            .await
+            .unwrap();
+        assert!(got.is_none(), "a sluggy hint is no better than the slug");
+    }
+
+    #[tokio::test]
+    async fn mark_learned_filename_updates_display_without_moving_file() {
+        // Mid-download: the engine learns the real name from the response
+        // headers. The row's display name + category update immediately so the
+        // user isn't staring at a slug, but the file on disk stays put — the
+        // engine is still writing it.
+        let pool = fresh_pool().await;
+        let other = crate::category::find_by_name(&pool, "Other")
+            .await
+            .unwrap()
+            .unwrap();
+        let video = crate::category::find_by_name(&pool, "Video")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let slug = "BWImVeeBXzQpnkCSnOk7PLUjH";
+        let on_disk = tmp.path().join(slug);
+        tokio::fs::write(&on_disk, b"partial").await.unwrap();
+        let url = format!("https://dl.fuckingfast.co/dl/{slug}");
+        let id = seed_row_with_url(&pool, &url, slug, on_disk.to_str().unwrap(), Some(other.id))
+            .await;
+
+        let learned = mark_learned_filename(&pool, id, &url.parse().unwrap(), "clip.mp4")
+            .await
+            .unwrap()
+            .expect("the real name should be applied to the display row");
+
+        assert_eq!(learned.filename, "clip.mp4");
+        assert!(learned.category_changed);
+        assert_eq!(learned.category_id, Some(video.id));
+        // The file has NOT moved: still at the slug path, no clip.mp4 yet.
+        assert_eq!(learned.output_path, on_disk);
+        assert!(tokio::fs::metadata(&on_disk).await.is_ok());
+        assert!(tokio::fs::metadata(tmp.path().join("clip.mp4")).await.is_err());
+
+        let row = sqlx::query("SELECT filename, output_path, category_id FROM downloads WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.get::<String, _>("filename"), "clip.mp4");
+        // output_path still points at the working (slug) file.
+        assert_eq!(
+            row.get::<String, _>("output_path"),
+            on_disk.to_string_lossy()
+        );
+        assert_eq!(row.get::<i64, _>("category_id"), video.id);
+
+        // Idempotent: re-emitting the same hint (resume/restart) is a no-op.
+        let again = mark_learned_filename(&pool, id, &url.parse().unwrap(), "clip.mp4")
+            .await
+            .unwrap();
+        assert!(again.is_none(), "re-applying the same name changes nothing");
+    }
+
+    #[tokio::test]
+    async fn apply_engine_filename_relocates_after_early_display_update() {
+        // After a mid-flight display update swapped the slug for the real
+        // name, completion must still relocate the physical file (still at the
+        // slug path) into the category folder — keyed off the on-disk name,
+        // not the already-updated display name.
+        let pool = fresh_pool().await;
+        let other = crate::category::find_by_name(&pool, "Other")
+            .await
+            .unwrap()
+            .unwrap();
+        let video = crate::category::find_by_name(&pool, "Video")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let other_dir = tmp.path().join("Other");
+        let video_dir = tmp.path().join("Video");
+        tokio::fs::create_dir_all(&other_dir).await.unwrap();
+        sqlx::query("UPDATE categories SET default_output_path = ? WHERE id = ?")
+            .bind(video_dir.to_string_lossy().as_ref())
+            .bind(video.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let slug = "BWImVeeBXzQpnkCSnOk7PLUjH";
+        let on_disk = other_dir.join(slug);
+        tokio::fs::write(&on_disk, b"video bytes").await.unwrap();
+        let url = format!("https://dl.fuckingfast.co/dl/{slug}");
+        let id = seed_row_with_url(&pool, &url, slug, on_disk.to_str().unwrap(), Some(other.id))
+            .await;
+
+        // Mid-flight: display name + category already updated, file unmoved.
+        mark_learned_filename(&pool, id, &url.parse().unwrap(), "clip.mp4")
+            .await
+            .unwrap()
+            .expect("display update");
+
+        // Completion: physical relocate into the Video folder.
+        let renamed = apply_engine_filename(&pool, id, &url.parse().unwrap(), "clip.mp4")
+            .await
+            .unwrap()
+            .expect("the file should still be relocated at completion");
+
+        let moved = video_dir.join("clip.mp4");
+        assert_eq!(renamed.filename, "clip.mp4");
+        // Category was already Video from the mid-flight update, so completion
+        // reports no further change (the queue won't re-emit CategoryChanged).
+        assert!(!renamed.category_changed);
+        assert_eq!(renamed.category_id, Some(video.id));
+        assert_eq!(renamed.path, moved);
+        assert!(tokio::fs::metadata(&moved).await.is_ok());
+        assert!(tokio::fs::metadata(&on_disk).await.is_err());
     }
 }

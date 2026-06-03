@@ -76,6 +76,13 @@ pub struct DownloadSummary {
     /// mark an HTML landing page (served in place of the real file by
     /// one-click hosts) as a successful download.
     pub content_type: Option<String>,
+    /// Best filename the engine derived from the *download* response
+    /// (`Content-Disposition` / final-redirect URL). Single-use-token and
+    /// one-click hosts often name the file only on the GET that fetches the
+    /// bytes — too late for the add-time probe, which had to fall back to
+    /// the random URL slug. The queue applies this after completion to
+    /// rename such files. `None` when the engine learned nothing better.
+    pub filename_hint: Option<String>,
 }
 
 /// Start a brand-new download. If a sidecar already exists for the output
@@ -160,6 +167,7 @@ pub async fn download_with_control(
         meta.save(&meta_path).await?;
         preallocate(&opts.output, meta.total_bytes).await?;
         let content_type = info.content_type.clone();
+        let filename_hint = info.filename_hint.clone();
         // A child token: a worker failure inside `run_transfer` calls
         // `cancel()`, and token clones share state — using the parent
         // directly would cancel the fallback before it starts. The child is
@@ -174,6 +182,7 @@ pub async fn download_with_control(
             false,
             control_rx,
             content_type,
+            filename_hint,
             None,
             Some(opts.segments),
         )
@@ -201,6 +210,7 @@ pub async fn download_with_control(
     meta.save(&meta_path).await?;
     preallocate(&opts.output, meta.total_bytes).await?;
     let content_type = info.content_type.clone();
+    let filename_hint = info.filename_hint.clone();
     run_transfer(
         client,
         opts,
@@ -211,6 +221,7 @@ pub async fn download_with_control(
         false,
         control_rx,
         content_type,
+        filename_hint,
         Some(resp),
         None,
     )
@@ -234,6 +245,7 @@ async fn single_stream_download(
     meta.save(meta_path).await?;
     preallocate(&opts.output, meta.total_bytes).await?;
     let content_type = info.content_type.clone();
+    let filename_hint = info.filename_hint.clone();
     run_transfer(
         client.clone(),
         opts,
@@ -244,6 +256,7 @@ async fn single_stream_download(
         false,
         None,
         content_type,
+        filename_hint,
         Some(resp),
         None,
     )
@@ -365,8 +378,10 @@ pub async fn resume_at_with_control(
     }
 
     let content_type = info.content_type.clone();
+    let filename_hint = info.filename_hint.clone();
     run_transfer(
-        client, opts, meta, meta_path, cancel, tx, true, control_rx, content_type, None, None,
+        client, opts, meta, meta_path, cancel, tx, true, control_rx, content_type, filename_hint,
+        None, None,
     )
     .await
 }

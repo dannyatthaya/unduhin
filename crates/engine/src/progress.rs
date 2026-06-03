@@ -43,6 +43,14 @@ pub enum ProgressEvent {
         segments: usize,
         resumed_bytes: u64,
     },
+    /// The filename the engine derived from the download response
+    /// (`Content-Disposition` / final-redirect URL), surfaced as soon as the
+    /// response headers arrive — before the body finishes — so a consumer can
+    /// show the real name (and re-categorize) mid-flight instead of leaving a
+    /// random URL slug on screen until completion. Advisory: the file on disk
+    /// is not renamed here (the engine still owns it); the same hint rides out
+    /// on [`crate::DownloadSummary::filename_hint`] for the final move.
+    FilenameLearned { hint: String },
     /// Per-segment heartbeat from the ticker. `bytes_downloaded` is
     /// cumulative for the segment; `speed_bps` is the worker's own
     /// smoothed rate; `state` is the median-relative verdict.

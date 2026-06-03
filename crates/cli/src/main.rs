@@ -572,6 +572,11 @@ fn spawn_progress_bar(mut rx: broadcast::Receiver<ProgressEvent>) -> tokio::task
                     bar.set_position(downloaded);
                 }
                 Ok(ProgressEvent::SegmentProgress { .. }) => {}
+                Ok(ProgressEvent::FilenameLearned { hint }) => {
+                    // The CLI is given an explicit output path, so the learned
+                    // name doesn't rename anything here; surface it on the bar.
+                    bar.set_message(hint);
+                }
                 Ok(ProgressEvent::Completed { bytes }) => {
                     bar.set_length(bytes.max(total.unwrap_or(bytes)));
                     bar.set_position(bytes);
