@@ -17,8 +17,8 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde::Serialize;
 use tokio::sync::broadcast;
 use unduhin_core::{
-    AddDownload, CategorySelector, Core, DownloadFilter, DownloadSource, NewCategory, SettingValue,
-    Status,
+    AddDownload, CategorySelector, Core, DownloadFilter, DownloadKind, DownloadSource, NewCategory,
+    SettingValue, Status,
 };
 use url::Url;
 
@@ -303,6 +303,8 @@ async fn run_add(db: Option<PathBuf>, args: AddArgs) -> anyhow::Result<()> {
             media_info: None,
             headers: None,
             source: DownloadSource::Cli,
+            kind: DownloadKind::Http,
+            torrent: None,
         })
         .await?;
     let record = core.get_download(id).await?;
@@ -572,6 +574,10 @@ fn spawn_progress_bar(mut rx: broadcast::Receiver<ProgressEvent>) -> tokio::task
                     bar.set_position(downloaded);
                 }
                 Ok(ProgressEvent::SegmentProgress { .. }) => {}
+                // Torrent-only swarm / per-file variants (design §3.C). The CLI
+                // drives HTTP downloads only and never receives these; ignore
+                // them so the match stays exhaustive.
+                Ok(ProgressEvent::SwarmProgress { .. } | ProgressEvent::FileProgress { .. }) => {}
                 Ok(ProgressEvent::FilenameLearned { hint }) => {
                     // The CLI is given an explicit output path, so the learned
                     // name doesn't rename anything here; surface it on the bar.

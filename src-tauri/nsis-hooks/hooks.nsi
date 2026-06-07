@@ -121,8 +121,43 @@ FunctionEnd
     Pop $0
 !macroend
 
+; -------------------------------------------------------------------
+; Terminate running Unduhin processes so Windows releases the lock on
+; their .exe images. This matters because the native-messaging host is
+; owned by the *browser* (a long-lived `connectNative` port keeps it
+; alive), not by the app or the installer. Without this:
+;   - on uninstall, the still-running `native-host\unduhin-native-host.exe`
+;     leaves an orphaned process AND the locked binary on disk — deleting
+;     the registry keys alone only stops *future* launches; and
+;   - on upgrade, the staged host binary can't be overwritten.
+;
+; Process images: `Unduhin.exe` is the installed/bundled main app (Tauri
+; renames the `unduhin-app` cargo bin to `productName`); `unduhin-app.exe`
+; is the dev-build name, killed too so a dev machine cleans up. taskkill
+; exits non-zero when a process isn't running — we Pop and ignore it.
+; `nsExec::Exec` runs hidden (no console flash), unlike the `Exec` instr.
+; -------------------------------------------------------------------
+!macro UnduhinKillProcesses
+    DetailPrint "Stopping any running Unduhin processes..."
+    Push $0
+    nsExec::Exec 'taskkill /F /IM "unduhin-native-host.exe"'
+    Pop $0
+    nsExec::Exec 'taskkill /F /IM "Unduhin.exe"'
+    Pop $0
+    nsExec::Exec 'taskkill /F /IM "unduhin-app.exe"'
+    Pop $0
+    Pop $0
+!macroend
+
 ; Tauri's per-user NSIS install runs under HKCU; HKLM keys would require
 ; elevation. The browsers below all honour HKCU for native messaging.
+
+; Fired before files are staged. On an upgrade the previous host process
+; is still alive (browser keeps the port open), so kill it first or the
+; resource copy fails on the locked binary.
+!macro NSIS_HOOK_PREINSTALL
+    !insertmacro UnduhinKillProcesses
+!macroend
 
 !macro NSIS_HOOK_POSTINSTALL
     DetailPrint "Registering Native Messaging hooks for supported browsers..."
@@ -144,6 +179,10 @@ FunctionEnd
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
+    ; Kill the browser-owned host (and the app) first: the host's binary
+    ; is locked while it runs, so without this the uninstaller can't
+    ; delete it and an orphan process survives the uninstall.
+    !insertmacro UnduhinKillProcesses
     DetailPrint "Removing Native Messaging hooks..."
     DeleteRegKey HKCU "Software\Google\Chrome\NativeMessagingHosts\${NM_HOST_NAME}"
     DeleteRegKey HKCU "Software\Microsoft\Edge\NativeMessagingHosts\${NM_HOST_NAME}"

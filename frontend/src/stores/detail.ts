@@ -9,7 +9,7 @@ import { ref } from "vue";
 
 import type { DownloadId } from "@/types/tauri-bindings";
 
-export type DetailTab = "overview" | "segments" | "history";
+export type DetailTab = "overview" | "segments" | "torrent" | "history";
 
 export const useDetailStore = defineStore("detail", () => {
   const openId = ref<DownloadId | null>(null);

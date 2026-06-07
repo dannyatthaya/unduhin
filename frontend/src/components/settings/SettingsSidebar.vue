@@ -9,6 +9,7 @@ import {
   Code2,
   Film,
   Info,
+  Magnet,
 } from "lucide-vue-next";
 import type { Component } from "vue";
 
@@ -35,6 +36,7 @@ const items: NavItem[] = [
   { key: "categories", label: SECTION_LABELS.categories, icon: Folder },
   { key: "behaviour", label: SECTION_LABELS.behaviour, icon: Globe },
   { key: "network", label: SECTION_LABELS.network, icon: ArrowRight },
+  { key: "torrent", label: SECTION_LABELS.torrent, icon: Magnet },
 ];
 
 const integrationItems: NavItem[] = [

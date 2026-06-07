@@ -10,16 +10,22 @@
 // The matcher is intentionally conservative — false positives feel
 // noisier than false negatives because each match surfaces a toast.
 
+import { infoHashFromMagnet, isMagnetUri } from "@/lib/torrentInput";
+
 /**
  * Result of inspecting a clipboard payload. `null` means "no match —
- * stay silent". A non-null result carries the canonical URL and the
- * extension that was matched (the latter is only useful for telemetry
- * / debugging in the dev console).
+ * stay silent". A non-null result is one of two kinds:
+ *
+ * - `http`  — a direct-download URL whose tail extension is allowlisted.
+ *   Carries the canonical URL and the matched `ext` (useful for telemetry
+ *   / debugging in the dev console).
+ * - `magnet`— a BitTorrent magnet URI. Carries the URI and its info-hash
+ *   (the de-dup key) when one is recoverable; `infoHash` is `null` for an
+ *   exotic magnet with no `btih` topic, which the backend still accepts.
  */
-export interface ClipboardMatch {
-  url: string;
-  ext: string;
-}
+export type ClipboardMatch =
+  | { kind: "http"; url: string; ext: string }
+  | { kind: "magnet"; url: string; infoHash: string | null };
 
 /**
  * Inspect a clipboard payload and return a [`ClipboardMatch`] iff the
@@ -35,6 +41,10 @@ export interface ClipboardMatch {
  *   clipboard surface the user has to opt in to *something* for the
  *   prompt to feel non-spammy.
  * - HTML pages, directory paths, and query-only URLs return `null`.
+ *
+ * Magnet URIs are recognized unconditionally (they ARE downloads — there is
+ * no file-extension to allowlist against). A magnet match short-circuits
+ * before the http allowlist gate.
  */
 export function matchClipboardPayload(
   raw: string,
@@ -46,6 +56,12 @@ export function matchClipboardPayload(
   // Reject anything that visibly spans multiple lines; copying a paragraph
   // shouldn't trigger a capture even if some token in it parses as a URL.
   if (/[\n\r\t]/.test(text)) return null;
+
+  // Magnet URIs are downloads by definition — no allowlist gate (a magnet
+  // has no path-tail extension to match). The info-hash is the de-dup key.
+  if (isMagnetUri(text)) {
+    return { kind: "magnet", url: text, infoHash: infoHashFromMagnet(text) };
+  }
 
   let parsed: URL;
   try {
@@ -65,7 +81,7 @@ export function matchClipboardPayload(
   );
   if (!allow.has(ext)) return null;
 
-  return { url: text, ext };
+  return { kind: "http", url: text, ext };
 }
 
 /**

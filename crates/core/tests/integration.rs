@@ -30,8 +30,8 @@ use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use unduhin_core::settings::settings_keys;
 use unduhin_core::{
-    AddDownload, CategorySelector, Core, CoreEvent, DownloadFilter, DownloadSource, NewSchedule,
-    ScheduleKind, SettingValue, Status,
+    AddDownload, CategorySelector, Core, CoreEvent, DownloadFilter, DownloadKind, DownloadSource,
+    NewSchedule, ScheduleKind, SettingValue, Status,
 };
 use url::Url;
 
@@ -342,6 +342,8 @@ async fn auto_categorize_by_extension() -> Result<()> {
                 media_info: None,
                 headers: None,
                 source: DownloadSource::Manual,
+                kind: DownloadKind::Http,
+                torrent: None,
             })
             .await?;
         let rec = core.get_download(id).await?;
@@ -423,6 +425,8 @@ async fn queue_respects_concurrency_limit() -> Result<()> {
                 media_info: None,
                 headers: None,
                 source: DownloadSource::Manual,
+                kind: DownloadKind::Http,
+                torrent: None,
             })
             .await?;
         ids.push(id);
@@ -503,6 +507,8 @@ async fn pause_resume_survives_core_restart() -> Result<()> {
                 media_info: None,
                 headers: None,
                 source: DownloadSource::Manual,
+                kind: DownloadKind::Http,
+                torrent: None,
             })
             .await?;
 
@@ -592,6 +598,8 @@ async fn queue_emptied_fires_once_per_drain() -> Result<()> {
                 media_info: None,
                 headers: None,
                 source: DownloadSource::Manual,
+                kind: DownloadKind::Http,
+                torrent: None,
             })
             .await?;
         ids.push(id);
@@ -659,6 +667,8 @@ async fn queue_emptied_does_not_fire_during_brief_gap() -> Result<()> {
             media_info: None,
             headers: None,
             source: DownloadSource::Manual,
+            kind: DownloadKind::Http,
+            torrent: None,
         })
         .await?;
     core.start().await?;
@@ -678,6 +688,8 @@ async fn queue_emptied_does_not_fire_during_brief_gap() -> Result<()> {
             media_info: None,
             headers: None,
             source: DownloadSource::Manual,
+            kind: DownloadKind::Http,
+            torrent: None,
         })
         .await?;
     wait_for_status(&core, id2, Status::Completed, Duration::from_secs(30)).await?;
@@ -736,6 +748,8 @@ async fn empty_body_download_fails_instead_of_completing() -> Result<()> {
             media_info: None,
             headers: None,
             source: DownloadSource::Manual,
+            kind: DownloadKind::Http,
+            torrent: None,
         })
         .await?;
     core.start().await?;
@@ -788,6 +802,8 @@ async fn html_landing_page_download_fails_instead_of_completing() -> Result<()> 
             media_info: None,
             headers: None,
             source: DownloadSource::Manual,
+            kind: DownloadKind::Http,
+            torrent: None,
         })
         .await?;
     core.start().await?;
@@ -836,6 +852,8 @@ async fn start_at_schedule_defers_until_due() -> Result<()> {
             media_info: None,
             headers: None,
             source: DownloadSource::Manual,
+            kind: DownloadKind::Http,
+            torrent: None,
         })
         .await?;
 
@@ -913,6 +931,83 @@ async fn quiet_hours_state_reflects_active_window() -> Result<()> {
         state.until.is_some(),
         "active quiet hours should report a non-null `until`"
     );
+
+    core.shutdown().await?;
+    Ok(())
+}
+
+/// P6 hand-off: an extension `TorrentJob` (magnet) flows through
+/// `torrent_handoff::add_download_from_torrent_job` → `Core::add_download` and
+/// lands a torrent row whose `kind`, `source`, and recovered `info_hash` are
+/// all populated — the same contract the pipe server's
+/// `handle_download_torrent` relies on, exercised at the core boundary so it
+/// needs no `src-tauri` dependency. Mirrors `pipe_smoke`'s shape but for the
+/// torrent path.
+#[tokio::test]
+async fn extension_torrent_job_lands_a_torrent_row() -> Result<()> {
+    use unduhin_core::wire::TorrentJob;
+
+    let dir = tempfile::tempdir()?;
+    let (core, _) = fresh_core(&dir).await?;
+    let mut events = core.subscribe();
+
+    let hash = "0123456789abcdef0123456789abcdef01234567";
+    let job = TorrentJob {
+        magnet: Some(format!("magnet:?xt=urn:btih:{hash}&dn=Cool+Thing")),
+        torrent_file_b64: None,
+        page_url: Some("https://tracker.example/details".into()),
+        tab_id: Some(7),
+        suggested_filename: None,
+    };
+
+    let input = unduhin_core::torrent_handoff::add_download_from_torrent_job(
+        job,
+        Some(dir.path().join("incoming")),
+    )?;
+    assert_eq!(input.kind, DownloadKind::Torrent);
+    assert_eq!(input.source, DownloadSource::ExtensionPipe);
+
+    let id = core.add_download(input).await?;
+    assert!(id > 0, "ack id should be positive");
+
+    // DownloadAdded fires with a torrent snapshot.
+    let added = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await {
+                Ok(CoreEvent::DownloadAdded { id: ev, snapshot }) if ev == id => {
+                    return *snapshot;
+                }
+                Ok(_) => continue,
+                Err(_) => panic!("event stream closed before DownloadAdded"),
+            }
+        }
+    })
+    .await
+    .expect("DownloadAdded timed out");
+    assert_eq!(added.kind, DownloadKind::Torrent);
+
+    let rec = core.get_download(id).await?;
+    assert_eq!(rec.kind, DownloadKind::Torrent);
+    assert_eq!(rec.source, DownloadSource::ExtensionPipe);
+    // `add_download` (via normalize_torrent_meta) recovered the canonical
+    // info-hash from the magnet's xt= — the de-dup key.
+    let meta = rec.torrent.expect("torrent meta persisted");
+    assert_eq!(meta.info_hash, hash);
+    // Provisional display name came from the magnet `dn=`.
+    assert_eq!(rec.filename, "Cool Thing");
+
+    // Q7 front-door de-dup: re-adding the same swarm hands back the SAME row
+    // rather than spawning a twin.
+    let dup_job = TorrentJob {
+        magnet: Some(format!("magnet:?xt=urn:btih:{hash}")),
+        torrent_file_b64: None,
+        page_url: None,
+        tab_id: None,
+        suggested_filename: None,
+    };
+    let dup_input = unduhin_core::torrent_handoff::add_download_from_torrent_job(dup_job, None)?;
+    let dup_id = core.add_download(dup_input).await?;
+    assert_eq!(dup_id, id, "duplicate magnet add should return the existing row");
 
     core.shutdown().await?;
     Ok(())

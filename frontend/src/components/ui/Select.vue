@@ -1,4 +1,5 @@
 <script setup lang="ts" generic="T extends string | number">
+import { computed } from "vue";
 import { Check, ChevronDown } from "lucide-vue-next";
 import {
   SelectContent,
@@ -9,7 +10,6 @@ import {
   SelectPortal,
   SelectRoot,
   SelectTrigger,
-  SelectValue,
   SelectViewport,
 } from "reka-ui";
 
@@ -47,6 +47,17 @@ function emitValue(raw: string | number) {
   }
   emit("update:modelValue", raw as T);
 }
+
+// Reactively look up the selected option's label so the trigger updates when
+// option labels change (e.g. switching app language). reka-ui's <SelectValue>
+// captures the selected item's text once at selection time and would otherwise
+// show a stale (English) label after a locale switch.
+const selectedLabel = computed(() => {
+  const match = props.options.find(
+    (o) => String(o.value) === String(props.modelValue),
+  );
+  return match ? match.label : (props.placeholder ?? "");
+});
 </script>
 
 <template>
@@ -58,7 +69,7 @@ function emitValue(raw: string | number) {
     <SelectTrigger
       class="inline-flex h-9 w-full items-center justify-between rounded-md border border-input bg-background px-3 text-sm transition-colors hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring data-disabled:cursor-not-allowed data-disabled:opacity-50"
     >
-      <SelectValue :placeholder="placeholder ?? ''" />
+      <span class="truncate text-left">{{ selectedLabel }}</span>
       <SelectIcon as-child>
         <ChevronDown class="h-4 w-4 shrink-0 text-muted-foreground" />
       </SelectIcon>

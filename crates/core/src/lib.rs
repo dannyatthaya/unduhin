@@ -34,13 +34,15 @@ mod secret;
 pub mod settings;
 pub mod speed;
 pub mod tooling;
+pub mod torrent_handoff;
 pub mod wire;
 pub mod ytdlp;
 
 pub use category::{Category, CategoryId, NewCategory};
 pub use download::{
     count_by_source, last_by_source, AddDownload, CategorySelector, DownloadFilter, DownloadId,
-    DownloadRecord, DownloadSource, Status, ALL_STATUSES,
+    DownloadKind, DownloadRecord, DownloadSource, Status, SwarmStats, TorrentFile, TorrentMeta,
+    TorrentSource, ALL_STATUSES,
 };
 pub use error::{CoreError, Result};
 pub use event::CoreEvent;
@@ -76,6 +78,16 @@ struct CoreInner {
     /// dominate (queue tick + notifications gate); writes happen only on
     /// schedule CRUD, so an `RwLock` is the right shape.
     schedules: Arc<RwLock<SchedulesCache>>,
+    /// Process-wide librqbit session, behind the `crates/torrent` facade.
+    /// Lazily built on the first `DownloadKind::Torrent` claim (design §3.D):
+    /// it owns one DHT, one listen socket, and one peer budget, so users who
+    /// never touch torrents bind no socket and start no DHT. Shared with the
+    /// queue manager (the worker resolves it from here). The
+    /// `fetch_torrent_metadata` command does NOT use this session — it spins up
+    /// a separate short-lived `list_only` probe session (ephemeral port, UPnP
+    /// off) so an add-dialog metadata probe never contends with active
+    /// downloads.
+    torrent_engine: Arc<queue::TorrentEngineCell>,
 }
 
 impl Core {
@@ -136,6 +148,7 @@ impl Core {
                 events: tx,
                 queue: Mutex::new(None),
                 schedules: Arc::new(RwLock::new(schedules)),
+                torrent_engine: Arc::new(queue::TorrentEngineCell::new()),
             }),
         })
     }
@@ -173,6 +186,7 @@ impl Core {
             self.inner.pool.clone(),
             self.inner.events.clone(),
             self.inner.schedules.clone(),
+            self.inner.torrent_engine.clone(),
         )
         .await;
         *slot = Some(handle);
@@ -205,6 +219,31 @@ impl Core {
         });
         self.poke_queue().await;
         Ok(id)
+    }
+
+    /// Resolve a torrent's metadata (file list) WITHOUT downloading — backs the
+    /// add-dialog file picker. Uses the queue's SHARED process-wide librqbit
+    /// session (built on first use from the `torrent_*` settings), NOT a
+    /// throwaway one: a second session starts a second `PersistentDht` on the
+    /// same persisted UDP port, which fails to bind ("error initializing
+    /// persistent DHT") and would starve the real download of peers. `list_only`
+    /// only probes — it adds nothing to the session and doesn't disturb active
+    /// downloads.
+    pub async fn fetch_torrent_metadata(
+        &self,
+        input: torrent::TorrentInput,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<torrent::TorrentMetadata> {
+        let engine = self
+            .inner
+            .torrent_engine
+            .get_or_init(&self.inner.pool)
+            .await?;
+        let meta = engine
+            .fetch_metadata(&input, cancel)
+            .await
+            .map_err(engine::EngineError::from)?;
+        Ok(meta)
     }
 
     pub async fn list_downloads(&self, filter: DownloadFilter) -> Result<Vec<DownloadRecord>> {
@@ -250,6 +289,10 @@ impl Core {
     /// the DB row is removed regardless — the user asked to forget the
     /// download and we honour that even if the file is locked.
     pub async fn remove(&self, id: DownloadId, delete_data: bool) -> Result<()> {
+        // Snapshot the row before deleting so we know whether it's a torrent
+        // (and its info_hash) — needed to forget it from the live librqbit
+        // session below.
+        let record = download::get(&self.inner.pool, id).await.ok();
         // Cancel first so the queue manager drops any active handle and
         // flushes the sidecar, then delete the row.
         let _ = self.cancel(id).await;
@@ -264,6 +307,22 @@ impl Core {
             let slot = self.inner.queue.lock().await;
             if let Some(q) = slot.as_ref() {
                 q.cancel_and_wait(id).await;
+            }
+        }
+        // For torrents, remove it from the live librqbit session so a later
+        // re-add starts FRESH. Without this, librqbit keeps it managed in
+        // memory and `add_torrent` returns `AlreadyManaged`, resuming from where
+        // it left off (e.g. 50%) even after the row and files are gone. Only
+        // when a session already exists; `delete_data` lets librqbit drop the
+        // content + fastresume too.
+        if let Some(rec) = record
+            .as_ref()
+            .filter(|r| r.kind == download::DownloadKind::Torrent)
+        {
+            if let Some(meta) = rec.torrent.as_ref().filter(|m| !m.info_hash.is_empty()) {
+                if let Some(engine) = self.inner.torrent_engine.get() {
+                    let _ = engine.forget(&meta.info_hash, delete_data).await;
+                }
             }
         }
         let outcome = download::remove(&self.inner.pool, id, delete_data).await?;

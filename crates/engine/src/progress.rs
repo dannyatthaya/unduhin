@@ -73,6 +73,35 @@ pub enum ProgressEvent {
     Completed { bytes: u64 },
     /// Final failure. Stringified because broadcast requires `Clone`.
     Failed { error: String },
+    /// Per-poll swarm snapshot for a BitTorrent transfer.
+    ///
+    /// **Charter exception (design §5 Q9).** This crate is otherwise a
+    /// pure-HTTP downloader with no torrent concepts, but `core`'s single
+    /// progress pump is shared by every backend; emitting torrent swarm state
+    /// through the same [`ProgressEvent`] vocabulary lets the `crates/torrent`
+    /// facade reuse that one pump instead of standing up a second event path.
+    /// `up_bps` / `down_bps` are bytes/sec; `ratio_milli` is the upload/download
+    /// ratio in thousandths (1500 = 1.5×). The HTTP/media paths never emit it,
+    /// and the pump simply ignored unknown variants before this was added.
+    /// A future `crates/proto` extraction is the cleaner long-term home.
+    SwarmProgress {
+        peers: u32,
+        seeds: u32,
+        up_bps: u64,
+        down_bps: u64,
+        ratio_milli: u32,
+    },
+    /// Per-file progress for a multi-file BitTorrent transfer.
+    ///
+    /// **Charter exception (design §5 Q9)** — same rationale as
+    /// [`ProgressEvent::SwarmProgress`]. `index` is the file's position in the
+    /// torrent's file list; `downloaded` / `total` are bytes for that one file.
+    /// HTTP/media never emit it.
+    FileProgress {
+        index: usize,
+        downloaded: u64,
+        total: u64,
+    },
 }
 
 /// Helper for building a broadcast channel of `ProgressEvent`.

@@ -11,6 +11,7 @@ export type SettingsSectionKey =
   | "categories"
   | "behaviour"
   | "network"
+  | "torrent"
   | "media"
   | "browser"
   | "about";
@@ -30,6 +31,7 @@ export const SECTION_LABELS: Record<SettingsSectionKey, string> = {
   categories: "Categories",
   behaviour: "Behaviour",
   network: "Network",
+  torrent: "Torrent",
   media: "Media",
   browser: "Browser",
   about: "About",
@@ -40,6 +42,7 @@ export const SECTION_ROUTES: Record<SettingsSectionKey, string> = {
   categories: "/settings/categories",
   behaviour: "/settings/behaviour",
   network: "/settings/network",
+  torrent: "/settings/torrent",
   media: "/settings/media",
   browser: "/settings/browser",
   about: "/settings/about",
@@ -231,6 +234,61 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
     description: "The identifier Unduhin sends with every HTTP request.",
     keywords: ["ua", "header", "browser", "identify"],
     route: SECTION_ROUTES.network,
+  },
+
+  // -- Torrent -------------------------------------------------------------
+  {
+    section: "torrent",
+    id: "torrent/listen-port",
+    label: "Listen port",
+    description:
+      "TCP/UDP port for inbound peer connections. 0 lets the OS pick a random port.",
+    keywords: ["port", "listen", "incoming", "peers", "bittorrent"],
+    route: SECTION_ROUTES.torrent,
+  },
+  {
+    section: "torrent",
+    id: "torrent/enable-dht",
+    label: "Enable DHT",
+    description:
+      "Distributed hash table — required to resolve trackerless magnet links.",
+    keywords: ["dht", "magnet", "trackerless", "mainline", "peers"],
+    route: SECTION_ROUTES.torrent,
+  },
+  {
+    section: "torrent",
+    id: "torrent/enable-upnp",
+    label: "Enable UPnP port mapping",
+    description:
+      "Ask the router to forward the listen port so remote peers can reach you.",
+    keywords: ["upnp", "port", "forward", "nat", "router"],
+    route: SECTION_ROUTES.torrent,
+  },
+  {
+    section: "torrent",
+    id: "torrent/max-peers",
+    label: "Max peers per torrent",
+    description: "Upper bound on simultaneous peer connections for one torrent.",
+    keywords: ["peers", "connections", "limit", "budget"],
+    route: SECTION_ROUTES.torrent,
+  },
+  {
+    section: "torrent",
+    id: "torrent/download-dir",
+    label: "Torrent download folder",
+    description:
+      "Where torrent content lands. Empty falls back to the default download folder.",
+    keywords: ["folder", "directory", "path", "torrent", "location"],
+    route: SECTION_ROUTES.torrent,
+  },
+  {
+    section: "torrent",
+    id: "torrent/seed-ratio",
+    label: "Seed ratio",
+    description:
+      "Keep seeding until this upload/download ratio. 0 stops at 100% (no seeding).",
+    keywords: ["seed", "ratio", "upload", "share"],
+    route: SECTION_ROUTES.torrent,
   },
 
   // -- Media ---------------------------------------------------------------

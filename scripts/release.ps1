@@ -70,6 +70,33 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Load local secrets (notably TAURI_SIGNING_PRIVATE_KEY[_PASSWORD]) from a
+# gitignored `.env` at the repo root, so they don't have to be re-exported in
+# every shell. Format is KEY=VALUE; blank lines and #-comments are skipped, and
+# the value is split on the FIRST '=' (signing keys are base64 and contain '=').
+# A value already present in the environment wins, so an explicit `$env:FOO=...`
+# or a CI-provided secret still overrides the file.
+$dotenv = Join-Path $PSScriptRoot "..\.env"
+if (Test-Path -LiteralPath $dotenv) {
+    foreach ($rawLine in Get-Content -LiteralPath $dotenv) {
+        $line = $rawLine.Trim()
+        if ($line.Length -eq 0 -or $line.StartsWith("#")) { continue }
+        $eq = $line.IndexOf("=")
+        if ($eq -lt 1) { continue }
+        $name = $line.Substring(0, $eq).Trim()
+        $value = $line.Substring($eq + 1).Trim()
+        if ($value.Length -ge 2) {
+            $q0 = $value[0]; $q1 = $value[$value.Length - 1]
+            if (($q0 -eq '"' -and $q1 -eq '"') -or ($q0 -eq "'" -and $q1 -eq "'")) {
+                $value = $value.Substring(1, $value.Length - 2)
+            }
+        }
+        if (-not [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($name, "Process"))) { continue }
+        Set-Item -Path ("Env:" + $name) -Value $value
+    }
+    Write-Host "Loaded local env from .env" -ForegroundColor DarkGray
+}
+
 if (-not $ReleaseUrlBase) {
     $ReleaseUrlBase = "https://github.com/dannyatthaya/unduhin/releases/download/v$Version"
 }

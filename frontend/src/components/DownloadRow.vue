@@ -13,6 +13,8 @@ import {
   Play,
   RotateCw,
   Trash2,
+  Users,
+  XCircle,
 } from "lucide-vue-next";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 
@@ -78,6 +80,83 @@ async function restart(id: DownloadId) {
   }
 }
 
+// ── Selection-aware context-menu actions ────────────────────────────────────
+// The right-click menu acts on the WHOLE multi-selection when this row is part
+// of one (count > 1); otherwise just this row — same rule as drag-and-drop.
+// This replaces the floating batch bar: every batch action lives in the menu.
+const targetIds = computed<DownloadId[]>(() =>
+  selection.has(props.download.id) && selection.count > 1
+    ? Array.from(selection.ids)
+    : [props.download.id],
+);
+const targetRecords = computed<DownloadRecord[]>(() =>
+  targetIds.value
+    .map((id) => store.records.get(id))
+    .filter((r): r is DownloadRecord => r != null),
+);
+const isBatch = computed(() => targetIds.value.length > 1);
+
+// Each action shows when ANY target qualifies, and runs only on the qualifying
+// subset — so a mixed multi-selection still does the sensible thing.
+const anyPlayable = computed(() =>
+  targetRecords.value.some(
+    (r) => r.status === "active" || r.status === "queued",
+  ),
+);
+const anyResumable = computed(() =>
+  targetRecords.value.some(
+    (r) => r.status === "paused" || r.status === "failed",
+  ),
+);
+const anyCancellable = computed(() =>
+  targetRecords.value.some((r) =>
+    ["active", "queued", "paused", "muxing"].includes(r.status),
+  ),
+);
+const anyRestartable = computed(() =>
+  targetRecords.value.some(
+    (r) => r.status === "failed" || r.status === "cancelled",
+  ),
+);
+
+/** Run `action` over every target row matching `filter`, in parallel. */
+async function runOnTargets(
+  filter: (r: DownloadRecord) => boolean,
+  action: (id: DownloadId) => Promise<unknown>,
+): Promise<void> {
+  await Promise.allSettled(
+    targetRecords.value.filter(filter).map((r) => action(r.id)),
+  );
+}
+
+const ctxPause = () =>
+  runOnTargets(
+    (r) => r.status === "active" || r.status === "queued",
+    (id) => store.pause(id),
+  );
+const ctxResume = () =>
+  runOnTargets(
+    (r) => r.status === "paused" || r.status === "failed",
+    (id) => store.resume(id),
+  );
+const ctxCancel = () =>
+  runOnTargets(
+    (r) => ["active", "queued", "paused", "muxing"].includes(r.status),
+    (id) => store.cancel(id),
+  );
+const ctxRetry = () =>
+  runOnTargets(
+    (r) => r.status === "failed" || r.status === "cancelled",
+    (id) => restart(id),
+  );
+const ctxDelete = () => deleteConfirm.requestDelete(targetIds.value);
+async function ctxMoveTo(target: Category) {
+  await runOnTargets(
+    (r) => r.category_id !== target.id,
+    (id) => store.setCategory(id, target.id),
+  );
+}
+
 // Parent (DownloadsView) provides the currently visible ordered ids
 // so shift-click range-select knows what to walk between. Falls back to
 // the single row when the component is rendered in isolation.
@@ -88,6 +167,16 @@ const orderedIds = inject<() => DownloadId[]>("orderedIds", () => [
 const stats = computed(() => store.statsFor(props.download.id));
 const isSelected = computed(() => selection.has(props.download.id));
 const isOpenInDetail = computed(() => detail.openId === props.download.id);
+
+/** Peers/seeds badge — only for torrent rows that already carry a swarm
+ *  snapshot (persisted on the `torrent` blob, re-emitted live by
+ *  `swarm_progress`). Null otherwise, so the badge stays hidden for
+ *  HTTP/media rows and torrents that haven't attached to the swarm yet. */
+const swarm = computed(() =>
+  props.download.kind === "torrent"
+    ? props.download.torrent?.swarm ?? null
+    : null
+);
 
 const pct = computed(() =>
   percent(props.download.downloaded_bytes, props.download.total_bytes)
@@ -233,34 +322,10 @@ function onDragStart(e: DragEvent) {
   e.dataTransfer.setData("text/plain", String(id));
 }
 
-const isPlayable = computed(
-  () => props.download.status === "active" || props.download.status === "queued"
-);
-
-const isResumable = computed(
-  () => props.download.status === "paused" || props.download.status === "failed"
-);
-
-const isRestartable = computed(
-  () =>
-    props.download.status === "failed" || props.download.status === "cancelled"
-);
-
 const isRenamable = computed(
   () =>
     props.download.status !== "active" && props.download.status !== "muxing"
 );
-
-async function moveToCategory(target: Category) {
-  if (target.id === props.download.category_id) return;
-  try {
-    await store.setCategory(props.download.id, target.id);
-    toast.push(t("notify.moveSuccess", { category: target.name }), "success");
-  } catch (e) {
-    const message = e instanceof Error ? e.message : String(e);
-    toast.push(t("errors.moveDownload", { error: message }), "error");
-  }
-}
 
 function renameFile() {
   console.info(`Rename ${props.download.id} (todo)`);
@@ -343,6 +408,14 @@ const menuItems = computed(() => {
             {{ download.filename }}
           </h3>
           <StatusBadge :status="download.status" :queue-position="queuePosition" />
+          <span
+            v-if="swarm"
+            class="inline-flex items-center gap-1 rounded-md bg-info/10 px-1.5 py-0.5 text-[11px] font-medium text-info"
+            :title="t('downloads.torrentSwarmBadgeTitle', { peers: swarm.peers, seeds: swarm.seeds })"
+          >
+            <Users class="h-3 w-3" aria-hidden />
+            {{ t("downloads.torrentSwarmBadge", { peers: swarm.peers, seeds: swarm.seeds }) }}
+          </span>
         </div>
 
         <div
@@ -437,48 +510,50 @@ const menuItems = computed(() => {
     </ContextMenuTrigger>
 
     <ContextMenuContent class="min-w-[14rem]">
-      <ContextMenuItem v-if="isPlayable" @select="store.pause(download.id)">
+      <ContextMenuItem v-if="anyPlayable" @select="ctxPause">
         <Pause class="h-3.5 w-3.5" />
         <span>{{ t("downloads.menuPause") }}</span>
         <ContextMenuShortcut>Space</ContextMenuShortcut>
       </ContextMenuItem>
-      <ContextMenuItem
-        v-else-if="isResumable"
-        @select="store.resume(download.id)"
-      >
+      <ContextMenuItem v-else-if="anyResumable" @select="ctxResume">
         <Play class="h-3.5 w-3.5" />
         <span>{{ t("downloads.menuResume") }}</span>
         <ContextMenuShortcut>Space</ContextMenuShortcut>
       </ContextMenuItem>
 
-      <ContextMenuItem
-        :disabled="!isRestartable"
-        @select="restart(download.id)"
-      >
+      <ContextMenuItem v-if="anyCancellable" @select="ctxCancel">
+        <XCircle class="h-3.5 w-3.5" />
+        <span>{{ t("downloads.batchCancel") }}</span>
+      </ContextMenuItem>
+
+      <ContextMenuItem :disabled="!anyRestartable" @select="ctxRetry">
         <RotateCw class="h-3.5 w-3.5" />
         <span>{{ t("downloads.menuRestart") }}</span>
       </ContextMenuItem>
-      <ContextMenuItem @select="detail.open(download.id, 'history')">
-        <Clock class="h-3.5 w-3.5" />
-        <span>{{ t("downloads.menuSchedule") }}</span>
-      </ContextMenuItem>
+      <!-- Single-row-only conveniences (meaningless for a multi-selection). -->
+      <template v-if="!isBatch">
+        <ContextMenuItem @select="detail.open(download.id, 'history')">
+          <Clock class="h-3.5 w-3.5" />
+          <span>{{ t("downloads.menuSchedule") }}</span>
+        </ContextMenuItem>
 
-      <ContextMenuSeparator />
-      <ContextMenuLabel>{{ t("downloads.menuOpen") }}</ContextMenuLabel>
-      <ContextMenuItem @select="openFolder">
-        <Folder class="h-3.5 w-3.5" />
-        <span>{{ t("downloads.menuOpenDestination") }}</span>
-        <ContextMenuShortcut>Ctrl+O</ContextMenuShortcut>
-      </ContextMenuItem>
-      <ContextMenuItem @select="openSourceUrl">
-        <ExternalLink class="h-3.5 w-3.5" />
-        <span>{{ t("downloads.menuOpenSource") }}</span>
-      </ContextMenuItem>
-      <ContextMenuItem @select="copyUrl">
-        <Copy class="h-3.5 w-3.5" />
-        <span>{{ t("downloads.menuCopyUrl") }}</span>
-        <ContextMenuShortcut>Ctrl+C</ContextMenuShortcut>
-      </ContextMenuItem>
+        <ContextMenuSeparator />
+        <ContextMenuLabel>{{ t("downloads.menuOpen") }}</ContextMenuLabel>
+        <ContextMenuItem @select="openFolder">
+          <Folder class="h-3.5 w-3.5" />
+          <span>{{ t("downloads.menuOpenDestination") }}</span>
+          <ContextMenuShortcut>Ctrl+O</ContextMenuShortcut>
+        </ContextMenuItem>
+        <ContextMenuItem @select="openSourceUrl">
+          <ExternalLink class="h-3.5 w-3.5" />
+          <span>{{ t("downloads.menuOpenSource") }}</span>
+        </ContextMenuItem>
+        <ContextMenuItem @select="copyUrl">
+          <Copy class="h-3.5 w-3.5" />
+          <span>{{ t("downloads.menuCopyUrl") }}</span>
+          <ContextMenuShortcut>Ctrl+C</ContextMenuShortcut>
+        </ContextMenuItem>
+      </template>
 
       <ContextMenuSeparator />
       <ContextMenuLabel>{{ t("downloads.menuOrganize") }}</ContextMenuLabel>
@@ -491,14 +566,18 @@ const menuItems = computed(() => {
           <ContextMenuItem
             v-for="c in categories.list"
             :key="c.id"
-            :disabled="c.id === download.category_id"
-            @select="moveToCategory(c)"
+            :disabled="!isBatch && c.id === download.category_id"
+            @select="ctxMoveTo(c)"
           >
             {{ c.name }}
           </ContextMenuItem>
         </ContextMenuSubContent>
       </ContextMenuSub>
-      <ContextMenuItem :disabled="!isRenamable" @select="renameFile">
+      <ContextMenuItem
+        v-if="!isBatch"
+        :disabled="!isRenamable"
+        @select="renameFile"
+      >
         <Pencil class="h-3.5 w-3.5" />
         <span>{{ t("downloads.menuRename") }}</span>
         <ContextMenuShortcut>F2</ContextMenuShortcut>
@@ -506,10 +585,7 @@ const menuItems = computed(() => {
 
       <ContextMenuSeparator />
       <ContextMenuLabel>{{ t("downloads.menuDanger") }}</ContextMenuLabel>
-      <ContextMenuItem
-        variant="danger"
-        @select="deleteConfirm.requestDelete([download.id])"
-      >
+      <ContextMenuItem variant="danger" @select="ctxDelete">
         <Trash2 class="h-3.5 w-3.5" />
         <span>{{ t("downloads.menuDelete") }}</span>
       </ContextMenuItem>

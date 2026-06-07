@@ -19,8 +19,9 @@ describe("matchClipboardPayload", () => {
       FILE_TYPES,
     );
     expect(m).not.toBeNull();
+    expect(m!.kind).toBe("http");
     expect(m!.url).toBe("https://example.com/files/setup.zip");
-    expect(m!.ext).toBe("zip");
+    expect(m!.kind === "http" && m!.ext).toBe("zip");
   });
 
   it("matches mp4 case-insensitively", () => {
@@ -28,7 +29,7 @@ describe("matchClipboardPayload", () => {
       "https://example.com/video.MP4",
       FILE_TYPES,
     );
-    expect(m?.ext).toBe("mp4");
+    expect(m?.kind === "http" && m.ext).toBe("mp4");
   });
 
   it("trims surrounding whitespace before parsing", () => {
@@ -37,6 +38,34 @@ describe("matchClipboardPayload", () => {
       FILE_TYPES,
     );
     expect(m?.url).toBe("https://example.com/setup.iso");
+  });
+
+  it("captures a magnet URI regardless of the allowlist", () => {
+    const uri =
+      "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=Foo";
+    const m = matchClipboardPayload(uri, []);
+    expect(m).not.toBeNull();
+    expect(m!.kind).toBe("magnet");
+    expect(m!.url).toBe(uri);
+    expect(m!.kind === "magnet" && m!.infoHash).toBe(
+      "0123456789abcdef0123456789abcdef01234567",
+    );
+  });
+
+  it("captures a magnet with no btih topic (null info-hash)", () => {
+    const uri = "magnet:?xt=urn:ed2k:abc&dn=Bar";
+    const m = matchClipboardPayload(uri, FILE_TYPES);
+    expect(m?.kind).toBe("magnet");
+    expect(m?.kind === "magnet" && m.infoHash).toBeNull();
+  });
+
+  it("lowercases an uppercase magnet info-hash", () => {
+    const uri =
+      "magnet:?xt=urn:btih:ABCDEF0123456789ABCDEF0123456789ABCDEF01";
+    const m = matchClipboardPayload(uri, FILE_TYPES);
+    expect(m?.kind === "magnet" && m.infoHash).toBe(
+      "abcdef0123456789abcdef0123456789abcdef01",
+    );
   });
 
   it("rejects an HTML page", () => {
@@ -96,12 +125,8 @@ describe("matchClipboardPayload", () => {
   });
 
   it("normalises a leading dot in the allowlist entry", () => {
-    expect(
-      matchClipboardPayload(
-        "https://example.com/setup.zip",
-        [".zip"],
-      )?.ext,
-    ).toBe("zip");
+    const m = matchClipboardPayload("https://example.com/setup.zip", [".zip"]);
+    expect(m?.kind === "http" && m.ext).toBe("zip");
   });
 
   it("ignores a query-string suffix when extracting the extension", () => {
@@ -109,7 +134,7 @@ describe("matchClipboardPayload", () => {
       "https://example.com/setup.zip?token=abc",
       FILE_TYPES,
     );
-    expect(m?.ext).toBe("zip");
+    expect(m?.kind === "http" && m.ext).toBe("zip");
   });
 
   it("rejects suspicious extensions longer than 8 chars", () => {

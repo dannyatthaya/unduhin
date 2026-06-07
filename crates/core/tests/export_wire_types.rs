@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use ts_rs::TS;
 use unduhin_core::wire::{
     DownloadJob, ExtensionSettings, HandoffDecision, HandoffMode, HostRule, Inbound, MediaKind,
-    MediaStream, Outbound, RequestHeader, RuleMetric, SettingsPatch, StatusEntry,
+    MediaStream, Outbound, RequestHeader, RuleMetric, SettingsPatch, StatusEntry, TorrentJob,
     ALLOWED_DEV_EXTENSION_ID, HOST_NAME,
 };
 
@@ -38,6 +38,7 @@ fn render() -> String {
         MediaKind::decl(),
         MediaStream::decl(),
         DownloadJob::decl(),
+        TorrentJob::decl(),
         StatusEntry::decl(),
         HandoffMode::decl(),
         HandoffDecision::decl(),

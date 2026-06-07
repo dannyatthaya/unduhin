@@ -562,6 +562,12 @@ async fn dispatch(core: &Core, msg: unduhin_core::wire::Inbound) -> unduhin_core
                 message: e.to_string(),
             },
         },
+        Inbound::DownloadTorrent { job } => match handle_download_torrent(core, job).await {
+            Ok(id) => Outbound::Ack { id },
+            Err(e) => Outbound::Error {
+                message: e.to_string(),
+            },
+        },
         Inbound::Status => match handle_status(core).await {
             Ok(downloads) => Outbound::Status { downloads },
             Err(e) => Outbound::Error {
@@ -646,6 +652,8 @@ async fn handle_download(
             Some(headers)
         },
         source: unduhin_core::DownloadSource::ExtensionPipe,
+        kind: unduhin_core::DownloadKind::Http,
+        torrent: None,
     };
     core.add_download(input).await.map_err(|e| format!("{e}"))
 }
@@ -689,7 +697,31 @@ async fn handle_download_media(
             Some(headers)
         },
         source: unduhin_core::DownloadSource::ExtensionPipe,
+        kind: unduhin_core::DownloadKind::Media,
+        torrent: None,
     };
+    core.add_download(input).await.map_err(|e| format!("{e}"))
+}
+
+/// Extension torrent hand-off. The untrusted [`wire::TorrentJob`] (magnet URI
+/// or base64 `.torrent` bytes) is validated and turned into an
+/// `AddDownload { kind: Torrent, source: ExtensionPipe }` by
+/// `core::torrent_handoff` — which size-limits / sanity-checks the payload and
+/// writes any `.torrent` bytes into the managed dir under a content-hash name
+/// (no caller-supplied path ever reaches the filesystem). We then hand it to
+/// `Core::add_download`, which de-dups by info-hash and assigns the row id.
+///
+/// [`wire::TorrentJob`]: unduhin_core::wire::TorrentJob
+#[cfg(windows)]
+async fn handle_download_torrent(
+    core: &Core,
+    job: unduhin_core::wire::TorrentJob,
+) -> Result<unduhin_core::DownloadId, String> {
+    let input = unduhin_core::torrent_handoff::add_download_from_torrent_job(
+        job,
+        unduhin_core::torrent_handoff::incoming_torrents_dir(),
+    )
+    .map_err(|e| format!("{e}"))?;
     core.add_download(input).await.map_err(|e| format!("{e}"))
 }
 
@@ -878,6 +910,47 @@ mod tests {
         let h = headers_from_media(&stream);
         assert_eq!(h[0], ("Cookie".into(), "s=1".into()));
         assert_eq!(h[1], ("Referer".into(), "https://x/watch".into()));
+    }
+
+    /// The `DownloadTorrent` dispatch arm is Windows-only and was once missing —
+    /// the build broke at the Wave-3 merge and no test caught it (the core-side
+    /// handoff test deliberately bypasses src-tauri). Drive the real
+    /// `dispatch -> handle_download_torrent -> Core::add_download` path with a
+    /// magnet and assert it Acks a torrent row, and that an identical second job
+    /// de-dups to the same row (Q7) rather than minting a new one. No network:
+    /// magnet `add_download` only inserts a row (the worker is never started).
+    #[tokio::test]
+    async fn dispatch_download_torrent_magnet_acks_and_dedups() {
+        use unduhin_core::wire::{Inbound, Outbound, TorrentJob};
+
+        let dir = tempfile::tempdir().unwrap();
+        let core = Core::open(dir.path().join("pipe-torrent.db"))
+            .await
+            .unwrap();
+
+        let magnet = "magnet:?xt=urn:btih:6f84758b0ddd8dc05840bf932a77935d8b5b8b93&dn=debian.iso";
+        let job = || TorrentJob {
+            magnet: Some(magnet.to_string()),
+            torrent_file_b64: None,
+            page_url: None,
+            tab_id: None,
+            suggested_filename: None,
+        };
+
+        let id = match dispatch(&core, Inbound::DownloadTorrent { job: job() }).await {
+            Outbound::Ack { id } => id,
+            other => panic!("expected Ack, got {other:?}"),
+        };
+        let rec = core.get_download(id).await.unwrap();
+        assert_eq!(rec.kind, unduhin_core::DownloadKind::Torrent);
+
+        // Q7: an identical magnet must return the SAME row, not a new id.
+        match dispatch(&core, Inbound::DownloadTorrent { job: job() }).await {
+            Outbound::Ack { id: dup } => {
+                assert_eq!(dup, id, "duplicate magnet must de-dup to the same row")
+            }
+            other => panic!("expected Ack on duplicate, got {other:?}"),
+        }
     }
 }
 

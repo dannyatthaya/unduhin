@@ -1,0 +1,39 @@
+[package]
+name = "torrent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Unduhin torrent backend — librqbit facade emitting engine progress events."
+
+[dependencies]
+# librqbit routed through rustls (rust-tls), not native-tls/SChannel/openssl.
+# http-api-client is the feature the workspace's rustls stack aligns with.
+librqbit = { version = "8.1.1", default-features = false, features = ["rust-tls", "http-api-client"] }
+# `engine` ONLY for the shared `ProgressEvent` vocabulary (design §3.D); the
+# facade emits these so torrents flow through core's existing pump unchanged.
+engine = { path = "../engine" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# librqbit's `rust-tls` feature transitively pulls `aws-lc-rs` (via its
+# misleadingly-named `sha1-ring` SHA-1 backend) → `aws-lc-sys`, whose default
+# build assembles AVX paths with the NASM toolchain. NASM is not installed on
+# this MSVC host, so we pin `aws-lc-sys` here only to switch on `prebuilt-nasm`,
+# which links AWS-LC's checked-in pre-assembled objects and needs no NASM.
+# This is a build-only feature toggle; we do not use aws-lc-sys directly.
+aws-lc-sys = { version = "0.41", features = ["prebuilt-nasm"] }
+
+[dev-dependencies]
+tokio = { workspace = true }
+anyhow = { workspace = true }
+# Integration tests name `engine::ProgressEvent` directly when draining the
+# facade's broadcast channel.
+engine = { path = "../engine" }
+# Lets the live probe surface librqbit's DHT/peer/tracker logs via RUST_LOG when
+# diagnosing "no peers" failures.
+tracing-subscriber = { workspace = true }

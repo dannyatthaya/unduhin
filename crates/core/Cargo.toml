@@ -14,6 +14,10 @@ path = "src/lib.rs"
 
 [dependencies]
 engine = { path = "../engine" }
+# Torrent backend facade over librqbit (design §3.D). `core` depends on it for
+# the `TorrentEngine` it lazily constructs on the first torrent claim; it never
+# sees a librqbit type.
+torrent = { path = "../torrent" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 url = { workspace = true }

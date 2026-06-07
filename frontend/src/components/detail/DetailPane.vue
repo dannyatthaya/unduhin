@@ -6,6 +6,7 @@ import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 
 import DetailOverview from "./DetailOverview.vue";
 import DetailSegments from "./DetailSegments.vue";
+import DetailTorrent from "./DetailTorrent.vue";
 import DetailHistory from "./DetailHistory.vue";
 import RowMenu from "@/components/RowMenu.vue";
 import ScheduleDialog from "@/components/ScheduleDialog.vue";
@@ -45,9 +46,30 @@ const historyCount = computed(() =>
   record.value ? downloads.timelineFor(record.value.id).length : 0
 );
 
+/** Torrent rows run the librqbit backend — they have no HTTP segments, so
+ *  the Segments tab is replaced by a Torrent tab (peers/seeds/files). */
+const isTorrent = computed(() => record.value?.kind === "torrent");
+const torrentFileCount = computed(
+  () => record.value?.torrent?.files?.length ?? 0
+);
+
 const tabs = computed<{ id: DetailTab; label: string; count?: () => number }[]>(() => [
   { id: "overview", label: t("detail.tabOverview") },
-  { id: "segments", label: t("detail.tabSegments"), count: () => segmentsCount.value },
+  ...(isTorrent.value
+    ? [
+        {
+          id: "torrent" as const,
+          label: t("detail.tabTorrent"),
+          count: () => torrentFileCount.value,
+        },
+      ]
+    : [
+        {
+          id: "segments" as const,
+          label: t("detail.tabSegments"),
+          count: () => segmentsCount.value,
+        },
+      ]),
   { id: "history", label: t("detail.tabHistory"), count: () => historyCount.value },
 ]);
 
@@ -290,13 +312,28 @@ const moreMenu = computed(() => {
         <DetailOverview
           v-if="detail.tab === 'overview'"
           :download="record"
-          @view-segments="detail.setTab('segments')"
+          @view-segments="detail.setTab(isTorrent ? 'torrent' : 'segments')"
+        />
+        <DetailTorrent
+          v-else-if="isTorrent && detail.tab === 'torrent'"
+          :download="record"
         />
         <DetailSegments
-          v-else-if="detail.tab === 'segments'"
+          v-else-if="!isTorrent && detail.tab === 'segments'"
           :download="record"
         />
         <DetailHistory
+          v-else-if="detail.tab === 'history'"
+          :download="record"
+        />
+        <!-- Fallback when the active tab doesn't apply to this kind (e.g. a
+             stale 'segments' tab on a torrent row): show the kind's primary
+             secondary view rather than a blank pane. -->
+        <DetailTorrent
+          v-else-if="isTorrent"
+          :download="record"
+        />
+        <DetailSegments
           v-else
           :download="record"
         />

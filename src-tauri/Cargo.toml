@@ -32,6 +32,11 @@ chrono = { workspace = true }
 
 engine = { path = "../crates/engine" }
 unduhin-core = { path = "../crates/core" }
+# Torrent facade over librqbit. Used only by the `fetch_torrent_metadata`
+# command (P4) for the add-time `list_only` file-list probe — a short-lived
+# session distinct from the queue's process-wide one in core.
+torrent = { path = "../crates/torrent" }
+tokio-util = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -59,3 +64,6 @@ windows = { version = "0.61", features = [
 [features]
 default = []
 # `tauri-plugin-shell` etc. can be slotted in later; kept lean for now.
+
+[dev-dependencies]
+tempfile = { workspace = true }

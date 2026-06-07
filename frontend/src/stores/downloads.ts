@@ -34,6 +34,15 @@ export interface DownloadStats {
   eta: number | null;
 }
 
+/** One torrent file's live download progress, keyed by file index.
+ *  Carried in-memory like `SegmentLive` (the backend re-emits it but does
+ *  not persist it — only the swarm snapshot lands in the row's JSON). */
+export interface TorrentFileLive {
+  index: number;
+  downloaded: number;
+  total: number;
+}
+
 export interface DownloadsState {
   records: Map<DownloadId, DownloadRecord>;
   stats: Map<DownloadId, DownloadStats>;
@@ -41,6 +50,10 @@ export interface DownloadsState {
    *  segment index. Updated from `segment_progress` events; never
    *  written by the frontend itself. */
   liveSegments: Map<DownloadId, Map<number, SegmentLive>>;
+  /** Torrent per-file progress, keyed by download then by file index.
+   *  Updated from `torrent_file_progress` events. In-memory only, like
+   *  `liveSegments` — the backend does not persist it. */
+  liveTorrentFiles: Map<DownloadId, Map<number, TorrentFileLive>>;
 }
 
 export type TimelineKind =
@@ -107,6 +120,36 @@ export function applyEvent(state: DownloadsState, event: CoreEvent): void {
       });
       break;
     }
+    case "swarm_progress": {
+      // Mirror the backend pump: persist the latest swarm snapshot onto the
+      // record's `torrent.swarm` so peers/seeds/ratio render live and survive
+      // the next `refresh()` (which reloads the persisted blob). Only torrent
+      // rows carry `torrent`; ignore the event for non-torrent records.
+      const rec = state.records.get(event.id);
+      if (rec?.torrent) {
+        rec.torrent.swarm = {
+          peers: event.peers,
+          seeds: event.seeds,
+          up_bps: event.up_bps,
+          down_bps: event.down_bps,
+          ratio_milli: event.ratio_milli,
+        };
+      }
+      break;
+    }
+    case "torrent_file_progress": {
+      let map = state.liveTorrentFiles.get(event.id);
+      if (!map) {
+        map = new Map();
+        state.liveTorrentFiles.set(event.id, map);
+      }
+      map.set(event.index, {
+        index: event.index,
+        downloaded: event.downloaded,
+        total: event.total,
+      });
+      break;
+    }
     case "completed": {
       const rec = state.records.get(event.id);
       if (rec) {
@@ -131,6 +174,7 @@ export function applyEvent(state: DownloadsState, event: CoreEvent): void {
       state.records.delete(event.id);
       state.stats.delete(event.id);
       state.liveSegments.delete(event.id);
+      state.liveTorrentFiles.delete(event.id);
       break;
     case "category_changed": {
       const rec = state.records.get(event.id);
@@ -171,6 +215,9 @@ export const useDownloadsStore = defineStore("downloads", () => {
   const records = ref(new Map<DownloadId, DownloadRecord>());
   const stats = ref(new Map<DownloadId, DownloadStats>());
   const liveSegments = ref(new Map<DownloadId, Map<number, SegmentLive>>());
+  const liveTorrentFiles = ref(
+    new Map<DownloadId, Map<number, TorrentFileLive>>(),
+  );
   const speedHistory = ref(new Map<DownloadId, number[]>());
   const timeline = ref(new Map<DownloadId, TimelineEntry[]>());
 
@@ -214,6 +261,12 @@ export const useDownloadsStore = defineStore("downloads", () => {
 
   function liveSegmentsFor(id: DownloadId): Map<number, SegmentLive> | undefined {
     return liveSegments.value.get(id);
+  }
+
+  function liveTorrentFilesFor(
+    id: DownloadId,
+  ): Map<number, TorrentFileLive> | undefined {
+    return liveTorrentFiles.value.get(id);
   }
 
   function speedHistoryFor(id: DownloadId): number[] {
@@ -273,6 +326,7 @@ export const useDownloadsStore = defineStore("downloads", () => {
         records: records.value,
         stats: stats.value,
         liveSegments: liveSegments.value,
+        liveTorrentFiles: liveTorrentFiles.value,
       },
       event,
     );
@@ -328,6 +382,7 @@ export const useDownloadsStore = defineStore("downloads", () => {
         speedHistory.value.delete(event.id);
         timeline.value.delete(event.id);
         liveSegments.value.delete(event.id);
+        liveTorrentFiles.value.delete(event.id);
         break;
     }
 
@@ -336,6 +391,7 @@ export const useDownloadsStore = defineStore("downloads", () => {
     records.value = new Map(records.value);
     stats.value = new Map(stats.value);
     liveSegments.value = new Map(liveSegments.value);
+    liveTorrentFiles.value = new Map(liveTorrentFiles.value);
     speedHistory.value = new Map(speedHistory.value);
     timeline.value = new Map(timeline.value);
   }
@@ -348,6 +404,7 @@ export const useDownloadsStore = defineStore("downloads", () => {
     records,
     stats,
     liveSegments,
+    liveTorrentFiles,
     speedHistory,
     timeline,
     loading,
@@ -361,6 +418,7 @@ export const useDownloadsStore = defineStore("downloads", () => {
     aggregateSpeedBps,
     statsFor,
     liveSegmentsFor,
+    liveTorrentFilesFor,
     speedHistoryFor,
     timelineFor,
     refresh,

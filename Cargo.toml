@@ -3,13 +3,17 @@ resolver = "2"
 members = [
     "crates/engine",
     "crates/core",      # package name: unduhin-core
+    "crates/torrent",
     "crates/cli",
     "crates/native-host",
     "src-tauri",
 ]
+# `vendor/` holds patched forks of third-party crates (see [patch.crates-io]
+# below); they are dependencies, not workspace members.
+exclude = ["vendor"]
 
 [workspace.package]
-version = "1.0.1"
+version = "1.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/dannyatthaya/unduhin"
@@ -45,3 +49,13 @@ async-trait = "0.1"
 lto = "thin"
 codegen-units = 1
 strip = "debuginfo"
+
+# Vendored fork of librqbit-dht 5.3.1 (pulled in transitively by librqbit) with
+# a one-arm fix to its DHT UDP recv loop: tolerate Windows WSAECONNRESET
+# (os error 10054, from ICMP port-unreachable) instead of letting it kill the
+# DHT framer — which otherwise takes DHT down for the entire session on Windows.
+# Upstream librqbit, including 9.0-rc, never disables SIO_UDP_CONNRESET, so this
+# is the only fix. Re-sync `vendor/librqbit-dht` if librqbit is bumped; drop it
+# once fixed upstream (issue to be filed).
+[patch.crates-io]
+librqbit-dht = { path = "vendor/librqbit-dht" }

@@ -64,6 +64,107 @@ impl FromStr for DownloadSource {
     }
 }
 
+/// Which backend runs a download. Persisted to the `downloads.kind`
+/// column (migration `20260905000001_downloads_torrent`) as the explicit
+/// discriminator the queue worker branches on, replacing the older
+/// implicit `media_info.is_some()` check. Mirrors [`DownloadSource`] in
+/// shape (derives, snake_case serde, `as_str`/`Display`/`FromStr`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DownloadKind {
+    /// Multi-segment HTTP/HTTPS via the [`engine`] crate.
+    #[default]
+    Http,
+    /// yt-dlp subprocess flow (`crate::ytdlp`).
+    Media,
+    /// BitTorrent via the `crates/torrent` facade over librqbit.
+    Torrent,
+}
+
+impl DownloadKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DownloadKind::Http => "http",
+            DownloadKind::Media => "media",
+            DownloadKind::Torrent => "torrent",
+        }
+    }
+}
+
+impl std::fmt::Display for DownloadKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for DownloadKind {
+    type Err = CoreError;
+    fn from_str(s: &str) -> Result<Self> {
+        Ok(match s {
+            "http" => DownloadKind::Http,
+            "media" => DownloadKind::Media,
+            "torrent" => DownloadKind::Torrent,
+            other => {
+                return Err(CoreError::InvalidArgument(format!(
+                    "unknown download kind: {other}"
+                )))
+            }
+        })
+    }
+}
+
+/// Persisted torrent state for a [`DownloadKind::Torrent`] row. Stored as
+/// one nullable JSON column on `downloads.torrent`, exactly like
+/// `media_info` / `headers`. The DB blob holds only logical state; the
+/// librqbit piece bitfield / fastresume lives in a managed dir keyed by
+/// `info_hash`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TorrentMeta {
+    /// Lowercase hex info-hash — the stable de-dup key (from the magnet's
+    /// `xt=urn:btih:` or hashed from `.torrent` bytes).
+    pub info_hash: String,
+    pub source: TorrentSource,
+    /// `None` = download all files; otherwise the librqbit `only_files`
+    /// selection (file indices into `files`).
+    pub selected_files: Option<Vec<usize>>,
+    /// Filled once librqbit resolves metadata.
+    pub files: Option<Vec<TorrentFile>>,
+    /// Last swarm snapshot; survives relaunch so the UI can render
+    /// peers/seeds before the session re-attaches.
+    pub swarm: Option<SwarmStats>,
+}
+
+/// Where a torrent came from. The `.torrent` bytes are copied into the
+/// managed dir at add time and referenced by path (not stored inline);
+/// magnets store the URI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum TorrentSource {
+    Magnet { uri: String },
+    File { path: PathBuf },
+    InfoHash { hash: String },
+}
+
+/// One file inside a torrent, as exposed to the add-time picker and the
+/// detail-pane per-file progress list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TorrentFile {
+    pub index: usize,
+    pub path: String,
+    pub length: u64,
+    pub selected: bool,
+}
+
+/// Last swarm snapshot persisted into the row's `torrent` JSON.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmStats {
+    pub peers: u32,
+    pub seeds: u32,
+    pub up_bps: u64,
+    pub down_bps: u64,
+    pub ratio_milli: u32,
+}
+
 /// Lifecycle status. Stored as the lowercase string in the DB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -176,6 +277,17 @@ pub struct DownloadRecord {
     /// `20260904000001_downloads_speed_samples.sql` column.
     #[serde(default)]
     pub speed_samples: Option<Vec<u32>>,
+    /// Which backend runs this download. The queue worker branches on it
+    /// (`http` → engine, `media` → yt-dlp, `torrent` → librqbit facade).
+    /// Older rows land as `Http` per the NOT NULL DEFAULT applied by
+    /// `20260905000001_downloads_torrent.sql` (the backfill upgrades
+    /// yt-dlp rows to `Media`).
+    #[serde(default)]
+    pub kind: DownloadKind,
+    /// Persisted torrent state when `kind == Torrent`. `None` for HTTP /
+    /// media rows and rows predating the torrent migration.
+    #[serde(default)]
+    pub torrent: Option<TorrentMeta>,
 }
 
 /// Inputs to [`crate::Core::add_download`].
@@ -204,6 +316,11 @@ pub struct AddDownload {
     /// paths pass `Manual`; the pipe sets `ExtensionPipe`; the
     /// CLI sets `Cli`. Persisted to `downloads.source`.
     pub source: DownloadSource,
+    /// Which backend runs this download. HTTP/media callers pass `Http` /
+    /// `Media`; torrent callers pass `Torrent` and populate `torrent`.
+    pub kind: DownloadKind,
+    /// Torrent state when `kind == Torrent`. `None` otherwise.
+    pub torrent: Option<TorrentMeta>,
 }
 
 /// Either a database id or a name when calling [`AddDownload`]. The CLI
@@ -232,18 +349,68 @@ pub(crate) async fn insert(pool: &SqlitePool, input: AddDownload) -> Result<Down
         media_info,
         headers,
         source,
+        kind,
+        torrent,
     } = input;
 
-    // If the caller supplied a filename, respect it. yt-dlp-driven rows
-    // bring their own title (we use it as the filename stem) and skip
-    // the HEAD probe entirely. Otherwise pre-probe the URL so we capture
-    // Content-Disposition / final-redirect / MIME signals that path-tail
-    // alone can't see — without this, randomized URLs like `/d/abc123xyz`
-    // get saved as extension-less garbage.
-    let filename = match (filename, media_info.as_ref()) {
-        (Some(f), _) => f,
-        (None, Some(info)) => sanitize_filename(&info.title),
-        (None, None) => probe_filename(pool, &url)
+    // Normalize the discriminator: a row carrying yt-dlp `media_info` is
+    // always `Media`, and one carrying `torrent` state is always
+    // `Torrent`, regardless of what the caller passed. This keeps the
+    // explicit `kind` column in lock-step with the JSON-blob columns the
+    // worker branches on, so the two can never disagree.
+    let kind = if media_info.is_some() {
+        DownloadKind::Media
+    } else if torrent.is_some() {
+        DownloadKind::Torrent
+    } else {
+        kind
+    };
+
+    // Normalize the torrent meta before anything else: ensure the
+    // `info_hash` is lowercase hex (deriving it from a magnet's
+    // `xt=urn:btih:` when the caller left it blank), because Q7 de-dup and
+    // the managed-state-dir key both rely on a canonical hash.
+    let torrent = match torrent {
+        Some(mut meta) => {
+            normalize_torrent_meta(&mut meta, &url);
+            Some(meta)
+        }
+        None => None,
+    };
+
+    // Q7 front-door de-dup: a second add of the same swarm (matched on the
+    // canonical `info_hash`) is a NO-OP that hands back the existing row,
+    // never a new one — so the UI never shows two rows for one swarm. Only
+    // checked against rows that are still meaningful (not removed/cancelled
+    // — a cancelled row can be retried, so it counts; a separate explicit
+    // re-add of a removed torrent legitimately makes a fresh row because
+    // the old row is gone). See design §5.7.
+    if let Some(meta) = torrent.as_ref() {
+        if !meta.info_hash.is_empty() {
+            if let Some(existing) = find_active_torrent_by_hash(pool, &meta.info_hash).await? {
+                tracing::info!(
+                    info_hash = %meta.info_hash,
+                    existing_id = existing.id,
+                    "add_download: duplicate torrent — returning existing row"
+                );
+                return Ok(existing);
+            }
+        }
+    }
+
+    // Provisional name. Torrents skip the HEAD probe entirely (there is no
+    // HTTP resource to probe) and take a provisional name now — magnet
+    // `dn=` → `.torrent` stem → `"torrent"` — reconciled to the real
+    // torrent name once librqbit resolves metadata (the facade emits
+    // `FilenameLearned`, mirroring `finalize_ytdlp_completion`). yt-dlp rows
+    // bring their own title and also skip the probe; plain HTTP rows pre-probe
+    // the URL so randomized URLs like `/d/abc123xyz` don't save as
+    // extension-less garbage.
+    let filename = match (filename, kind, media_info.as_ref(), torrent.as_ref()) {
+        (Some(f), ..) => f,
+        (None, DownloadKind::Torrent, _, torrent) => provisional_torrent_name(torrent, &url),
+        (None, _, Some(info), _) => sanitize_filename(&info.title),
+        (None, ..) => probe_filename(pool, &url)
             .await
             .or_else(|| filename_from_url(&url))
             .unwrap_or_else(|| "download.bin".to_string()),
@@ -272,7 +439,18 @@ pub(crate) async fn insert(pool: &SqlitePool, input: AddDownload) -> Result<Down
         None => auto_categorize_for_filename(pool, &filename).await?,
     };
 
-    let resolved_output = resolve_output_path(pool, &filename, &output_path, category_id).await?;
+    // HTTP / media rows resolve to a single FILE path. Torrents resolve to
+    // a content-root DIRECTORY: librqbit writes the torrent's file(s)
+    // directly under the `output_folder` we hand it, so the row's
+    // `output_path` must be that directory — keyed per-infohash so two
+    // torrents never collide and Q4's directory-aware `remove_dir_all`
+    // (download::remove) can delete the whole tree.
+    let resolved_output = match kind {
+        DownloadKind::Torrent => {
+            resolve_torrent_output_dir(pool, &filename, &output_path, torrent.as_ref()).await?
+        }
+        _ => resolve_output_path(pool, &filename, &output_path, category_id).await?,
+    };
     let segments = segments.unwrap_or(default_segments(pool).await?);
 
     let created_at = crate::now_iso();
@@ -291,11 +469,18 @@ pub(crate) async fn insert(pool: &SqlitePool, input: AddDownload) -> Result<Down
         }
         _ => None,
     };
+    // Torrent state rides one nullable JSON column, exactly like
+    // `media_info` / `headers`.
+    let torrent_json = match torrent.as_ref() {
+        Some(meta) => Some(serde_json::to_string(meta)?),
+        None => None,
+    };
     let row = sqlx::query(
         "INSERT INTO downloads (\
             url, filename, output_path, total_bytes, downloaded_bytes, status, \
-            category_id, priority, segments, created_at, media_info, headers, source) \
-         VALUES (?, ?, ?, NULL, 0, 'queued', ?, ?, ?, ?, ?, ?, ?) \
+            category_id, priority, segments, created_at, media_info, headers, source, \
+            kind, torrent) \
+         VALUES (?, ?, ?, NULL, 0, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          RETURNING id",
     )
     .bind(url.as_str())
@@ -308,11 +493,251 @@ pub(crate) async fn insert(pool: &SqlitePool, input: AddDownload) -> Result<Down
     .bind(media_info_json)
     .bind(headers_json)
     .bind(source.as_str())
+    .bind(kind.as_str())
+    .bind(torrent_json)
     .fetch_one(pool)
     .await?;
 
     let id: i64 = row.get("id");
     get(pool, id).await
+}
+
+/// Lowercase the canonical `info_hash` and, when the caller left it blank,
+/// derive it from a magnet `xt=urn:btih:` (no metadata fetch needed — Q7).
+/// Bare-infohash sources copy their hash in. Leaves it empty only when no
+/// hash can be recovered (e.g. a `.torrent` file whose bytes haven't been
+/// hashed yet — the add-dialog path computes that hash before calling in).
+fn normalize_torrent_meta(meta: &mut TorrentMeta, url: &url::Url) {
+    if meta.info_hash.is_empty() {
+        if let TorrentSource::Magnet { uri } = &meta.source {
+            if let Some(h) = info_hash_from_magnet(uri) {
+                meta.info_hash = h;
+            }
+        } else if let TorrentSource::InfoHash { hash } = &meta.source {
+            meta.info_hash = hash.clone();
+        }
+    }
+    // The `url` column for a torrent row carries the magnet URI; try it too
+    // as a last resort so a caller that only set `url` still de-dups.
+    if meta.info_hash.is_empty() {
+        if let Some(h) = info_hash_from_magnet(url.as_str()) {
+            meta.info_hash = h;
+        }
+    }
+    meta.info_hash = meta.info_hash.trim().to_ascii_lowercase();
+}
+
+/// Extract the BitTorrent v1 info-hash from a magnet URI's
+/// `xt=urn:btih:<hash>` parameter, normalized to lowercase hex. Accepts the
+/// 40-char hex form; returns `None` for the (rarer) base32 form or when the
+/// parameter is absent — callers fall back to other hash sources. No
+/// network / metadata fetch is involved (design §5.7).
+fn info_hash_from_magnet(uri: &str) -> Option<String> {
+    // Magnets are not always valid `Url`s for `url::Url`, but the query is a
+    // simple `&`-joined list of `key=value`s after the first `?`.
+    let query = uri.split_once('?').map(|(_, q)| q).unwrap_or(uri);
+    for pair in query.split('&') {
+        let (k, v) = pair.split_once('=')?;
+        if !k.eq_ignore_ascii_case("xt") {
+            continue;
+        }
+        // urn:btih:<hash> (case-insensitive scheme).
+        let lower = v.to_ascii_lowercase();
+        if let Some(hash) = lower.strip_prefix("urn:btih:") {
+            if hash.len() == 40 && hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Some(hash.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Provisional display name for a torrent before librqbit resolves
+/// metadata: magnet `dn=` → `.torrent` file stem → `"torrent"` (design
+/// §3.B). Reconciled to the real torrent name on the first
+/// `FilenameLearned` event (see [`reconcile_torrent_filename`]).
+fn provisional_torrent_name(torrent: Option<&TorrentMeta>, url: &url::Url) -> String {
+    if let Some(meta) = torrent {
+        match &meta.source {
+            TorrentSource::Magnet { uri } => {
+                if let Some(name) = magnet_display_name(uri) {
+                    return name;
+                }
+            }
+            TorrentSource::File { path } => {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    if !stem.is_empty() {
+                        return stem.to_string();
+                    }
+                }
+            }
+            TorrentSource::InfoHash { .. } => {}
+        }
+    }
+    // Fall back to the `url` column (the magnet URI for magnet rows).
+    if let Some(name) = magnet_display_name(url.as_str()) {
+        return name;
+    }
+    "torrent".to_string()
+}
+
+/// Pull the `dn=` (display name) parameter out of a magnet URI, percent-decoded.
+fn magnet_display_name(uri: &str) -> Option<String> {
+    let query = uri.split_once('?').map(|(_, q)| q).unwrap_or(uri);
+    for pair in query.split('&') {
+        let (k, v) = pair.split_once('=')?;
+        if k.eq_ignore_ascii_case("dn") {
+            // Magnet `dn=` uses `+` for spaces in addition to percent-encoding.
+            let decoded = urlencoding_decode(&v.replace('+', " "));
+            let trimmed = decoded.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Find a non-terminal download row carrying the given torrent `info_hash`,
+/// for Q7 front-door de-dup. A `Removed` row is gone from the table, so it
+/// never matches; a `Cancelled`/`Failed` row still matches (the user can
+/// retry it, and a re-add should resume that row, not spawn a twin).
+async fn find_active_torrent_by_hash(
+    pool: &SqlitePool,
+    info_hash: &str,
+) -> Result<Option<DownloadRecord>> {
+    // The `info_hash` lives inside the `torrent` JSON blob, so there is no
+    // indexable column to query directly. Torrent rows are rare relative to
+    // the table, so scan the kind='torrent' rows and compare in Rust. The
+    // JSON `"info_hash":"<hash>"` substring is a cheap pre-filter.
+    let needle = format!("\"info_hash\":\"{info_hash}\"");
+    let rows = sqlx::query("SELECT * FROM downloads WHERE kind = 'torrent' AND torrent LIKE ?")
+        .bind(format!("%{needle}%"))
+        .fetch_all(pool)
+        .await?;
+    for row in &rows {
+        let record = record_from_row(row)?;
+        if record
+            .torrent
+            .as_ref()
+            .is_some_and(|t| t.info_hash == info_hash)
+        {
+            return Ok(Some(record));
+        }
+    }
+    Ok(None)
+}
+
+/// Resolve the content-root DIRECTORY a torrent row downloads into. Unlike
+/// HTTP/media rows (a single file), librqbit writes the torrent's file(s)
+/// directly under one `output_folder`, so the row's `output_path` is that
+/// folder. We key it per-infohash under the configured base so two torrents
+/// never share a directory and Q4's `remove_dir_all` keys cleanly off it.
+async fn resolve_torrent_output_dir(
+    pool: &SqlitePool,
+    filename: &str,
+    explicit: &Option<PathBuf>,
+    torrent: Option<&TorrentMeta>,
+) -> Result<PathBuf> {
+    // An explicit path wins verbatim (the add-dialog / extension may target a
+    // chosen folder); make it absolute the same way `resolve_output_path` does.
+    if let Some(path) = explicit {
+        return Ok(if path.is_absolute() || path.has_root() {
+            path.clone()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(path)
+        });
+    }
+
+    // Base folder: the torrent-specific download dir, else the global default,
+    // else the current dir — mirroring `category_target_folder`'s fallback
+    // chain but rooted at the `torrent_download_dir` setting (design §3.G).
+    let base = torrent_base_dir(pool).await?;
+    // Per-download subdir name: the sanitized provisional/real name, suffixed
+    // with the infohash so distinct torrents that happen to share a name stay
+    // separate. Fall back to just the infohash when there's no usable name.
+    let hash = torrent.map(|t| t.info_hash.as_str()).unwrap_or("");
+    let subdir = match (filename.is_empty(), hash.is_empty()) {
+        (false, false) => format!("{filename}.{}", &hash[..hash.len().min(12)]),
+        (false, true) => filename.to_string(),
+        (true, false) => hash.to_string(),
+        (true, true) => "torrent".to_string(),
+    };
+    safe_join(&base, &sanitize_filename(&subdir))
+}
+
+/// Base folder torrents download into: `torrent_download_dir` setting, else
+/// the global `default_output_path`, else the current working directory.
+async fn torrent_base_dir(pool: &SqlitePool) -> Result<PathBuf> {
+    let torrent_dir = crate::settings::get(pool, "torrent_download_dir")
+        .await?
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .filter(|s| !s.is_empty());
+    if let Some(d) = torrent_dir {
+        return Ok(PathBuf::from(d));
+    }
+    let global = crate::settings::get(pool, "default_output_path")
+        .await?
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .filter(|s| !s.is_empty());
+    if let Some(g) = global {
+        return Ok(PathBuf::from(g));
+    }
+    Ok(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
+/// Reconcile a torrent row's DISPLAY metadata once librqbit resolves the real
+/// torrent name (delivered via `engine::ProgressEvent::FilenameLearned`,
+/// mirroring `finalize_ytdlp_completion`). Unlike the HTTP/yt-dlp paths this
+/// must NOT move anything on disk: the content root is a directory librqbit is
+/// actively writing into, and renaming it mid-flight would break the live
+/// handle. We update only the row's `filename` + (re-routed) `category_id`.
+///
+/// Re-categorization preserves a deliberate user choice exactly like
+/// `finalize_ytdlp_completion`: only re-route when the stored category is the
+/// one auto-routing for the *old* name would have picked. Returns the new
+/// (filename, category) when anything changed, else `None` (idempotent on
+/// event re-emission).
+pub(crate) async fn reconcile_torrent_filename(
+    pool: &SqlitePool,
+    id: DownloadId,
+    hint: &str,
+) -> Result<Option<(String, Option<crate::category::CategoryId>, bool)>> {
+    let new_name = sanitize_filename(hint);
+    if new_name.is_empty() {
+        return Ok(None);
+    }
+    let row = sqlx::query("SELECT filename, category_id FROM downloads WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?
+        .ok_or(CoreError::DownloadNotFound(id))?;
+    let current_name: String = row.get("filename");
+    let current_category: Option<i64> = row.get("category_id");
+
+    if current_name == new_name {
+        // Display already reflects the resolved name (event re-emitted).
+        return Ok(None);
+    }
+
+    let auto_for_current = auto_categorize_for_filename(pool, &current_name).await?;
+    let new_category = if current_category == auto_for_current {
+        auto_categorize_for_filename(pool, &new_name).await?
+    } else {
+        current_category
+    };
+    let category_changed = new_category != current_category;
+
+    sqlx::query("UPDATE downloads SET filename = ?, category_id = ? WHERE id = ?")
+        .bind(&new_name)
+        .bind(new_category)
+        .bind(id)
+        .execute(pool)
+        .await?;
+
+    Ok(Some((new_name, new_category, category_changed)))
 }
 
 /// Make an arbitrary string safe to use as a single Windows filename.
@@ -404,21 +829,63 @@ pub(crate) async fn remove(
 
     let mut outcome = RemoveOutcome::default();
     if delete_data {
-        // Best-effort delete: report failure on the row, but don't
-        // roll back the DB delete — the user asked to remove the row.
-        match tokio::fs::remove_file(&record.output_path).await {
+        // Multi-file torrents create a *content folder* (the row's
+        // `output_path` is the content root), so they need a recursive
+        // delete; HTTP / media rows are a single file. Best-effort either
+        // way: report failure on the row, but don't roll back the DB
+        // delete — the user asked to remove the row.
+        let delete_result = if record.kind == DownloadKind::Torrent {
+            tokio::fs::remove_dir_all(&record.output_path).await
+        } else {
+            tokio::fs::remove_file(&record.output_path).await
+        };
+        match delete_result {
             Ok(()) => outcome.data_deleted = true,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 outcome.data_deleted = true;
             }
             Err(e) => outcome.data_error = Some(e.to_string()),
         }
-        // Sidecar is engine-only state; cleaning it up here keeps stale
-        // files from accumulating, but we ignore errors.
-        let sidecar = engine::Meta::sidecar_path(&record.output_path);
-        let _ = tokio::fs::remove_file(&sidecar).await;
+        if record.kind == DownloadKind::Torrent {
+            // librqbit's JSON persistence store keeps fastresume state as flat
+            // files in the shared state root (`<app_data>/torrents/`):
+            // `<info_hash>.bitv` (piece bitfield) + `<info_hash>.torrent`
+            // (metainfo), next to a shared `session.json`. Remove only THIS
+            // torrent's two files so its bitfield doesn't leak — never the
+            // whole dir, which would drop every other torrent's state and the
+            // session list. Best-effort: ignore errors and a not-yet-resolved
+            // (empty) info_hash (skipping it also avoids `join("")` resolving
+            // back to the state root).
+            if let Some(info_hash) = record
+                .torrent
+                .as_ref()
+                .map(|t| t.info_hash.as_str())
+                .filter(|h| !h.is_empty())
+            {
+                if let Some(root) = torrent_state_root() {
+                    let _ = tokio::fs::remove_file(root.join(format!("{info_hash}.bitv"))).await;
+                    let _ =
+                        tokio::fs::remove_file(root.join(format!("{info_hash}.torrent"))).await;
+                }
+            }
+        } else {
+            // Sidecar is engine-only state; cleaning it up here keeps stale
+            // files from accumulating, but we ignore errors.
+            let sidecar = engine::Meta::sidecar_path(&record.output_path);
+            let _ = tokio::fs::remove_file(&sidecar).await;
+        }
     }
     Ok(outcome)
+}
+
+/// Root dir where librqbit persists per-torrent fastresume state — the
+/// `state_dir` handed to the facade in `queue::build_torrent_config`:
+/// `<app_data>/torrents`. librqbit's `JsonSessionPersistenceStore` writes flat
+/// files here (`<info_hash>.bitv`, `<info_hash>.torrent`) plus a shared
+/// `session.json`; it does NOT create a per-infohash subdir. `None` when no
+/// app-data root is resolvable.
+pub fn torrent_state_root() -> Option<PathBuf> {
+    crate::directories_root().map(|d| d.join("torrents"))
 }
 
 pub(crate) async fn set_priority(pool: &SqlitePool, id: DownloadId, priority: i64) -> Result<()> {
@@ -979,6 +1446,45 @@ pub(crate) async fn persist_progress(
     Ok(())
 }
 
+/// Persist the latest swarm snapshot into a torrent row's `torrent` JSON
+/// blob (the `swarm` field of [`TorrentMeta`]). Mirrors how
+/// [`persist_progress`] keeps the byte counters fresh, but for the
+/// torrent-only swarm state so peers/seeds/ratio survive a relaunch and the
+/// UI can render them before the session re-attaches (design §3.C).
+///
+/// Idempotent on a missing/non-torrent row: if the row has no `torrent`
+/// blob (a data bug or an HTTP/media row) we leave it untouched rather than
+/// fabricate one. Read-modify-write: the rest of the `TorrentMeta` (source,
+/// selected files, file list) is preserved.
+pub(crate) async fn persist_swarm(
+    pool: &SqlitePool,
+    id: DownloadId,
+    swarm: &SwarmStats,
+) -> Result<()> {
+    let existing: Option<String> = sqlx::query_scalar("SELECT torrent FROM downloads WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?
+        .flatten();
+    let Some(json) = existing.filter(|s| !s.is_empty()) else {
+        // No torrent blob to merge into — nothing to persist.
+        return Ok(());
+    };
+    let mut meta: TorrentMeta = match serde_json::from_str(&json) {
+        Ok(m) => m,
+        // A corrupt blob shouldn't take down the swarm pump; degrade.
+        Err(_) => return Ok(()),
+    };
+    meta.swarm = Some(swarm.clone());
+    let updated = serde_json::to_string(&meta)?;
+    sqlx::query("UPDATE downloads SET torrent = ? WHERE id = ?")
+        .bind(updated)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Count downloads of a given `source`, optionally restricted to rows
 /// created at or after `since`. Powers the Settings → Browser status
 /// card's "downloads captured this week" counter and the lifetime
@@ -1126,6 +1632,22 @@ fn record_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<DownloadRecord> {
         .ok()
         .flatten()
         .and_then(|s| serde_json::from_str::<Vec<u32>>(&s).ok());
+    // Defensive `try_get` for `kind` (migration 20260905000001): absent
+    // column / NULL / unknown value all degrade to `Http`, matching the
+    // NOT NULL DEFAULT 'http' the migration applies.
+    let kind = row
+        .try_get::<String, _>("kind")
+        .ok()
+        .and_then(|s| s.parse::<DownloadKind>().ok())
+        .unwrap_or(DownloadKind::Http);
+    // Defensive `try_get` for `torrent` (same migration): absent column /
+    // NULL / unparseable JSON all degrade to `None`.
+    let torrent = row
+        .try_get::<Option<String>, _>("torrent")
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| serde_json::from_str::<TorrentMeta>(&s).ok());
     Ok(DownloadRecord {
         id: row.get("id"),
         url: row.get("url"),
@@ -1147,6 +1669,8 @@ fn record_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<DownloadRecord> {
         headers,
         source,
         speed_samples,
+        kind,
+        torrent,
     })
 }
 
@@ -1525,6 +2049,8 @@ mod tests {
             media_info: None,
             headers: Some(headers.clone()),
             source: DownloadSource::ExtensionPipe,
+            kind: DownloadKind::Http,
+            torrent: None,
         };
         let rec = insert(&pool, input).await.unwrap();
         let again = get(&pool, rec.id).await.unwrap();
@@ -1545,6 +2071,8 @@ mod tests {
             media_info: None,
             headers: None,
             source: DownloadSource::Manual,
+            kind: DownloadKind::Http,
+            torrent: None,
         };
         let rec = insert(&pool, input).await.unwrap();
         assert!(rec.headers.is_none());
@@ -1668,6 +2196,179 @@ mod tests {
         ] {
             assert_eq!(src.as_str().parse::<DownloadSource>().unwrap(), src);
         }
+    }
+
+    #[test]
+    fn download_kind_round_trip() {
+        for kind in [
+            DownloadKind::Http,
+            DownloadKind::Media,
+            DownloadKind::Torrent,
+        ] {
+            // string form round-trips through FromStr
+            assert_eq!(kind.as_str().parse::<DownloadKind>().unwrap(), kind);
+            // Display agrees with as_str
+            assert_eq!(kind.to_string(), kind.as_str());
+            // serde snake_case round-trips and matches as_str
+            let json = serde_json::to_string(&kind).unwrap();
+            assert_eq!(json, format!("\"{}\"", kind.as_str()));
+            assert_eq!(serde_json::from_str::<DownloadKind>(&json).unwrap(), kind);
+        }
+        // Default is Http (mirrors the migration's NOT NULL DEFAULT).
+        assert_eq!(DownloadKind::default(), DownloadKind::Http);
+        // Unknown values are rejected, not silently defaulted, at the
+        // FromStr boundary (record_from_row degrades separately).
+        assert!("ftp".parse::<DownloadKind>().is_err());
+    }
+
+    #[test]
+    fn torrent_meta_json_round_trip() {
+        let meta = TorrentMeta {
+            info_hash: "abcdef0123456789".to_string(),
+            source: TorrentSource::Magnet {
+                uri: "magnet:?xt=urn:btih:abcdef0123456789".to_string(),
+            },
+            selected_files: Some(vec![0, 2]),
+            files: Some(vec![TorrentFile {
+                index: 0,
+                path: "dir/file.bin".to_string(),
+                length: 1234,
+                selected: true,
+            }]),
+            swarm: Some(SwarmStats {
+                peers: 7,
+                seeds: 3,
+                up_bps: 100,
+                down_bps: 2000,
+                ratio_milli: 1500,
+            }),
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let back: TorrentMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, meta);
+        // TorrentSource uses an internally-tagged snake_case enum.
+        assert!(json.contains("\"kind\":\"magnet\""));
+    }
+
+    #[tokio::test]
+    async fn migration_backfills_media_kind() {
+        // Reproduce the pre-torrent on-disk shape: a yt-dlp row carrying a
+        // non-empty `media_info` blob but with `kind` still at the column's
+        // NOT NULL DEFAULT 'http' (the value an unmigrated row would have
+        // had before the backfill UPDATE ran). Then run the migration's
+        // exact backfill statement and assert it upgrades only that row.
+        let pool = fresh_pool().await;
+
+        // A media-style row left at the default 'http' kind. Use a
+        // complete `MediaInfo` JSON so the (non-defensive) media_info read
+        // in `record_from_row` doesn't fail when we read the row back.
+        let media_info_json =
+            serde_json::to_string(&crate::ytdlp::MediaInfo {
+                extractor: "test".to_string(),
+                format_selector: "best".to_string(),
+                title: "v".to_string(),
+                original_url: "https://x/v".to_string(),
+                needs_ffmpeg: false,
+            })
+            .unwrap();
+        let media_id: i64 = sqlx::query(
+            "INSERT INTO downloads (url, filename, output_path, downloaded_bytes, status, \
+                                    priority, segments, created_at, media_info, kind) \
+             VALUES ('https://x/v', 'v', '/tmp/v', 0, 'completed', 0, 1, \
+                     '2026-01-01T00:00:00Z', ?, 'http') \
+             RETURNING id",
+        )
+        .bind(&media_info_json)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("id");
+
+        // A plain HTTP row with no media_info — must stay 'http'.
+        let http_id: i64 = sqlx::query(
+            "INSERT INTO downloads (url, filename, output_path, downloaded_bytes, status, \
+                                    priority, segments, created_at, kind) \
+             VALUES ('https://x/f', 'f', '/tmp/f', 0, 'completed', 0, 1, \
+                     '2026-01-01T00:00:00Z', 'http') \
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("id");
+
+        // The migration's backfill statement, verbatim.
+        sqlx::query("UPDATE downloads SET kind = 'media' WHERE media_info IS NOT NULL AND media_info <> ''")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let media_rec = get(&pool, media_id).await.unwrap();
+        let http_rec = get(&pool, http_id).await.unwrap();
+        assert_eq!(media_rec.kind, DownloadKind::Media, "media_info row upgraded");
+        assert_eq!(http_rec.kind, DownloadKind::Http, "plain http row untouched");
+    }
+
+    #[tokio::test]
+    async fn insert_normalizes_kind_from_media_info() {
+        // A caller that passes media_info but forgets to set kind=Media
+        // still lands as Media — the explicit column can't drift from the
+        // JSON blob the worker branches on.
+        let pool = fresh_pool().await;
+        let input = AddDownload {
+            url: "https://example.com/v".parse().unwrap(),
+            filename: Some("v".to_string()),
+            output_path: Some(std::path::PathBuf::from("/tmp/v")),
+            category: None,
+            priority: 0,
+            segments: Some(1),
+            media_info: Some(crate::ytdlp::MediaInfo {
+                extractor: "test".to_string(),
+                format_selector: "best".to_string(),
+                title: "v".to_string(),
+                original_url: "https://example.com/v".to_string(),
+                needs_ffmpeg: false,
+            }),
+            headers: None,
+            source: DownloadSource::Manual,
+            kind: DownloadKind::Http, // deliberately wrong; insert must fix it
+            torrent: None,
+        };
+        let rec = insert(&pool, input).await.unwrap();
+        assert_eq!(rec.kind, DownloadKind::Media);
+    }
+
+    #[tokio::test]
+    async fn insert_round_trips_torrent_meta() {
+        let pool = fresh_pool().await;
+        let meta = TorrentMeta {
+            info_hash: "deadbeef".to_string(),
+            source: TorrentSource::Magnet {
+                uri: "magnet:?xt=urn:btih:deadbeef".to_string(),
+            },
+            selected_files: None,
+            files: None,
+            swarm: None,
+        };
+        let input = AddDownload {
+            url: "magnet:?xt=urn:btih:deadbeef".parse().unwrap(),
+            filename: Some("torrent".to_string()),
+            output_path: Some(std::path::PathBuf::from("/tmp/torrent")),
+            category: None,
+            priority: 0,
+            segments: Some(1),
+            media_info: None,
+            headers: None,
+            source: DownloadSource::Manual,
+            kind: DownloadKind::Torrent,
+            torrent: Some(meta.clone()),
+        };
+        let rec = insert(&pool, input).await.unwrap();
+        assert_eq!(rec.kind, DownloadKind::Torrent);
+        assert_eq!(rec.torrent.as_ref(), Some(&meta));
+        // Reads back identically through get/record_from_row.
+        let again = get(&pool, rec.id).await.unwrap();
+        assert_eq!(again.torrent.as_ref(), Some(&meta));
     }
 
     #[tokio::test]
@@ -1972,5 +2673,329 @@ mod tests {
         assert_eq!(renamed.path, moved);
         assert!(tokio::fs::metadata(&moved).await.is_ok());
         assert!(tokio::fs::metadata(&on_disk).await.is_err());
+    }
+
+    // --- Phase 2b: torrent insert / de-dup / reconcile -----------------------
+
+    #[test]
+    fn info_hash_from_magnet_extracts_lowercase_hex() {
+        let m = "magnet:?xt=urn:btih:6F84758B0DDD8DC05840BF932A77935D8B5B8B93&dn=debian.iso";
+        assert_eq!(
+            info_hash_from_magnet(m).as_deref(),
+            Some("6f84758b0ddd8dc05840bf932a77935d8b5b8b93")
+        );
+        // Case-insensitive scheme + extra params in any order.
+        let m2 = "magnet:?tr=udp%3A%2F%2Ftracker&XT=URN:BTIH:abcdef0123456789abcdef0123456789abcdef01";
+        assert_eq!(
+            info_hash_from_magnet(m2).as_deref(),
+            Some("abcdef0123456789abcdef0123456789abcdef01")
+        );
+        // No xt param, or non-40-hex (base32) form → None (caller falls back).
+        assert!(info_hash_from_magnet("magnet:?dn=no-hash").is_none());
+        assert!(info_hash_from_magnet("magnet:?xt=urn:btih:TOOSHORT").is_none());
+    }
+
+    #[test]
+    fn provisional_torrent_name_prefers_dn_then_stem_then_default() {
+        let url: url::Url = "magnet:?xt=urn:btih:deadbeef".parse().unwrap();
+        // magnet dn= (with + and percent-encoding) wins.
+        let magnet = TorrentMeta {
+            info_hash: "deadbeef".into(),
+            source: TorrentSource::Magnet {
+                uri: "magnet:?xt=urn:btih:deadbeef&dn=My%20Linux+ISO".into(),
+            },
+            selected_files: None,
+            files: None,
+            swarm: None,
+        };
+        assert_eq!(provisional_torrent_name(Some(&magnet), &url), "My Linux ISO");
+
+        // .torrent file → stem.
+        let file = TorrentMeta {
+            info_hash: "deadbeef".into(),
+            source: TorrentSource::File {
+                path: PathBuf::from("/downloads/ubuntu-24.04.torrent"),
+            },
+            selected_files: None,
+            files: None,
+            swarm: None,
+        };
+        assert_eq!(provisional_torrent_name(Some(&file), &url), "ubuntu-24.04");
+
+        // Bare info-hash with no dn → "torrent" fallback.
+        let ih = TorrentMeta {
+            info_hash: "deadbeef".into(),
+            source: TorrentSource::InfoHash {
+                hash: "deadbeef".into(),
+            },
+            selected_files: None,
+            files: None,
+            swarm: None,
+        };
+        let plain: url::Url = "magnet:?xt=urn:btih:deadbeef".parse().unwrap();
+        assert_eq!(provisional_torrent_name(Some(&ih), &plain), "torrent");
+    }
+
+    #[tokio::test]
+    async fn insert_derives_provisional_name_from_magnet_dn() {
+        // No caller filename: a magnet row takes its dn= as the provisional
+        // name (no HEAD probe), sanitized.
+        let pool = fresh_pool().await;
+        let uri = "magnet:?xt=urn:btih:6f84758b0ddd8dc05840bf932a77935d8b5b8b93&dn=Debian+ISO";
+        let input = AddDownload {
+            url: uri.parse().unwrap(),
+            filename: None,
+            output_path: Some(PathBuf::from("/tmp/torrents/debian")),
+            category: None,
+            priority: 0,
+            segments: None,
+            media_info: None,
+            headers: None,
+            source: DownloadSource::Manual,
+            kind: DownloadKind::Torrent,
+            torrent: Some(TorrentMeta {
+                info_hash: String::new(), // forces derivation from the magnet
+                source: TorrentSource::Magnet { uri: uri.into() },
+                selected_files: None,
+                files: None,
+                swarm: None,
+            }),
+        };
+        let rec = insert(&pool, input).await.unwrap();
+        assert_eq!(rec.kind, DownloadKind::Torrent);
+        assert_eq!(rec.filename, "Debian ISO");
+        // info_hash was derived from xt= and lowercased.
+        assert_eq!(
+            rec.torrent.as_ref().unwrap().info_hash,
+            "6f84758b0ddd8dc05840bf932a77935d8b5b8b93"
+        );
+    }
+
+    #[tokio::test]
+    async fn insert_dedups_duplicate_magnet_add() {
+        // Q7 front-door de-dup: a second add of the SAME info-hash hands back
+        // the existing row rather than inserting a twin.
+        let pool = fresh_pool().await;
+        let uri = "magnet:?xt=urn:btih:1111111111111111111111111111111111111111&dn=Thing";
+        let make = || AddDownload {
+            url: uri.parse().unwrap(),
+            filename: None,
+            output_path: Some(PathBuf::from("/tmp/torrents/thing")),
+            category: None,
+            priority: 0,
+            segments: None,
+            media_info: None,
+            headers: None,
+            source: DownloadSource::Manual,
+            kind: DownloadKind::Torrent,
+            torrent: Some(TorrentMeta {
+                info_hash: String::new(),
+                source: TorrentSource::Magnet { uri: uri.into() },
+                selected_files: None,
+                files: None,
+                swarm: None,
+            }),
+        };
+        let first = insert(&pool, make()).await.unwrap();
+        let second = insert(&pool, make()).await.unwrap();
+        assert_eq!(first.id, second.id, "duplicate add must be a no-op");
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM downloads WHERE kind = 'torrent'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "only one row for the swarm");
+    }
+
+    #[tokio::test]
+    async fn insert_torrent_skips_dedup_for_distinct_hashes() {
+        // Two genuinely different torrents both insert — de-dup keys on the
+        // hash, not on kind.
+        let pool = fresh_pool().await;
+        let mk = |hash40: &str| {
+            let uri = format!("magnet:?xt=urn:btih:{hash40}&dn=t");
+            AddDownload {
+                url: uri.parse().unwrap(),
+                filename: None,
+                output_path: Some(PathBuf::from(format!("/tmp/torrents/{hash40}"))),
+                category: None,
+                priority: 0,
+                segments: None,
+                media_info: None,
+                headers: None,
+                source: DownloadSource::Manual,
+                kind: DownloadKind::Torrent,
+                torrent: Some(TorrentMeta {
+                    info_hash: String::new(),
+                    source: TorrentSource::Magnet { uri },
+                    selected_files: None,
+                    files: None,
+                    swarm: None,
+                }),
+            }
+        };
+        let a = insert(&pool, mk("2222222222222222222222222222222222222222"))
+            .await
+            .unwrap();
+        let b = insert(&pool, mk("3333333333333333333333333333333333333333"))
+            .await
+            .unwrap();
+        assert_ne!(a.id, b.id);
+    }
+
+    #[tokio::test]
+    async fn reconcile_torrent_filename_updates_display_and_category() {
+        // The facade learned the real torrent name post-metadata. The display
+        // name + (auto) category update; nothing on disk is touched.
+        let pool = fresh_pool().await;
+        let other = crate::category::find_by_name(&pool, "Other")
+            .await
+            .unwrap()
+            .unwrap();
+        let video = crate::category::find_by_name(&pool, "Video")
+            .await
+            .unwrap()
+            .unwrap();
+        // Provisional torrent row: a name with no extension auto-routes to Other.
+        let id = seed_row(&pool, "magnet-provisional", Some(other.id), None).await;
+
+        let (name, cat, changed) =
+            reconcile_torrent_filename(&pool, id, "Big Buck Bunny.mp4")
+                .await
+                .unwrap()
+                .expect("a real name reconciles");
+        assert_eq!(name, "Big Buck Bunny.mp4");
+        assert!(changed);
+        assert_eq!(cat, Some(video.id));
+
+        let row = sqlx::query("SELECT filename, category_id FROM downloads WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.get::<String, _>("filename"), "Big Buck Bunny.mp4");
+        assert_eq!(row.get::<i64, _>("category_id"), video.id);
+
+        // Idempotent: re-emitting the resolved name changes nothing.
+        let again = reconcile_torrent_filename(&pool, id, "Big Buck Bunny.mp4")
+            .await
+            .unwrap();
+        assert!(again.is_none());
+    }
+
+    #[tokio::test]
+    async fn reconcile_torrent_filename_preserves_user_category() {
+        // A deliberate user category is never re-routed by the learned name.
+        let pool = fresh_pool().await;
+        let docs = crate::category::find_by_name(&pool, "Documents")
+            .await
+            .unwrap()
+            .unwrap();
+        // "weird name" doesn't auto-route to Documents, so it's a user choice.
+        let id = seed_row(&pool, "weird name", Some(docs.id), None).await;
+
+        let (name, cat, changed) = reconcile_torrent_filename(&pool, id, "movie.mp4")
+            .await
+            .unwrap()
+            .expect("name still updates");
+        assert_eq!(name, "movie.mp4");
+        assert!(!changed, "user category preserved");
+        assert_eq!(cat, Some(docs.id));
+    }
+
+    /// Seed a torrent row whose `torrent` column holds a serialized
+    /// [`TorrentMeta`] (no swarm snapshot yet), returning its id and the
+    /// stored meta. Used to exercise [`persist_swarm`]'s read-modify-write.
+    async fn seed_torrent_row(pool: &SqlitePool) -> (i64, TorrentMeta) {
+        let meta = TorrentMeta {
+            info_hash: "aabbccddeeff00112233445566778899aabbccdd".into(),
+            source: TorrentSource::Magnet {
+                uri: "magnet:?xt=urn:btih:aabbccddeeff00112233445566778899aabbccdd&dn=Thing".into(),
+            },
+            selected_files: Some(vec![0, 2]),
+            files: Some(vec![TorrentFile {
+                index: 0,
+                path: "a.bin".into(),
+                length: 100,
+                selected: true,
+            }]),
+            swarm: None,
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let row = sqlx::query(
+            "INSERT INTO downloads (url, filename, output_path, downloaded_bytes, status, \
+                                    priority, segments, created_at, kind, torrent) \
+             VALUES ('magnet:?xt=urn:btih:aabbccddeeff00112233445566778899aabbccdd', \
+                     'Thing', '/tmp/torrents/thing', 0, 'active', 0, 1, \
+                     '2026-01-01T00:00:00Z', 'torrent', ?) \
+             RETURNING id",
+        )
+        .bind(&json)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        (row.get("id"), meta)
+    }
+
+    #[tokio::test]
+    async fn persist_swarm_round_trips_into_torrent_json() {
+        // The pump persists each swarm snapshot into the row's `torrent` blob
+        // (design §3.C) so peers/seeds survive a relaunch. The snapshot lands
+        // in `swarm` and the rest of the meta is preserved untouched.
+        let pool = fresh_pool().await;
+        let (id, original) = seed_torrent_row(&pool).await;
+
+        let snap = SwarmStats {
+            peers: 12,
+            seeds: 30,
+            up_bps: 4_096,
+            down_bps: 1_048_576,
+            ratio_milli: 1500,
+        };
+        persist_swarm(&pool, id, &snap).await.unwrap();
+
+        // Read back through the same defensive path the worker uses.
+        let rec = get(&pool, id).await.unwrap();
+        let meta = rec.torrent.expect("torrent blob preserved");
+        assert_eq!(meta.swarm.as_ref(), Some(&snap), "snapshot persisted");
+        // Everything else is untouched by the read-modify-write.
+        assert_eq!(meta.info_hash, original.info_hash);
+        assert_eq!(meta.source, original.source);
+        assert_eq!(meta.selected_files, original.selected_files);
+        assert_eq!(meta.files, original.files);
+
+        // A later snapshot overwrites the previous one in place.
+        let snap2 = SwarmStats {
+            peers: 8,
+            seeds: 25,
+            up_bps: 0,
+            down_bps: 2_000,
+            ratio_milli: 1750,
+        };
+        persist_swarm(&pool, id, &snap2).await.unwrap();
+        let meta2 = get(&pool, id).await.unwrap().torrent.unwrap();
+        assert_eq!(meta2.swarm.as_ref(), Some(&snap2));
+    }
+
+    #[tokio::test]
+    async fn persist_swarm_is_noop_without_torrent_blob() {
+        // An HTTP/media row (no `torrent` blob) must not gain a fabricated one.
+        let pool = fresh_pool().await;
+        let id = seed_row(&pool, "plain.bin", None, None).await;
+        let snap = SwarmStats {
+            peers: 1,
+            seeds: 1,
+            up_bps: 0,
+            down_bps: 0,
+            ratio_milli: 0,
+        };
+        // Does not error and leaves the column NULL.
+        persist_swarm(&pool, id, &snap).await.unwrap();
+        let torrent: Option<String> = sqlx::query_scalar("SELECT torrent FROM downloads WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(torrent.is_none(), "no torrent blob fabricated");
     }
 }

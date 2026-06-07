@@ -12,7 +12,6 @@ import DownloadGroup from "@/components/DownloadGroup.vue";
 import DownloadRow from "@/components/DownloadRow.vue";
 import EmptyState from "@/components/EmptyState.vue";
 import DetailPane from "@/components/detail/DetailPane.vue";
-import BatchActionBar from "@/components/BatchActionBar.vue";
 import SkeletonRow from "@/components/SkeletonRow.vue";
 import SortToolbar from "@/components/SortToolbar.vue";
 
@@ -207,8 +206,6 @@ onBeforeUnmount(() => {
             @add-url="showAddUrl = true"
           />
         </div>
-
-        <BatchActionBar />
       </main>
 
       <AppStatusBar :loading="downloads.loading" />

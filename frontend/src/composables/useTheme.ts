@@ -3,7 +3,7 @@
 // (`unduhin:theme`) keeps the very first paint correct before the
 // settings store has refreshed from the backend.
 
-import { computed, ref, watch } from "vue";
+import { computed, effectScope, ref, watch } from "vue";
 import { useDark, usePreferredDark } from "@vueuse/core";
 
 import { useSettingsStore } from "@/stores/settings";
@@ -62,21 +62,29 @@ let _wired = false;
 /**
  * Hook the theme to the persisted `theme_mode` setting. Safe to call from
  * multiple components; only the first call wires up the watcher.
+ *
+ * The watcher runs in a detached effect scope so it lives for the app's
+ * lifetime regardless of which component first calls `useTheme()`. Binding
+ * it to the caller's component scope was the bug: the only caller was
+ * `AppTopBar`, which unmounts on the Settings route, so toggling the theme
+ * there stopped propagating to the DOM until the next app start.
  */
 function wireToSettings() {
   if (_wired) return;
   _wired = true;
   const settings = useSettingsStore();
   // First adoption: read the current value once the store has loaded.
-  watch(
-    () => settings.values["theme_mode"],
-    (v) => {
-      if (v === "light" || v === "dark" || v === "system") {
-        if (mode.value !== v) mode.value = v;
-      }
-    },
-    { immediate: true },
-  );
+  effectScope(true).run(() => {
+    watch(
+      () => settings.values["theme_mode"],
+      (v) => {
+        if (v === "light" || v === "dark" || v === "system") {
+          if (mode.value !== v) mode.value = v;
+        }
+      },
+      { immediate: true },
+    );
+  });
 }
 
 export function useTheme() {

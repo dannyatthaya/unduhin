@@ -1,11 +1,17 @@
 {
-  "generated_at": "2026-06-03T15:45:49.2559853Z",
+  "generated_at": "2026-06-07T02:35:15.6284361Z",
   "rust": [
     {
       "name": "anyhow",
       "version": "1.0.102",
       "license": "MIT OR Apache-2.0",
       "repository": "https://github.com/dtolnay/anyhow"
+    },
+    {
+      "name": "aws-lc-sys",
+      "version": "0.41.0",
+      "license": "ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0)",
+      "repository": "https://github.com/aws/aws-lc-rs"
     },
     {
       "name": "base64",
@@ -48,6 +54,12 @@
       "version": "0.17.11",
       "license": "MIT",
       "repository": "https://github.com/console-rs/indicatif"
+    },
+    {
+      "name": "librqbit",
+      "version": "8.1.1",
+      "license": "Apache-2.0",
+      "repository": "https://github.com/ikatson/rqbit"
     },
     {
       "name": "reqwest",

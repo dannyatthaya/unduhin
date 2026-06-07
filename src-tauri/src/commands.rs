@@ -15,8 +15,8 @@ use unduhin_core::{
     wire::{ExtensionSettings, HandoffDecision, RuleMetric, SettingsPatch},
     ytdlp::{MediaInfo, ProbeResult},
     AddDownload, Category, CategoryId, CategorySelector, Core, DownloadFilter, DownloadId,
-    DownloadRecord, DownloadSource, NewCategory, NewSchedule, QuietHoursState, Schedule,
-    ScheduleId, SettingValue, Status,
+    DownloadKind, DownloadRecord, DownloadSource, NewCategory, NewSchedule, QuietHoursState,
+    Schedule, ScheduleId, SettingValue, Status, TorrentMeta,
 };
 
 use crate::error::{CommandError, CommandResult};
@@ -37,6 +37,15 @@ pub struct AddDownloadInput {
     /// Captured browser request headers — populated by native
     /// host hand-offs. Frontend Add URL paths leave this `None`.
     pub headers: Option<Vec<(String, String)>>,
+    /// Which backend should run the download. Omitted (or `Http`) for the
+    /// direct-file / media paths; the torrent path (P4) sends `Torrent`
+    /// together with `torrent`. Defaults to `Http`.
+    #[serde(default)]
+    pub kind: DownloadKind,
+    /// Torrent state when `kind == Torrent` — the resolved `info_hash`,
+    /// source, and the user's file selection from the add-time picker.
+    #[serde(default)]
+    pub torrent: Option<TorrentMeta>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -213,14 +222,57 @@ pub async fn add_download(
     core: State<'_, Core>,
     input: AddDownloadInput,
 ) -> CommandResult<DownloadId> {
-    let url = url::Url::parse(&input.url).map_err(|e| CommandError {
-        message: format!("invalid URL: {e}"),
-    })?;
+    // The `kind` column and the `torrent` blob must agree; trust either
+    // signal so a caller that set only one still lands a torrent row.
+    let is_torrent = input.kind == DownloadKind::Torrent || input.torrent.is_some();
+
+    // For HTTP / media rows `url` must be a real URL. Torrent rows carry the
+    // magnet URI (or a `file:`-wrapped `.torrent` path) in this field; magnets
+    // parse fine, but a `.torrent` source may not, so for torrents we fall
+    // back to synthesizing a magnet URL from the resolved info-hash. The
+    // backend keys de-dup and the provisional name off `torrent.source`, not
+    // this column, so the fallback is only a parseable placeholder.
+    let url = match url::Url::parse(&input.url) {
+        Ok(u) => u,
+        Err(e) if is_torrent => {
+            let hash = input
+                .torrent
+                .as_ref()
+                .map(|t| t.info_hash.as_str())
+                .filter(|h| !h.is_empty());
+            match hash {
+                Some(h) => url::Url::parse(&format!("magnet:?xt=urn:btih:{h}")).map_err(|e| {
+                    CommandError {
+                        message: format!("invalid torrent magnet placeholder: {e}"),
+                    }
+                })?,
+                None => {
+                    return Err(CommandError {
+                        message: format!("invalid torrent input: {e}"),
+                    })
+                }
+            }
+        }
+        Err(e) => {
+            return Err(CommandError {
+                message: format!("invalid URL: {e}"),
+            })
+        }
+    };
 
     let category = match (input.category_id, input.category_name) {
         (Some(id), _) => Some(CategorySelector::Id(id)),
         (None, Some(name)) if !name.is_empty() => Some(CategorySelector::Name(name)),
         _ => None,
+    };
+
+    // `insert` re-normalizes the discriminator against the JSON blobs, but we
+    // pass the explicit `kind` through so a torrent without a resolved blob
+    // (shouldn't happen from the UI) still lands as `Torrent`.
+    let kind = if is_torrent {
+        DownloadKind::Torrent
+    } else {
+        input.kind
     };
 
     let id = core
@@ -234,6 +286,8 @@ pub async fn add_download(
             media_info: input.media_info,
             headers: input.headers,
             source: DownloadSource::Manual,
+            kind,
+            torrent: input.torrent,
         })
         .await?;
     Ok(id)
@@ -473,6 +527,99 @@ pub async fn probe_media_url(
             message: e.to_string(),
         }),
     }
+}
+
+// Torrents (add-time metadata probe)
+
+/// Input to [`fetch_torrent_metadata`] — mirrors the frontend `TorrentSource`
+/// discriminant (`crates/core/src/download.rs::TorrentSource`, serde-tagged
+/// `kind` snake_case). The dialog builds this from the user's magnet paste or
+/// `.torrent` drop and asks for the file list before adding anything.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum TorrentMetadataInput {
+    Magnet { uri: String },
+    File { path: String },
+    InfoHash { hash: String },
+}
+
+impl TorrentMetadataInput {
+    fn into_torrent_input(self) -> torrent::TorrentInput {
+        match self {
+            TorrentMetadataInput::Magnet { uri } => torrent::TorrentInput::Magnet(uri),
+            TorrentMetadataInput::File { path } => {
+                torrent::TorrentInput::TorrentFile(PathBuf::from(path))
+            }
+            TorrentMetadataInput::InfoHash { hash } => torrent::TorrentInput::InfoHash(hash),
+        }
+    }
+}
+
+/// One file in a probed torrent. `index` is its position in the torrent's
+/// file list — the value the add-time picker feeds back as a
+/// `TorrentMeta.selected_files` entry.
+#[derive(Debug, Serialize)]
+pub struct TorrentMetadataFile {
+    pub index: usize,
+    pub path: String,
+    pub length: u64,
+}
+
+/// Result of [`fetch_torrent_metadata`] — the resolved `info_hash`, display
+/// name, and every file in torrent order. Mirrors the frontend's
+/// `TorrentMetadataResult`.
+#[derive(Debug, Serialize)]
+pub struct TorrentMetadataResult {
+    pub info_hash: String,
+    pub name: String,
+    pub files: Vec<TorrentMetadataFile>,
+}
+
+/// Probe a magnet / `.torrent` / infohash for its file list WITHOUT
+/// downloading (librqbit `list_only`) — backs the add-time file picker.
+///
+/// This spins up a SHORT-LIVED librqbit session distinct from the queue's
+/// process-wide download session (which lives in `unduhin-core` and is not
+/// exposed here): a `list_only` probe binds an OS-assigned ephemeral port,
+/// fetches metadata, and is dropped when the command returns. DHT is read
+/// from the `torrent_enable_dht` setting (default on) so trackerless magnets
+/// can resolve; UPnP is left off for the probe since no inbound peers are
+/// needed. The facade bounds the probe with its own timeout
+/// ([`torrent::DEFAULT_METADATA_TIMEOUT`]); on elapse this returns an error
+/// the dialog surfaces as "couldn't fetch torrent metadata".
+#[tauri::command]
+pub async fn fetch_torrent_metadata(
+    core: State<'_, Core>,
+    input: TorrentMetadataInput,
+) -> CommandResult<TorrentMetadataResult> {
+    // Probe through the queue's SHARED process-wide session (in unduhin-core),
+    // NOT a second librqbit session here: a second session starts a second
+    // PersistentDht on the same persisted UDP port, which fails to bind
+    // ("error initializing persistent DHT") and would starve the real download
+    // of peers. `list_only` only probes — it doesn't disturb active downloads.
+    let ti = input.into_torrent_input();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let meta = core
+        .fetch_torrent_metadata(ti, cancel)
+        .await
+        .map_err(|e| CommandError {
+            message: e.to_string(),
+        })?;
+
+    Ok(TorrentMetadataResult {
+        info_hash: meta.info_hash,
+        name: meta.name,
+        files: meta
+            .files
+            .into_iter()
+            .enumerate()
+            .map(|(index, f)| TorrentMetadataFile {
+                index,
+                path: f.path,
+                length: f.length,
+            })
+            .collect(),
+    })
 }
 
 #[tauri::command]

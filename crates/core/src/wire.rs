@@ -92,6 +92,38 @@ pub struct MediaStream {
     pub request_headers: Vec<RequestHeader>,
 }
 
+/// A BitTorrent download captured by the extension — a clicked
+/// `magnet:` link or a downloaded `.torrent` file. Mirrors
+/// [`DownloadJob`] but for the torrent path (design §3.E). Routed to
+/// `core::torrent_handoff` on the native side, which validates the
+/// untrusted bytes / URI and builds an `AddDownload { kind: Torrent }`.
+///
+/// Exactly one of `magnet` / `torrent_file_b64` is expected to be set;
+/// the handler rejects a job with neither. The browser can't hand over a
+/// filesystem path, so a captured `.torrent` arrives base64-encoded and
+/// is written into the managed dir on the native side.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-rs-export", derive(TS))]
+#[cfg_attr(feature = "ts-rs-export", ts(export, export_to = "wire.d.ts"))]
+#[serde(rename_all = "camelCase")]
+pub struct TorrentJob {
+    /// A `magnet:?xt=urn:btih:…` URI. Set when the user clicked a magnet
+    /// link.
+    pub magnet: Option<String>,
+    /// Base64-encoded raw `.torrent` bytes. Set when the user downloaded
+    /// a `.torrent` file (the browser cannot pass a path). Size-limited
+    /// and validated on the native side before it touches disk.
+    pub torrent_file_b64: Option<String>,
+    /// User-visible URL on the page that triggered the capture.
+    pub page_url: Option<String>,
+    #[cfg_attr(feature = "ts-rs-export", ts(type = "number | null"))]
+    pub tab_id: Option<i64>,
+    /// Display-name hint (e.g. the `.torrent` link text). Only ever used
+    /// as the provisional `AddDownload.filename`, which the core run
+    /// through `sanitize_filename` — never as a path.
+    pub suggested_filename: Option<String>,
+}
+
 /// One row in an [`Outbound::Status`] payload. Strictly a subset of
 /// [`crate::DownloadRecord`] — the extension popup only needs enough to
 /// render the "recent downloads" list.
@@ -354,6 +386,14 @@ pub enum Inbound {
     DownloadMedia {
         stream: MediaStream,
     },
+    /// Browser captured a `magnet:` link or a `.torrent` file. The native
+    /// side validates the untrusted payload, writes any `.torrent` bytes
+    /// into the managed dir, and builds an `AddDownload { kind: Torrent,
+    /// source: ExtensionPipe }`. `Ack { id }` returns the assigned
+    /// `DownloadId`, same as the HTTP / media paths.
+    DownloadTorrent {
+        job: TorrentJob,
+    },
     Status,
     /// Tauri panel asks for the cached extension settings.
     GetSettings,
@@ -507,6 +547,45 @@ mod tests {
         assert!(s.contains("\"type\": \"downloadMedia\""));
         assert!(s.contains("\"kind\": \"hls\""));
         assert!(s.contains("\"manifestUrl\""));
+    }
+
+    #[test]
+    fn download_torrent_roundtrip() {
+        let msg = Inbound::DownloadTorrent {
+            job: TorrentJob {
+                magnet: Some("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567".into()),
+                torrent_file_b64: None,
+                page_url: Some("https://tracker.example/details".into()),
+                tab_id: Some(9),
+                suggested_filename: Some("ubuntu.iso".into()),
+            },
+        };
+        let s = roundtrip(&msg);
+        // Tagged `type` + camelCase confirm the serde attrs are in effect.
+        assert!(s.contains("\"type\": \"downloadTorrent\""));
+        assert!(s.contains("\"torrentFileB64\""));
+        assert!(s.contains("\"pageUrl\""));
+        assert!(s.contains("\"suggestedFilename\""));
+    }
+
+    #[test]
+    fn download_torrent_file_roundtrip() {
+        // The `.torrent`-bytes variant: magnet is None, b64 carries the
+        // metainfo. The handler decides which arm based on which field is
+        // populated.
+        let msg = Inbound::DownloadTorrent {
+            job: TorrentJob {
+                magnet: None,
+                torrent_file_b64: Some("ZDg6YW5ub3VuY2U=".into()),
+                page_url: None,
+                tab_id: None,
+                suggested_filename: Some("thing".into()),
+            },
+        };
+        let s = roundtrip(&msg);
+        assert!(s.contains("\"type\": \"downloadTorrent\""));
+        assert!(s.contains("\"magnet\": null"));
+        assert!(s.contains("\"torrentFileB64\": \"ZDg6YW5ub3VuY2U=\""));
     }
 
     #[test]

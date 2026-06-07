@@ -56,6 +56,30 @@ pub enum CoreEvent {
         id: DownloadId,
         error: String,
     },
+    /// Live swarm snapshot for a torrent download. Translated from the
+    /// engine's [`engine::ProgressEvent::SwarmProgress`] in `queue.rs`; the
+    /// pump also persists the snapshot into the row's `torrent` JSON so the
+    /// peers/seeds survive a relaunch. `up_bps` / `down_bps` are bytes/sec;
+    /// `ratio_milli` is the upload/download ratio in thousandths.
+    SwarmProgress {
+        id: DownloadId,
+        peers: u32,
+        seeds: u32,
+        up_bps: u64,
+        down_bps: u64,
+        ratio_milli: u32,
+    },
+    /// Per-file progress for a multi-file torrent. Re-emitted from the
+    /// engine's [`engine::ProgressEvent::FileProgress`] (renamed so the wire
+    /// shape reads `torrent_file_progress` rather than colliding with the
+    /// HTTP segment vocabulary). Not persisted — the detail pane keeps it in
+    /// memory like `SegmentProgress`.
+    TorrentFileProgress {
+        id: DownloadId,
+        index: usize,
+        downloaded: u64,
+        total: u64,
+    },
     Removed {
         id: DownloadId,
     },

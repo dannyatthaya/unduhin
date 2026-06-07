@@ -67,6 +67,60 @@ export interface SegmentLive {
   state: SegmentRuntimeState;
 }
 
+// ---------------------------------------------------------------------------
+// Torrent shapes — mirror crates/core/src/download.rs
+//   (DownloadKind, TorrentMeta, TorrentSource, TorrentFile, SwarmStats)
+// ---------------------------------------------------------------------------
+
+/** Which backend runs a download. Mirrors `DownloadKind` (snake_case serde).
+ *  `http` → engine, `media` → yt-dlp, `torrent` → librqbit facade. */
+export type DownloadKind = "http" | "media" | "torrent";
+
+/** Where a torrent came from. Serde-tagged with `kind` (snake_case) — mirrors
+ *  `crates/core/src/download.rs::TorrentSource`. `.torrent` bytes are copied
+ *  into the managed dir and referenced by `path`; magnets store the URI. */
+export type TorrentSource =
+  | { kind: "magnet"; uri: string }
+  | { kind: "file"; path: string }
+  | { kind: "info_hash"; hash: string };
+
+/** One file inside a torrent — feeds the add-time picker and the detail-pane
+ *  per-file progress list. Mirrors `download.rs::TorrentFile`. */
+export interface TorrentFile {
+  index: number;
+  path: string;
+  length: number;
+  selected: boolean;
+}
+
+/** Last swarm snapshot persisted into the row's `torrent` JSON. `up_bps` /
+ *  `down_bps` are bytes/sec; `ratio_milli` is the upload/download ratio in
+ *  thousandths (1500 = 1.5x). Mirrors `download.rs::SwarmStats`. */
+export interface SwarmStats {
+  peers: number;
+  seeds: number;
+  up_bps: number;
+  down_bps: number;
+  ratio_milli: number;
+}
+
+/** Persisted torrent state for a `kind === "torrent"` row. Stored as one
+ *  nullable JSON column on `downloads.torrent`. Mirrors
+ *  `crates/core/src/download.rs::TorrentMeta`. */
+export interface TorrentMeta {
+  /** Lowercase hex info-hash — the stable de-dup key. */
+  info_hash: string;
+  source: TorrentSource;
+  /** `null` = download all files; otherwise the selected file indices into
+   *  `files` (librqbit `only_files`). */
+  selected_files: number[] | null;
+  /** Filled once librqbit resolves metadata. */
+  files: TorrentFile[] | null;
+  /** Last swarm snapshot; survives relaunch so the UI can render peers/seeds
+   *  before the session re-attaches. */
+  swarm: SwarmStats | null;
+}
+
 export interface DownloadRecord {
   id: DownloadId;
   url: string;
@@ -90,6 +144,12 @@ export interface DownloadRecord {
    * rebuild the detail-pane sparkline for downloads that finished before
    * this session. Null while in flight or for legacy rows. */
   speed_samples: number[] | null;
+  /** Which backend runs this download. Defaults to `"http"` on legacy rows
+   * (the migration backfills yt-dlp rows to `"media"`). */
+  kind: DownloadKind;
+  /** Persisted torrent state when `kind === "torrent"`. Null for HTTP/media
+   * rows and rows predating the torrent migration. */
+  torrent: TorrentMeta | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -236,6 +296,32 @@ export type CoreEvent =
       error: string;
     }
   | {
+      /** Live swarm snapshot for a torrent download. The queue pump also
+       *  persists this into the row's `torrent` JSON so peers/seeds survive
+       *  a relaunch. `up_bps` / `down_bps` are bytes/sec; `ratio_milli` is
+       *  the upload/download ratio in thousandths (1500 = 1.5x). Mirrors
+       *  `crates/core/src/event.rs::CoreEvent::SwarmProgress`. */
+      type: "swarm_progress";
+      id: DownloadId;
+      peers: number;
+      seeds: number;
+      up_bps: number;
+      down_bps: number;
+      ratio_milli: number;
+    }
+  | {
+      /** Per-file progress for a multi-file torrent. `index` is the file's
+       *  position in the torrent's file list; `downloaded` / `total` are
+       *  bytes for that one file. Not persisted (in-memory like
+       *  `segment_progress`). Mirrors
+       *  `crates/core/src/event.rs::CoreEvent::TorrentFileProgress`. */
+      type: "torrent_file_progress";
+      id: DownloadId;
+      index: number;
+      downloaded: number;
+      total: number;
+    }
+  | {
       type: "removed";
       id: DownloadId;
     }
@@ -320,6 +406,35 @@ export interface AddDownloadInput {
   priority?: number | null;
   segments?: number | null;
   media_info?: MediaInfo | null;
+  /** Which backend should run the download. Omit (or `"http"`) for direct
+   *  files; the media dialog leaves this unset and supplies `media_info`;
+   *  the torrent path (P4) sends `"torrent"` plus `torrent`. */
+  kind?: DownloadKind | null;
+  /** Torrent state when `kind === "torrent"` — the resolved `info_hash`,
+   *  source, and the user's file selection from the add-time picker. */
+  torrent?: TorrentMeta | null;
+}
+
+/** Input to `fetch_torrent_metadata` — probe a torrent's file list WITHOUT
+ *  downloading (librqbit `list_only`), backing the add-time file picker.
+ *  Mirrors the facade's `TorrentInput` / `TorrentSource` discriminant. P4
+ *  wires the Tauri command; this types the surface it will expose. */
+export type TorrentMetadataInput = TorrentSource;
+
+/** Result of `fetch_torrent_metadata`. Mirrors the facade's
+ *  `crates/torrent::TorrentMetadata` (info_hash + display name + every file
+ *  in torrent order). `index` is each file's position in the list, used to
+ *  build the `selected_files` selection sent back in `TorrentMeta`. */
+export interface TorrentMetadataResult {
+  info_hash: string;
+  name: string;
+  files: TorrentMetadataFile[];
+}
+
+export interface TorrentMetadataFile {
+  index: number;
+  path: string;
+  length: number;
 }
 
 export interface NewCategoryInput {
@@ -428,6 +543,18 @@ export const api = {
    */
   probeMediaUrl: (url: string) =>
     invoke<ProbeResult | null>("probe_media_url", { url }),
+  /**
+   * Probe a magnet / `.torrent` / infohash for its file list WITHOUT
+   * downloading (librqbit `list_only`) — backs the add-time file picker.
+   * Returns the resolved `info_hash`, display name, and every file in
+   * torrent order. Throws when metadata can't be fetched within the
+   * backend timeout (no peers / DHT off) or the input is malformed.
+   *
+   * The backing Tauri command is wired in P4; this typed wrapper is the
+   * frozen surface that the AddUrlDialog torrent path will call.
+   */
+  fetchTorrentMetadata: (input: TorrentMetadataInput) =>
+    invoke<TorrentMetadataResult>("fetch_torrent_metadata", { input }),
   toolStatus: (tool: Tool) => invoke<ToolStatus>("tool_status", { tool }),
   installTool: (tool: Tool) => invoke<ToolStatus>("install_tool", { tool }),
 

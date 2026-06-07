@@ -31,6 +31,12 @@ const live = computed(() => store.liveSegmentsFor(props.download.id));
 
 const isMedia = computed(() => props.download.media_info != null);
 
+/** Torrent rows have no HTTP segments — the per-segment preview + "view all
+ *  segments" affordance don't apply. The detail pane offers a Torrent tab
+ *  instead, so the overview just hides the segments preview here. */
+const isTorrent = computed(() => props.download.kind === "torrent");
+const showSegmentsPreview = computed(() => !isMedia.value && !isTorrent.value);
+
 const pct = computed(() =>
   percent(props.download.downloaded_bytes, props.download.total_bytes)
 );
@@ -167,8 +173,9 @@ const addedAt = computed(() => {
       </div>
     </section>
 
-    <!-- Segments preview — hidden for yt-dlp (single-stream) downloads. -->
-    <section v-if="!isMedia">
+    <!-- Segments preview — hidden for yt-dlp (single-stream) and torrent
+         downloads (no HTTP segments; use the Torrent tab instead). -->
+    <section v-if="showSegmentsPreview">
       <header class="mb-2 flex items-center justify-between">
         <h3 class="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
           {{ t("detail.tabSegments") }}

@@ -36,6 +36,29 @@ cookieHeader: string | null, userAgent: string | null,
  */
 requestHeaders: Array<RequestHeader>, tabId: number | null, pageUrl: string | null, };
 
+export type TorrentJob = { 
+/**
+ * A `magnet:?xt=urn:btih:…` URI. Set when the user clicked a magnet
+ * link.
+ */
+magnet: string | null, 
+/**
+ * Base64-encoded raw `.torrent` bytes. Set when the user downloaded
+ * a `.torrent` file (the browser cannot pass a path). Size-limited
+ * and validated on the native side before it touches disk.
+ */
+torrentFileB64: string | null, 
+/**
+ * User-visible URL on the page that triggered the capture.
+ */
+pageUrl: string | null, tabId: number | null, 
+/**
+ * Display-name hint (e.g. the `.torrent` link text). Only ever used
+ * as the provisional `AddDownload.filename`, which the core run
+ * through `sanitize_filename` — never as a path.
+ */
+suggestedFilename: string | null, };
+
 export type StatusEntry = { id: number, url: string, filename: string, status: string, totalBytes: number | null, downloadedBytes: number, };
 
 export type HandoffMode = "catch-all" | "ask-first" | "rules-only" | "passthrough";
@@ -72,7 +95,7 @@ export type ExtensionSettings = { enabled: boolean, nativeHostName: string, minS
 
 export type SettingsPatch = { enabled: boolean | null, nativeHostName: string | null, minSizeMb: number | null, extensionAllowlist: Array<string> | null, extensionBlocklist: Array<string> | null, blockedHosts: Array<HostRule> | null, alwaysInterceptHosts: Array<HostRule> | null, detectHls: boolean | null, detectDash: boolean | null, verboseLogging: boolean | null, mode: HandoffMode | null, installContextMenu: boolean | null, hideShelf: boolean | null, forwardCookies: boolean | null, fileTypes: Array<string> | null, };
 
-export type Inbound = { "type": "ping" } | { "type": "download", job: DownloadJob, } | { "type": "downloadMedia", stream: MediaStream, } | { "type": "status" } | { "type": "getSettings" } | { "type": "setSettings", patch: SettingsPatch, } | { "type": "askHandoff", 
+export type Inbound = { "type": "ping" } | { "type": "download", job: DownloadJob, } | { "type": "downloadMedia", stream: MediaStream, } | { "type": "downloadTorrent", job: TorrentJob, } | { "type": "status" } | { "type": "getSettings" } | { "type": "setSettings", patch: SettingsPatch, } | { "type": "askHandoff", 
 /**
  * Extension-generated correlation token. Echoed back on the
  * matching `HandoffDecision`. UUID-ish in practice; opaque to

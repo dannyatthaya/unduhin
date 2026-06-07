@@ -162,7 +162,7 @@ function onLanguage(value: string) {
           </div>
           <p
             v-if="showRestartHint"
-            class="text-xs text-muted-foreground"
+            class="max-w-xs text-xs text-muted-foreground"
           >
             {{ t("settings.languageRestartHint") }}
           </p>

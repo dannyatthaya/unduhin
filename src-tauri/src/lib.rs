@@ -167,6 +167,7 @@ pub fn run() {
             commands::get_setting,
             commands::set_setting,
             commands::probe_media_url,
+            commands::fetch_torrent_metadata,
             commands::tool_status,
             commands::install_tool,
             commands::record_update_check,
@@ -189,8 +190,22 @@ pub fn run() {
         .expect("failed to build tauri app")
         .run(move |_app, event| {
             if let RunEvent::ExitRequested { .. } = event {
+                // Flush state (bounded), then HARD-EXIT. librqbit's session
+                // keeps background tasks alive (DHT, peer sockets, blocking disk
+                // I/O); on a normal return the tokio runtime's drop blocks
+                // waiting on them, which surfaces as the window hanging on "Not
+                // Responding". `process::exit` skips that teardown. Interrupted
+                // downloads are recoverable: `Core::open` re-queues any row left
+                // `active`/`muxing` on the next launch.
                 let core_for_shutdown = _app.state::<Core>().inner().clone();
-                let _ = runtime_handle.block_on(core_for_shutdown.shutdown());
+                let _ = runtime_handle.block_on(async {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        core_for_shutdown.shutdown(),
+                    )
+                    .await
+                });
+                std::process::exit(0);
             }
         });
 }

@@ -737,7 +737,7 @@ async fn resume_all(core: &Core) -> usize {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use unduhin_core::{DownloadRecord, DownloadSource};
+    use unduhin_core::{DownloadKind, DownloadRecord, DownloadSource};
 
     fn rec(id: DownloadId, status: Status) -> DownloadRecord {
         rec_with(id, status, 0, None)
@@ -770,6 +770,8 @@ mod tests {
             headers: None,
             source: DownloadSource::Manual,
             speed_samples: None,
+            kind: DownloadKind::Http,
+            torrent: None,
         }
     }
 

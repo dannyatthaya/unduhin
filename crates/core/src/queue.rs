@@ -24,17 +24,124 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use engine::{Backoff, CancellationToken, Control, DownloadOptions, Meta, ProgressEvent};
 use sqlx::SqlitePool;
-use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
+use tokio::sync::{broadcast, mpsc, Mutex, OnceCell, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use url::Url;
 
-use crate::download::{self, DownloadId, DownloadRecord, Status};
+use crate::download::{
+    self, DownloadId, DownloadKind, DownloadRecord, Status, SwarmStats, TorrentSource,
+};
 use crate::event::CoreEvent;
 use crate::schedule::{self, SchedulesCache};
 use crate::settings;
 use crate::tooling::{self, Tool};
 use crate::ytdlp::{self, YtdlpJob};
+
+/// Lazily-built process-wide torrent session, behind the `crates/torrent`
+/// facade. Stored on [`crate::CoreInner`] and shared with the queue manager;
+/// the worker resolves the [`torrent::TorrentEngine`] from it on the first
+/// `DownloadKind::Torrent` claim (design §3.D — one DHT, one listen socket,
+/// one peer budget for the whole process). Construction is config-from-settings
+/// and runs at most once thanks to [`OnceCell`].
+pub(crate) struct TorrentEngineCell {
+    cell: OnceCell<Arc<torrent::TorrentEngine>>,
+}
+
+impl TorrentEngineCell {
+    pub(crate) fn new() -> Self {
+        Self {
+            cell: OnceCell::new(),
+        }
+    }
+
+    /// Resolve the shared engine, building it on first use from the
+    /// `torrent_*` settings (design §3.G) + the managed state dir. The build
+    /// runs exactly once even under concurrent first claims; subsequent calls
+    /// return the cached `Arc`.
+    pub(crate) async fn get_or_init(
+        &self,
+        pool: &SqlitePool,
+    ) -> Result<Arc<torrent::TorrentEngine>, engine::EngineError> {
+        self.cell
+            .get_or_try_init(|| async {
+                let cfg = build_torrent_config(pool).await?;
+                let engine = torrent::TorrentEngine::new(cfg)
+                    .await
+                    .map_err(engine::EngineError::from)?;
+                Ok::<_, engine::EngineError>(Arc::new(engine))
+            })
+            .await
+            .cloned()
+    }
+
+    /// The shared engine if it has ALREADY been built, without initializing it.
+    /// `Core::remove` uses this to forget a torrent from a live session only
+    /// when one exists — no point spinning a session up just to remove
+    /// something that was therefore never in it.
+    pub(crate) fn get(&self) -> Option<Arc<torrent::TorrentEngine>> {
+        self.cell.get().cloned()
+    }
+}
+
+/// Build the facade's [`torrent::TorrentConfig`] from the `torrent_*` settings
+/// seeded by the P1 migration (design §3.G). The session-wide content default
+/// is `torrent_download_dir` (or the global default); per-download content dirs
+/// override it at `run` time. Session JSON + fastresume live in the managed
+/// `<app_data>/torrents` dir (design §3.D), distinct from content so resume
+/// state survives content moves.
+async fn build_torrent_config(pool: &SqlitePool) -> Result<torrent::TorrentConfig, engine::EngineError> {
+    // Session-default content dir: `torrent_download_dir`, else the global
+    // default, else the cwd. This is only the session default librqbit records;
+    // each `run` passes an explicit per-download content dir that overrides it.
+    let configured = settings::get(pool, "torrent_download_dir")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .filter(|s| !s.is_empty());
+    let download_dir = match configured {
+        Some(d) => PathBuf::from(d),
+        None => settings::get(pool, settings::settings_keys::DEFAULT_OUTPUT_PATH)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
+    };
+
+    let state_dir = crate::directories_root()
+        .map(|d| d.join("torrents"))
+        .unwrap_or_else(|| download_dir.join(".unduhin-torrents"));
+
+    let listen_port = settings::get(pool, "torrent_listen_port")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        .min(u16::MAX as u64) as u16;
+    let enable_dht = settings::get(pool, "torrent_enable_dht")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let enable_upnp = settings::get(pool, "torrent_enable_upnp")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    let mut cfg = torrent::TorrentConfig::new(download_dir, state_dir);
+    cfg.listen_port = listen_port;
+    cfg.enable_dht = enable_dht;
+    cfg.enable_upnp = enable_upnp;
+    Ok(cfg)
+}
 
 /// Period of the manager's reconciliation loop when nothing pokes it.
 const TICK_PERIOD: Duration = Duration::from_millis(500);
@@ -109,6 +216,9 @@ pub(crate) struct QueueManager {
     /// pass (start_at gating + after_queue deferral) and writes back when
     /// it reaps a fired `start_at` row.
     schedules: Arc<RwLock<SchedulesCache>>,
+    /// Shared lazy torrent session (design §3.D). Threaded into each torrent
+    /// worker so they all reuse one process-wide librqbit session.
+    torrent_engine: Arc<TorrentEngineCell>,
 }
 
 /// Debounce state for the `QueueEmptied` emission. Owned by the manager
@@ -140,6 +250,7 @@ impl QueueManager {
         pool: SqlitePool,
         events: broadcast::Sender<CoreEvent>,
         schedules: Arc<RwLock<SchedulesCache>>,
+        torrent_engine: Arc<TorrentEngineCell>,
     ) -> QueueHandle {
         let shutdown = CancellationToken::new();
         let (wake_tx, wake_rx) = mpsc::channel(1);
@@ -151,6 +262,7 @@ impl QueueManager {
             shutdown: shutdown.clone(),
             drain: Mutex::new(DrainTracker::default()),
             schedules,
+            torrent_engine,
         });
         let handle_manager = manager.clone();
         let join = tokio::spawn(async move {
@@ -313,9 +425,9 @@ impl QueueManager {
                 to: Status::Active,
             });
             let cancel = CancellationToken::new();
-            // Only engine-driven downloads use the control channel.
-            // yt-dlp paths ignore it.
-            let (control_tx, control_rx) = if record.media_info.is_none() {
+            // Only engine-driven (HTTP) downloads use the control channel
+            // for live re-segmentation. yt-dlp and torrent paths ignore it.
+            let (control_tx, control_rx) = if record.kind == DownloadKind::Http {
                 let (tx, rx) = mpsc::channel::<Control>(8);
                 (Some(tx), Some(rx))
             } else {
@@ -327,6 +439,7 @@ impl QueueManager {
                 record,
                 cancel.clone(),
                 control_rx,
+                self.torrent_engine.clone(),
             );
             active.insert(
                 id,
@@ -389,9 +502,10 @@ fn spawn_worker(
     record: DownloadRecord,
     cancel: CancellationToken,
     control_rx: Option<mpsc::Receiver<Control>>,
+    torrent_engine: Arc<TorrentEngineCell>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        run_worker(pool, events, record, cancel, control_rx).await;
+        run_worker(pool, events, record, cancel, control_rx, torrent_engine).await;
     })
 }
 
@@ -401,16 +515,25 @@ async fn run_worker(
     record: DownloadRecord,
     cancel: CancellationToken,
     control_rx: Option<mpsc::Receiver<Control>>,
+    torrent_engine: Arc<TorrentEngineCell>,
 ) {
     let id = record.id;
     let output_path = record.output_path.clone();
     let meta_path = Meta::sidecar_path(&output_path);
     let pump_meta_path = meta_path.clone();
-    let url = match record.url.parse::<Url>() {
-        Ok(u) => u,
-        Err(e) => {
-            mark_worker_failed(&pool, &events, id, &format!("invalid url: {e}")).await;
-            return;
+    // The URL parse is HTTP/media-only: those backends key everything off
+    // `record.url`. Torrent rows read `record.torrent` instead and may
+    // carry a bare info-hash that is not a valid `Url`, so the parse is
+    // pushed into the Http/Media arms below (Q3) — never gating torrents.
+    let url: Option<Url> = if record.kind == DownloadKind::Torrent {
+        None
+    } else {
+        match record.url.parse::<Url>() {
+            Ok(u) => Some(u),
+            Err(e) => {
+                mark_worker_failed(&pool, &events, id, &format!("invalid url: {e}")).await;
+                return;
+            }
         }
     };
 
@@ -426,7 +549,13 @@ async fn run_worker(
     // owns the producing side and we want to react in real time.
     let pump_pool = pool.clone();
     let pump_events = events.clone();
+    // The HTTP engine emits `FilenameLearned` and reconciles against
+    // `pump_url` (`None` for torrents). Torrents ALSO emit `FilenameLearned`
+    // (the librqbit facade fires it once magnet metadata resolves the real
+    // name) but reconcile via a directory-safe display-only path — gated on
+    // this flag so the two never cross-wire.
     let pump_url = url.clone();
+    let pump_is_torrent = record.kind == DownloadKind::Torrent;
     let pump = tokio::spawn(async move {
         // yt-dlp downloads multi-stream formats (video + audio) one
         // stream at a time. Each stream's progress restarts from byte 0,
@@ -462,8 +591,14 @@ async fn run_worker(
                     // Phase transition: a meaningful drop in the byte
                     // counter means yt-dlp moved to a new stream. We
                     // only fire this once per run; subsequent stream
-                    // boundaries are still treated as `Muxing`.
+                    // boundaries are still treated as `Muxing`. This is a
+                    // yt-dlp-only signal: torrent byte counts from librqbit
+                    // aren't monotonic (piece verification, the metadata →
+                    // content transition), so a torrent must NEVER be flipped
+                    // to `Muxing` here — it would show "Merging audio + video…"
+                    // and hide real progress (design §3.C: Muxing is yt-dlp-only).
                     if !muxing_emitted
+                        && !pump_is_torrent
                         && downloaded + 1024 < last_downloaded
                         && download::transition_status(
                             &pump_pool,
@@ -552,12 +687,52 @@ async fn run_worker(
                     });
                 }
                 Ok(ProgressEvent::FilenameLearned { hint }) => {
+                    // Torrents: the facade learned the real torrent name once
+                    // librqbit resolved magnet metadata. Reconcile the row's
+                    // DISPLAY name + category WITHOUT moving anything on disk
+                    // (the content root is a live directory librqbit is writing
+                    // into). Mirrors `finalize_ytdlp_completion`'s category
+                    // logic, display-only.
+                    if pump_is_torrent {
+                        match download::reconcile_torrent_filename(&pump_pool, id, &hint).await {
+                            Ok(Some((filename, category_id, category_changed))) => {
+                                // The on-disk content root is unchanged; report
+                                // the current `output_path` so the UI keeps a
+                                // valid path while updating the display name.
+                                if let Ok(record) = download::get(&pump_pool, id).await {
+                                    let _ = pump_events.send(CoreEvent::PathsChanged {
+                                        id,
+                                        filename,
+                                        output_path: record
+                                            .output_path
+                                            .to_string_lossy()
+                                            .into_owned(),
+                                    });
+                                }
+                                if category_changed {
+                                    let _ = pump_events.send(CoreEvent::CategoryChanged {
+                                        id,
+                                        category_id,
+                                    });
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                tracing::warn!(id, error = %e, "queue: reconcile_torrent_filename failed");
+                            }
+                        }
+                        continue;
+                    }
                     // The engine learned the real filename from the response
                     // headers while the bytes are still flowing. Update the
                     // row's display name + category now so the UI stops showing
                     // the random URL slug — the on-disk file is relocated to
-                    // match at completion (`apply_engine_filename`).
-                    match download::mark_learned_filename(&pump_pool, id, &pump_url, &hint).await {
+                    // match at completion (`apply_engine_filename`). Only the
+                    // HTTP engine has a meaningful `url` to reconcile against.
+                    let Some(pump_url) = pump_url.as_ref() else {
+                        continue;
+                    };
+                    match download::mark_learned_filename(&pump_pool, id, pump_url, &hint).await {
                         Ok(Some(learned)) => {
                             let _ = pump_events.send(CoreEvent::PathsChanged {
                                 id,
@@ -575,6 +750,28 @@ async fn run_worker(
                         Err(e) => {
                             tracing::warn!(id, error = %e, "queue: mark_learned_filename failed");
                         }
+                    }
+                }
+                Ok(ev @ ProgressEvent::SwarmProgress { .. }) => {
+                    // Torrent-only (design §3.C). Mirror the SegmentProgress
+                    // translate-and-re-emit pattern, but also persist the
+                    // snapshot into the row's `torrent` JSON so peers/seeds
+                    // survive a relaunch. `persist_swarm` is a no-op on a row
+                    // with no torrent blob, so a stray HTTP/media emission
+                    // (there is none today) can't corrupt anything.
+                    if let Some((swarm, core_ev)) = translate_swarm(id, &ev) {
+                        if let Err(e) = download::persist_swarm(&pump_pool, id, &swarm).await {
+                            tracing::warn!(id, error = %e, "queue: persist_swarm failed");
+                        }
+                        let _ = pump_events.send(core_ev);
+                    }
+                }
+                Ok(ev @ ProgressEvent::FileProgress { .. }) => {
+                    // Torrent-only per-file heartbeat. Re-emit only — the
+                    // detail pane holds it in memory like SegmentProgress; we
+                    // do not persist per-file byte counts (design §3.C).
+                    if let Some(core_ev) = translate_file_progress(id, &ev) {
+                        let _ = pump_events.send(core_ev);
                     }
                 }
                 Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
@@ -597,22 +794,37 @@ async fn run_worker(
     });
 
     let backoff = Backoff::default();
-    let result: Result<engine::DownloadSummary, engine::EngineError> =
-        if let Some(info) = record.media_info.clone() {
+    // Branch on the explicit backend discriminator. `Media` delegates to
+    // yt-dlp, `Torrent` to the librqbit facade, and `Http` to the engine
+    // (resume when a sidecar exists, fresh otherwise). The URL parse above
+    // guarantees `url` is `Some` for the Http/Media arms (Q3).
+    let result: Result<engine::DownloadSummary, engine::EngineError> = match record.kind {
+        DownloadKind::Media => {
             // yt-dlp-driven downloads bypass the engine entirely. The pump
             // still receives `ProgressEvent`s — yt-dlp produces them via
             // `ytdlp::download` parsing `--progress-template` lines.
-            run_ytdlp(
-                &pool,
-                &events,
-                info,
-                &record,
-                user_agent.clone(),
-                cancel.clone(),
-                tx.clone(),
-            )
-            .await
-        } else if meta_path.exists() {
+            match record.media_info.clone() {
+                Some(info) => {
+                    run_ytdlp(
+                        &pool,
+                        &events,
+                        info,
+                        &record,
+                        user_agent.clone(),
+                        cancel.clone(),
+                        tx.clone(),
+                    )
+                    .await
+                }
+                None => Err(engine::EngineError::other(
+                    "media download is missing its media_info",
+                )),
+            }
+        }
+        DownloadKind::Torrent => {
+            run_torrent(&pool, &torrent_engine, &record, cancel.clone(), tx.clone()).await
+        }
+        DownloadKind::Http if meta_path.exists() => {
             engine::resume_at_with_control(
                 meta_path.clone(),
                 backoff,
@@ -625,8 +837,12 @@ async fn run_worker(
                 control_rx,
             )
             .await
-        } else {
-            let mut opts = DownloadOptions::new(url.clone(), output_path.clone());
+        }
+        DownloadKind::Http => {
+            let http_url = url
+                .clone()
+                .expect("http rows always have a parsed url (Q3)");
+            let mut opts = DownloadOptions::new(http_url, output_path.clone());
             opts.segments = segments;
             opts.connect_timeout = connect_timeout;
             opts.read_timeout = read_timeout;
@@ -634,7 +850,8 @@ async fn run_worker(
             opts.user_agent = user_agent.clone();
             opts.headers = record.headers.clone().unwrap_or_default();
             engine::download_with_control(opts, cancel.clone(), Some(tx.clone()), control_rx).await
-        };
+        }
+    };
 
     drop(tx);
     let _ = pump.await;
@@ -648,8 +865,9 @@ async fn run_worker(
             // whose captured bare URL needs a browser session/token to
             // resolve. Refuse to call that a success; mark it Failed with a
             // clear message and discard the bogus artefact. Scoped to the
-            // engine path: yt-dlp rows always produce a real media file.
-            if record.media_info.is_none() {
+            // HTTP path: yt-dlp rows always produce a real media file, and
+            // torrents have no single output file to inspect.
+            if record.kind == DownloadKind::Http {
                 if let Some(reason) = http_completion_rejection(&summary) {
                     if matches!(
                         current_status(&pool, id).await.ok(),
@@ -679,7 +897,10 @@ async fn run_worker(
                 // category. Conservative: only overrides our own URL-tail
                 // fallback, never a user-typed or add-time-probed name.
                 if let Some(hint) = summary.filename_hint.as_deref() {
-                    match download::apply_engine_filename(&pool, id, &url, hint).await {
+                    let http_url = url
+                        .as_ref()
+                        .expect("http rows always have a parsed url (Q3)");
+                    match download::apply_engine_filename(&pool, id, http_url, hint).await {
                         Ok(Some(renamed)) => {
                             let _ = events.send(CoreEvent::PathsChanged {
                                 id,
@@ -809,6 +1030,77 @@ async fn run_worker(
             }
         }
     }
+}
+
+/// Drive a torrent download via the librqbit facade. Sibling to
+/// [`run_ytdlp`]: reads `record.torrent` (never `record.url`), emits the
+/// same [`engine::ProgressEvent`]s through the shared pump, and returns a
+/// [`engine::DownloadSummary`] so the worker's completion tail is reused
+/// unchanged.
+///
+/// The librqbit `Session` is process-wide (design §3.D): resolved lazily from
+/// the shared [`TorrentEngineCell`] on the first torrent claim and reused for
+/// every torrent thereafter. The worker's `CancellationToken` is honored for
+/// pause/shutdown (librqbit flushes fastresume on pause), and the broadcast
+/// `tx` carries progress into the same pump HTTP/media use.
+async fn run_torrent(
+    pool: &SqlitePool,
+    torrent_engine: &TorrentEngineCell,
+    record: &DownloadRecord,
+    cancel: CancellationToken,
+    tx: tokio::sync::broadcast::Sender<engine::ProgressEvent>,
+) -> Result<engine::DownloadSummary, engine::EngineError> {
+    // Read the torrent state off the row — never `record.url`. A torrent row
+    // with no `torrent` blob is a data bug (insert normalizes `kind`/`torrent`
+    // in lock-step); fail clearly rather than panic.
+    let meta = record.torrent.as_ref().ok_or_else(|| {
+        engine::EngineError::other("torrent download is missing its torrent metadata")
+    })?;
+
+    // Build the facade input from the persisted source. `TorrentInput` hides
+    // every librqbit type; the facade reads `.torrent` bytes itself.
+    let input = match &meta.source {
+        TorrentSource::Magnet { uri } => torrent::TorrentInput::Magnet(uri.clone()),
+        TorrentSource::File { path } => torrent::TorrentInput::TorrentFile(path.clone()),
+        TorrentSource::InfoHash { hash } => torrent::TorrentInput::InfoHash(hash.clone()),
+    };
+
+    // The content root is the row's `output_path` (a DIRECTORY for torrents —
+    // `resolve_torrent_output_dir`). librqbit writes the selected file(s)
+    // directly under it, so it is also the summary's `output` and the key
+    // Q4's `remove_dir_all` deletes.
+    let content_dir = record.output_path.clone();
+    let only_files = meta.selected_files.clone();
+
+    // Resolve the shared process-wide session (built on first use).
+    let engine = torrent_engine.get_or_init(pool).await?;
+
+    // `?` maps `TorrentError → engine::EngineError` (the facade's `From` impl):
+    // `Cancelled → ::Cancelled` (the worker's tail leaves the status alone),
+    // everything else → `::other` (marked Failed). Same trick `run_ytdlp` uses.
+    let summary = engine
+        .run(input, content_dir, only_files, cancel, Some(tx))
+        .await?;
+
+    Ok(engine::DownloadSummary {
+        // `record.url` is the magnet/source string, not necessarily a valid
+        // `Url`. The summary `url` is only used by the HTTP completion gate
+        // (skipped for torrents) and the unused field is otherwise inert, so
+        // fall back to a sentinel when the source string isn't a `Url`.
+        url: record
+            .url
+            .parse::<url::Url>()
+            .unwrap_or_else(|_| url::Url::parse("about:blank").expect("about:blank parses")),
+        output: summary.output_root,
+        bytes: summary.bytes,
+        // Torrents have no HTTP segments; one logical unit (design §3.C).
+        segments: 1,
+        resumed: summary.resumed,
+        // Torrents have no single output file to inspect; the HTTP-only
+        // completion gate and engine-filename hint do not apply.
+        content_type: None,
+        filename_hint: None,
+    })
 }
 
 /// Drive a yt-dlp child process for a media-info-tagged download. Wraps
@@ -1124,6 +1416,60 @@ fn record_remote_changed_restart(id: DownloadId) -> u32 {
     *entry
 }
 
+/// Translate an engine [`ProgressEvent::SwarmProgress`] into the swarm
+/// snapshot to persist and the [`CoreEvent::SwarmProgress`] to re-emit
+/// (design §3.C). Pure mapping, split out so the field correspondence is
+/// unit-testable without spinning up a worker. Returns `None` for any other
+/// variant (the pump only calls it on `SwarmProgress`).
+fn translate_swarm(id: DownloadId, ev: &ProgressEvent) -> Option<(SwarmStats, CoreEvent)> {
+    let ProgressEvent::SwarmProgress {
+        peers,
+        seeds,
+        up_bps,
+        down_bps,
+        ratio_milli,
+    } = *ev
+    else {
+        return None;
+    };
+    let swarm = SwarmStats {
+        peers,
+        seeds,
+        up_bps,
+        down_bps,
+        ratio_milli,
+    };
+    let core_ev = CoreEvent::SwarmProgress {
+        id,
+        peers,
+        seeds,
+        up_bps,
+        down_bps,
+        ratio_milli,
+    };
+    Some((swarm, core_ev))
+}
+
+/// Translate an engine [`ProgressEvent::FileProgress`] into a
+/// [`CoreEvent::TorrentFileProgress`] (renamed at the wire boundary, mirroring
+/// the `SegmentProgress` rename). Pure mapping; `None` for other variants.
+fn translate_file_progress(id: DownloadId, ev: &ProgressEvent) -> Option<CoreEvent> {
+    let ProgressEvent::FileProgress {
+        index,
+        downloaded,
+        total,
+    } = *ev
+    else {
+        return None;
+    };
+    Some(CoreEvent::TorrentFileProgress {
+        id,
+        index,
+        downloaded,
+        total,
+    })
+}
+
 async fn read_sidecar_segments(path: &Path) -> Option<Vec<engine::SegmentState>> {
     if !path.exists() {
         return None;
@@ -1210,5 +1556,119 @@ mod tests {
         assert!(
             http_completion_rejection(&summary(5_000, "page.html", Some("text/html"))).is_none()
         );
+    }
+
+    #[test]
+    fn translate_swarm_maps_fields_and_tags_id() {
+        // The pump translates the engine's torrent SwarmProgress into the
+        // persisted snapshot + the CoreEvent verbatim, stamping the id.
+        let ev = ProgressEvent::SwarmProgress {
+            peers: 7,
+            seeds: 19,
+            up_bps: 2_048,
+            down_bps: 999_999,
+            ratio_milli: 1234,
+        };
+        let (swarm, core_ev) = translate_swarm(42, &ev).expect("maps a SwarmProgress");
+        assert_eq!(
+            swarm,
+            SwarmStats {
+                peers: 7,
+                seeds: 19,
+                up_bps: 2_048,
+                down_bps: 999_999,
+                ratio_milli: 1234,
+            }
+        );
+        match core_ev {
+            CoreEvent::SwarmProgress {
+                id,
+                peers,
+                seeds,
+                up_bps,
+                down_bps,
+                ratio_milli,
+            } => {
+                assert_eq!(id, 42);
+                assert_eq!(peers, 7);
+                assert_eq!(seeds, 19);
+                assert_eq!(up_bps, 2_048);
+                assert_eq!(down_bps, 999_999);
+                assert_eq!(ratio_milli, 1234);
+            }
+            other => panic!("expected SwarmProgress, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_file_progress_renames_to_torrent_file_progress() {
+        // FileProgress re-emits as TorrentFileProgress (the wire rename) with
+        // its byte counters intact and the row id stamped on.
+        let ev = ProgressEvent::FileProgress {
+            index: 3,
+            downloaded: 512,
+            total: 4_096,
+        };
+        match translate_file_progress(9, &ev).expect("maps a FileProgress") {
+            CoreEvent::TorrentFileProgress {
+                id,
+                index,
+                downloaded,
+                total,
+            } => {
+                assert_eq!(id, 9);
+                assert_eq!(index, 3);
+                assert_eq!(downloaded, 512);
+                assert_eq!(total, 4_096);
+            }
+            other => panic!("expected TorrentFileProgress, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_helpers_ignore_unrelated_variants() {
+        // The translators are only meaningful for their own variant; a
+        // mismatched event yields None rather than a wrong-shaped CoreEvent.
+        let tick = ProgressEvent::Tick {
+            downloaded: 1,
+            total: Some(2),
+            speed_bps: 3.0,
+            eta: None,
+        };
+        assert!(translate_swarm(1, &tick).is_none());
+        assert!(translate_file_progress(1, &tick).is_none());
+    }
+
+    #[test]
+    fn core_swarm_event_serializes_snake_case() {
+        // Lock the wire contract Phase 3b binds against: the tag and field
+        // names must be snake_case `swarm_progress` / `torrent_file_progress`.
+        let swarm = CoreEvent::SwarmProgress {
+            id: 1,
+            peers: 2,
+            seeds: 3,
+            up_bps: 4,
+            down_bps: 5,
+            ratio_milli: 6,
+        };
+        let v: serde_json::Value = serde_json::to_value(&swarm).unwrap();
+        assert_eq!(v["type"], "swarm_progress");
+        assert_eq!(v["peers"], 2);
+        assert_eq!(v["seeds"], 3);
+        assert_eq!(v["up_bps"], 4);
+        assert_eq!(v["down_bps"], 5);
+        assert_eq!(v["ratio_milli"], 6);
+
+        let file = CoreEvent::TorrentFileProgress {
+            id: 1,
+            index: 0,
+            downloaded: 10,
+            total: 20,
+        };
+        let v: serde_json::Value = serde_json::to_value(&file).unwrap();
+        assert_eq!(v["type"], "torrent_file_progress");
+        assert_eq!(v["index"], 0);
+        assert_eq!(v["downloaded"], 10);
+        assert_eq!(v["total"], 20);
     }
 }

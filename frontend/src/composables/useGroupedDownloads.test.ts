@@ -25,6 +25,8 @@ function rec(over: Partial<DownloadRecord>): DownloadRecord {
     segments_meta: null,
     media_info: null,
     speed_samples: null,
+    kind: "http",
+    torrent: null,
     ...over,
   };
 }

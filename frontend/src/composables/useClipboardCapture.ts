@@ -28,7 +28,8 @@ import { useToast } from "@/composables/useToast";
 import { useBrowserSettings } from "@/composables/useBrowserSettings";
 import { useSettingsStore } from "@/stores/settings";
 import { useDownloadsStore } from "@/stores/downloads";
-import { matchClipboardPayload } from "@/lib/clipboardMatch";
+import { matchClipboardPayload, type ClipboardMatch } from "@/lib/clipboardMatch";
+import type { TorrentMeta } from "@/types/tauri-bindings";
 
 /** Poll interval. 1.5 s feels responsive without busy-polling. */
 const POLL_INTERVAL_MS = 1500;
@@ -69,8 +70,13 @@ export function useClipboardCapture() {
 
   async function pollOnce() {
     if (!isEnabled()) return;
-    const fileTypes = browser.view.value.fileTypes;
-    if (!fileTypes || fileTypes.length === 0) return;
+    // Magnets are downloads by definition, so they're capturable even with an
+    // empty file-type allowlist (which only gates http(s) tail extensions).
+    // Pass the allowlist through unchanged — `matchClipboardPayload` short-
+    // circuits magnets before the allowlist gate and an empty list naturally
+    // rejects every http URL, preserving the prior "empty = silent" behavior
+    // for direct-file links.
+    const fileTypes = browser.view.value.fileTypes ?? [];
     let raw: string;
     try {
       raw = await readText();
@@ -90,24 +96,27 @@ export function useClipboardCapture() {
       return;
     }
     rememberSeen(raw);
-    offerCapture(match.url);
+    offerCapture(match);
   }
 
-  function offerCapture(url: string) {
+  function offerCapture(match: ClipboardMatch) {
     pushAction(
-      t("settings.clipboardCapturePrompt", { url: truncate(url, 64) }),
+      t("settings.clipboardCapturePrompt", { url: truncate(match.url, 64) }),
       {
         label: t("settings.clipboardCaptureAction"),
         run: () => {
-          void downloads
-            .add({
-              url,
-              filename: null,
-              output_path: null,
-              category_id: null,
-              segments: null,
-              priority: null,
-            })
+          const added =
+            match.kind === "magnet"
+              ? captureMagnet(match.url, match.infoHash)
+              : downloads.add({
+                  url: match.url,
+                  filename: null,
+                  output_path: null,
+                  category_id: null,
+                  segments: null,
+                  priority: null,
+                });
+          void added
             .then(() => {
               push(t("settings.clipboardCaptureQueued"), "success");
             })
@@ -122,6 +131,33 @@ export function useClipboardCapture() {
       "info",
       CAPTURE_TOAST_MS,
     );
+  }
+
+  /**
+   * Capture a magnet straight from the clipboard without an add-time file
+   * picker: `selected_files: null` means "all files" (the librqbit default),
+   * and the file list / display name are reconciled by the backend once
+   * librqbit resolves metadata. The info-hash (when recoverable) is the
+   * de-dup key; the backend re-derives it from the magnet if we pass `""`.
+   */
+  function captureMagnet(uri: string, infoHash: string | null) {
+    const torrent: TorrentMeta = {
+      info_hash: infoHash ?? "",
+      source: { kind: "magnet", uri },
+      selected_files: null,
+      files: null,
+      swarm: null,
+    };
+    return downloads.add({
+      url: uri,
+      filename: null,
+      output_path: null,
+      category_id: null,
+      segments: null,
+      priority: null,
+      kind: "torrent",
+      torrent,
+    });
   }
 
   function start() {

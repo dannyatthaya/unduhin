@@ -9,6 +9,7 @@ import DeleteConfirmDialog from "@/components/DeleteConfirmDialog.vue";
 import ConfirmOnQuitDialog from "@/components/ConfirmOnQuitDialog.vue";
 import AskHandoffDialog from "@/components/settings/browser/AskHandoffDialog.vue";
 import { useUnduhinEvents } from "@/composables/useUnduhinEvents";
+import { useTheme } from "@/composables/useTheme";
 import {
   installConfirmOnQuitBridge,
   uninstallConfirmOnQuitBridge,
@@ -19,6 +20,10 @@ import { onCheckUpdates } from "@/types/tauri-bindings";
 
 const router = useRouter();
 
+// Wire the theme at the app shell so the persisted `theme_mode` setting
+// always propagates to the DOM, even when the user toggles it from the
+// Settings route (where AppTopBar — the other caller — is unmounted).
+useTheme();
 // One subscription for the whole app, so cross-route navigation does not
 // drop events (e.g. `setting_changed` while the user is in Settings).
 useUnduhinEvents();
