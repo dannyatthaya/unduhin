@@ -9,7 +9,7 @@
 // The actual HTTPS fetch is done by the plugin — we only translate the
 // boolean "available?" into our typed UpdateCheckStatus and persist it.
 
-import { computed, ref } from "vue";
+import { computed, ref, shallowRef } from "vue";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 
@@ -25,7 +25,13 @@ export function useAboutPage() {
 
   const phase = ref<CheckPhase>("idle");
   const phaseError = ref<string | null>(null);
-  const available = ref<Update | null>(null);
+  // The updater's `Update` is a class instance with `#private` fields.
+  // A deep `ref` would wrap it in a reactive Proxy, and calling
+  // `downloadAndInstall()` through that Proxy throws "Cannot read private
+  // member from an object whose class did not declare it" — the private-
+  // field brand check runs against the Proxy, not the real instance.
+  // `shallowRef` keeps `.value` as the untouched instance.
+  const available = shallowRef<Update | null>(null);
   const downloadedBytes = ref(0);
   const downloadTotal = ref<number | null>(null);
 
