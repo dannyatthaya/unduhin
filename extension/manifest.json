@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Unduhin",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Hand browser downloads to the Unduhin native app. Captures cookies, referer, and headers so authenticated downloads keep working.",
   "minimum_chrome_version": "116",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1Hz6A/3anvChSFJs0lKBHAwupHQawMlTN0XL5Arwpk4Eap9SxJueyApOVve8rW1mI9pQLf30hn0REo7Bbe80tvGJcShO5hYPm4dfXrJGTexjJGuMceq3jgIQd2kUCxE8DAnTfS8BtpVq6E1I6Z0vGbTUr19ddIw5HJ5C1WA8EL9vrmYQWpkSNFn0olyPl6tENgLuu5MZMSRLcWYgJPl/bjVXwE3YoYSUnm7e4A8HhdqmgilIfXOCgQ1tGEs2+BAdZQus0Jww6vGyonBjc2DIHxPj6eYuspFON4QvfBAizA7Ou+YgDEByOV5wo1kRg1CqklbMDgUzDIqm+JNl3suFBwIDAQAB",
