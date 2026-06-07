@@ -24,6 +24,8 @@ const groupLabel = computed(() => {
       return t("downloads.groupPausedQueued");
     case "needs-attention":
       return t("downloads.groupNeedsAttention");
+    case "cancelled":
+      return t("downloads.groupCancelled");
     case "completed":
       return t("downloads.groupCompletedToday");
     case "completed-yesterday":

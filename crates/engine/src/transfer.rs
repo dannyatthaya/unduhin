@@ -140,6 +140,7 @@ pub(crate) async fn run_transfer(
                 .map(|r| std::collections::HashMap::from([(0usize, r)]))
                 .unwrap_or_default(),
         ),
+        rate_limiter: opts.rate_limiter.clone(),
     });
 
     let mut workers: JoinSet<Result<()>> = JoinSet::new();
@@ -652,6 +653,10 @@ pub(crate) struct SharedState {
     /// first attempt (`already == 0`); a retry finds it gone and opens a
     /// fresh request.
     pub(crate) prefetched: Mutex<std::collections::HashMap<usize, reqwest::Response>>,
+    /// Shared byte-rate limiter (global speed cap). `None` = unthrottled.
+    /// Every segment gates its writes through this one bucket, so the cap is
+    /// across all segments, not per-segment.
+    pub(crate) rate_limiter: Option<std::sync::Arc<crate::throttle::TokenBucket>>,
 }
 
 /// Per-worker state owned by the ticker. The classification rules need
@@ -1093,6 +1098,12 @@ async fn consume_into_file(
         } else {
             &chunk[..]
         };
+        // Global speed limit: block until the shared bucket has room for the
+        // bytes we're about to commit. All segments share one bucket, so the
+        // cap is total throughput, not per-segment. No-op when unset / rate 0.
+        if let Some(rl) = shared.rate_limiter.as_ref() {
+            rl.acquire(slice.len() as u64).await;
+        }
         file.write_all(slice)
             .await
             .map_err(|e| EngineError::io(None, e))?;

@@ -426,7 +426,6 @@ export const useDownloadsStore = defineStore("downloads", () => {
     add,
     pause: api.pauseDownload,
     resume: api.resumeDownload,
-    cancel: api.cancelDownload,
     retry: api.retryDownload,
     /**
      * Direct passthrough to the backend's `remove_download` command.

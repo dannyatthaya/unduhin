@@ -88,6 +88,11 @@ struct CoreInner {
     /// off) so an add-dialog metadata probe never contends with active
     /// downloads.
     torrent_engine: Arc<queue::TorrentEngineCell>,
+    /// Process-wide byte-rate limiter for the global speed cap. One bucket is
+    /// shared by every HTTP worker (the queue hands each a clone), so the cap
+    /// is total throughput. Rate `0` = unlimited. Seeded from
+    /// `global_speed_limit_bps` at startup and updated live by [`Core::set_setting`].
+    rate_limiter: Arc<engine::TokenBucket>,
 }
 
 impl Core {
@@ -142,6 +147,15 @@ impl Core {
             .execute(&pool)
             .await?;
         let schedules = SchedulesCache::load(&pool).await?;
+        // Seed the global speed limiter from the persisted setting so the cap
+        // is in force from the first byte after a restart, before any
+        // `set_setting` arrives. `0` (or unset) = unlimited.
+        let speed_limit_bps = settings::get(&pool, settings::settings_keys::GLOBAL_SPEED_LIMIT_BPS)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
         Ok(Self {
             inner: Arc::new(CoreInner {
                 pool,
@@ -149,6 +163,7 @@ impl Core {
                 queue: Mutex::new(None),
                 schedules: Arc::new(RwLock::new(schedules)),
                 torrent_engine: Arc::new(queue::TorrentEngineCell::new()),
+                rate_limiter: engine::TokenBucket::new(speed_limit_bps),
             }),
         })
     }
@@ -187,6 +202,7 @@ impl Core {
             self.inner.events.clone(),
             self.inner.schedules.clone(),
             self.inner.torrent_engine.clone(),
+            self.inner.rate_limiter.clone(),
         )
         .await;
         *slot = Some(handle);
@@ -264,23 +280,38 @@ impl Core {
             .await
     }
 
-    pub async fn cancel(&self, id: DownloadId) -> Result<()> {
-        self.change_status(
-            id,
-            &[
-                Status::Queued,
-                Status::Active,
-                Status::Muxing,
-                Status::Paused,
-            ],
-            Status::Cancelled,
-        )
-        .await
-    }
-
+    /// Restart / retry a stopped download.
+    ///
+    /// - `Failed` → re-queue and **resume** from the partial (sidecar) — the
+    ///   long-standing retry behaviour.
+    /// - `Completed` → re-download **from scratch**: drop the resume sidecar and
+    ///   zero the progress columns first (so the worker does a fresh GET that
+    ///   overwrites the file rather than instantly re-completing), then re-queue.
+    ///
+    /// There is no user-facing "cancel" — pausing stops a download and deleting
+    /// discards it — so `Cancelled` is no longer a retry source.
     pub async fn retry(&self, id: DownloadId) -> Result<()> {
-        self.change_status(id, &[Status::Failed, Status::Cancelled], Status::Queued)
-            .await
+        let was_completed = matches!(
+            download::get(&self.inner.pool, id).await.map(|r| r.status),
+            Ok(Status::Completed)
+        );
+        if was_completed {
+            download::reset_for_restart(&self.inner.pool, id).await?;
+        }
+        self.change_status(id, &[Status::Failed, Status::Completed], Status::Queued)
+            .await?;
+        if was_completed {
+            // The row was at 100 %; reset the live bar so it doesn't sit in the
+            // queue showing a finished download.
+            let _ = self.inner.events.send(CoreEvent::ProgressUpdate {
+                id,
+                downloaded: 0,
+                total: None,
+                speed_bps: 0.0,
+                eta: None,
+            });
+        }
+        Ok(())
     }
 
     /// Remove a download row. When `delete_data` is true, the file on
@@ -293,9 +324,14 @@ impl Core {
         // (and its info_hash) — needed to forget it from the live librqbit
         // session below.
         let record = download::get(&self.inner.pool, id).await.ok();
-        // Cancel first so the queue manager drops any active handle and
-        // flushes the sidecar, then delete the row.
-        let _ = self.cancel(id).await;
+        // Stop the download before touching disk. An active worker is halted
+        // (and its sidecar flushed) by `cancel_and_wait` below; a not-yet-
+        // started `queued` row is parked as `paused` here so the manager can't
+        // claim it in the window before the DELETE. (There is no user-facing
+        // "cancel" — remove fully discards the row.)
+        let _ =
+            download::transition_status(&self.inner.pool, id, &[Status::Queued], Status::Paused)
+                .await;
         // Synchronously drain the in-memory worker before touching the
         // file on disk. The `cancel` call above only flips the DB row;
         // the worker observes that on its next tick and takes additional
@@ -359,11 +395,20 @@ impl Core {
             // want to silently strip the assignment on a typo.
             let _ = category::get(&self.inner.pool, cid).await?;
         }
-        download::set_category(&self.inner.pool, id, category_id).await?;
+        let relocated = download::set_category(&self.inner.pool, id, category_id).await?;
         let _ = self
             .inner
             .events
             .send(CoreEvent::CategoryChanged { id, category_id });
+        // The file may have been moved into the new category's folder; tell the
+        // UI so the detail pane and "open folder" point at the real location.
+        if let Some((filename, output_path)) = relocated {
+            let _ = self.inner.events.send(CoreEvent::PathsChanged {
+                id,
+                filename,
+                output_path: output_path.to_string_lossy().into_owned(),
+            });
+        }
         Ok(())
     }
 
@@ -550,6 +595,17 @@ impl Core {
 
     pub async fn set_setting(&self, key: &str, value: SettingValue) -> Result<()> {
         settings::set(&self.inner.pool, key, &value).await?;
+        // Apply the global speed cap live across every backend. HTTP workers
+        // share the token bucket; the torrent session has its own librqbit
+        // rate limiter; yt-dlp reads the value at next spawn (its `--limit-rate`
+        // can't change mid-process). `0` / unset = unlimited. No restart needed.
+        if key == settings::settings_keys::GLOBAL_SPEED_LIMIT_BPS {
+            let bps = value.as_u64().unwrap_or(0);
+            self.inner.rate_limiter.set_rate(bps).await;
+            if let Some(engine) = self.inner.torrent_engine.get() {
+                engine.set_download_limit(bps);
+            }
+        }
         let _ = self.inner.events.send(CoreEvent::SettingChanged {
             key: key.to_string(),
         });

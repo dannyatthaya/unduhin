@@ -427,6 +427,7 @@ async fn resume_across_explicit_restart() -> Result<()> {
         Vec::new(),
         CancellationToken::new(),
         None,
+        None,
     )
     .await?;
     assert!(summary.resumed);

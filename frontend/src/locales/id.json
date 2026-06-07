@@ -69,6 +69,7 @@
     "groupActive": "Aktif",
     "groupPausedQueued": "Dijeda & Antri",
     "groupNeedsAttention": "Perlu perhatian",
+    "groupCancelled": "Dibatalkan",
     "groupCompletedToday": "Selesai dalam 24 jam terakhir",
     "groupCompletedYesterday": "Selesai kemarin",
     "groupCompletedOlder": "Selesai sebelumnya",

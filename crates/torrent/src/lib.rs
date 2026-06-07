@@ -25,6 +25,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::num::NonZeroU32;
+
+use librqbit::limits::LimitsConfig;
 use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, Session, SessionOptions,
     SessionPersistenceConfig, TorrentStatsState,
@@ -135,11 +138,24 @@ pub struct TorrentConfig {
     pub enable_dht: bool,
     /// UPnP port-mapping for inbound peers.
     pub enable_upnp: bool,
+    /// Seed target as a ratio in thousandths (uploaded:downloaded). `0`
+    /// means "stop at 100 %, no seeding" — the torrent is forgotten the
+    /// moment it completes (the long-standing default). A positive value
+    /// keeps the torrent uploading after completion until
+    /// `uploaded / downloaded * 1000 >= seed_ratio_milli`, then forgets it
+    /// (design §3.G `torrent_seed_ratio_milli`).
+    pub seed_ratio_milli: u32,
+    /// Global download speed cap in bytes/sec applied to the whole librqbit
+    /// session (all torrents share it). `0` = unlimited. Mirrors the HTTP
+    /// engine's `global_speed_limit_bps`; updated live via
+    /// [`TorrentEngine::set_download_limit`].
+    pub download_limit_bps: u64,
 }
 
 impl TorrentConfig {
     /// Sensible defaults matching the seeded settings (design §3.G): DHT + UPnP
-    /// on, OS-assigned port. Caller must still set `download_dir` / `state_dir`.
+    /// on, OS-assigned port, no seeding. Caller must still set `download_dir` /
+    /// `state_dir`.
     pub fn new(download_dir: PathBuf, state_dir: PathBuf) -> Self {
         Self {
             download_dir,
@@ -147,7 +163,19 @@ impl TorrentConfig {
             listen_port: 0,
             enable_dht: true,
             enable_upnp: true,
+            seed_ratio_milli: 0,
+            download_limit_bps: 0,
         }
+    }
+}
+
+/// Build a librqbit [`LimitsConfig`] from a bytes/sec download cap. `0` (or a
+/// value that doesn't fit `u32`, clamped) maps to "no download limit"; upload
+/// is left uncapped (seeding is governed by `seed_ratio_milli`, not bandwidth).
+fn limits_from_bps(download_bps: u64) -> LimitsConfig {
+    LimitsConfig {
+        download_bps: NonZeroU32::new(download_bps.min(u32::MAX as u64) as u32),
+        upload_bps: None,
     }
 }
 
@@ -240,6 +268,11 @@ pub struct TorrentRunSummary {
 pub struct TorrentEngine {
     session: Arc<Session>,
     download_dir: PathBuf,
+    /// Seed-until ratio (thousandths); `0` = forget at 100 %. Read once from
+    /// the session config — like `listen_port` / DHT / UPnP, this is fixed for
+    /// the life of the process-wide session, so a change takes effect on the
+    /// next app start.
+    seed_ratio_milli: u32,
 }
 
 impl TorrentEngine {
@@ -281,6 +314,9 @@ impl TorrentEngine {
             persistence: Some(SessionPersistenceConfig::Json {
                 folder: Some(cfg.state_dir.clone()),
             }),
+            // Global download speed cap. librqbit applies this across the whole
+            // session, so it bounds the sum of all active torrents.
+            ratelimits: limits_from_bps(cfg.download_limit_bps),
             ..Default::default()
         };
 
@@ -291,6 +327,7 @@ impl TorrentEngine {
         Ok(Self {
             session,
             download_dir: cfg.download_dir,
+            seed_ratio_milli: cfg.seed_ratio_milli,
         })
     }
 
@@ -382,7 +419,9 @@ impl TorrentEngine {
 
     /// Run to completion, honoring `cancel`, emitting [`engine::ProgressEvent`]s
     /// on `tx`. On completion the torrent is STOPPED so it does not keep seeding
-    /// (design §5.1 — librqbit does not stop on its own).
+    /// (design §5.1 — librqbit does not stop on its own), UNLESS the session's
+    /// `seed_ratio_milli` is positive, in which case it seeds up to that ratio
+    /// first (see [`seed_to_ratio`](Self::seed_to_ratio)).
     ///
     /// `download_dir` overrides the session default for this torrent (per-download
     /// content folder). `only_files` selects a subset (`None` = all).
@@ -674,6 +713,16 @@ impl TorrentEngine {
                     let _ = tx.send(engine::ProgressEvent::Completed { bytes });
                 }
 
+                // Seed phase. `seed_ratio_milli == 0` is the default — "stop at
+                // 100 %, no seeding" — so we fall straight through to the forget
+                // below. A positive ratio keeps the torrent in the session and
+                // uploading until it hits the target (or the worker is
+                // cancelled); the worker stays alive for the whole phase, so a
+                // seeding torrent holds its `max_concurrent_downloads` slot.
+                if self.seed_ratio_milli > 0 {
+                    self.seed_to_ratio(&handle, &cancel, tx.as_ref()).await;
+                }
+
                 // Q1: librqbit keeps SEEDING after completion. Forget the torrent
                 // (without deleting files) to stop all upload. `delete(.., false)`
                 // removes it from the session but leaves content on disk.
@@ -722,6 +771,64 @@ impl TorrentEngine {
         }
     }
 
+    /// Seed a *completed* torrent until its upload:download ratio reaches the
+    /// session's [`seed_ratio_milli`](TorrentConfig::seed_ratio_milli)
+    /// (thousandths), then return so the caller forgets it. The download is
+    /// already 100 % here, so this only governs how long we keep uploading.
+    ///
+    /// Returns early when `cancel` fires (pause / remove / app shutdown). Emits
+    /// `SwarmProgress` ticks (now with `down_bps = 0`) so the UI keeps showing
+    /// live upload speed / ratio while seeding. Best-effort: a 0-byte torrent
+    /// has nothing to seed and returns immediately.
+    async fn seed_to_ratio(
+        &self,
+        handle: &Arc<librqbit::ManagedTorrent>,
+        cancel: &CancellationToken,
+        tx: Option<&broadcast::Sender<engine::ProgressEvent>>,
+    ) {
+        let mut ticker = tokio::time::interval(STATS_POLL_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return,
+                _ = ticker.tick() => {
+                    let stats = handle.stats();
+                    let downloaded = stats.progress_bytes;
+                    // Nothing downloaded ⇒ nothing to seed; avoid divide-by-zero.
+                    if downloaded == 0 {
+                        return;
+                    }
+                    let ratio_milli = ((stats.uploaded_bytes as u128 * 1000)
+                        / downloaded as u128)
+                        .min(u32::MAX as u128) as u32;
+
+                    if let Some(tx) = tx {
+                        let (peers, seeds, up_bps) = match stats.live.as_ref() {
+                            Some(live) => (
+                                live.snapshot.peer_stats.live as u32,
+                                live.snapshot.peer_stats.seen as u32,
+                                mbps_to_bytes_per_sec(live.upload_speed.mbps),
+                            ),
+                            None => (0, 0, 0),
+                        };
+                        let _ = tx.send(engine::ProgressEvent::SwarmProgress {
+                            peers,
+                            seeds,
+                            up_bps,
+                            down_bps: 0,
+                            ratio_milli,
+                        });
+                    }
+
+                    if ratio_milli >= self.seed_ratio_milli {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     /// Best-effort metadata snapshot (name + files) from a live handle, for the
     /// run summary. Falls back to the infohash for the name and an empty file
     /// list if metadata is not yet resolved.
@@ -755,6 +862,16 @@ impl TorrentEngine {
             name,
             files,
         }
+    }
+
+    /// Update the session-wide download speed cap live (bytes/sec; `0` =
+    /// unlimited). The `core` queue calls this when the user changes
+    /// `global_speed_limit_bps` so a running session re-paces without a
+    /// restart. Upload stays uncapped — seeding is bounded by ratio, not rate.
+    pub fn set_download_limit(&self, download_bps: u64) {
+        self.session
+            .ratelimits
+            .set_download_bps(NonZeroU32::new(download_bps.min(u32::MAX as u64) as u32));
     }
 
     /// The session's default download dir, for diagnostics / tests.

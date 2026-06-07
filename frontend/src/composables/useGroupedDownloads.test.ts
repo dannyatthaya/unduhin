@@ -63,4 +63,34 @@ describe("useGroupedDownloads — completed buckets", () => {
     const allIds = groups.value.flatMap((g) => g.rows.map((r) => r.id)).sort();
     expect(allIds).toEqual([1, 2, 3, 4]);
   });
+
+  it("groups cancelled rows instead of dropping them (count/Grouped mismatch fix)", () => {
+    const store = useDownloadsStore();
+    store.records = new Map<number, DownloadRecord>([
+      [1, rec({ id: 1, status: "cancelled" })],
+      [2, rec({ id: 2, status: "active" })],
+      [3, rec({ id: 3, status: "completed", completed_at: ago(HOUR) })],
+    ]);
+
+    const { groups, sortedMatching } = useGroupedDownloads(
+      () => "",
+      () => null,
+    );
+    const byKey = Object.fromEntries(
+      groups.value.map((g) => [g.key, g.rows.map((r) => r.id)]),
+    );
+
+    // Cancelled rows get their own group rather than vanishing.
+    expect(byKey["cancelled"]).toEqual([1]);
+
+    // The Grouped view must show exactly the same rows as the Flat view
+    // (`sortedMatching`) — which is what the sidebar category / "All
+    // downloads" counts are derived from. No row is counted-but-hidden.
+    const groupedIds = groups.value
+      .flatMap((g) => g.rows.map((r) => r.id))
+      .sort();
+    const flatIds = sortedMatching.value.map((r) => r.id).sort();
+    expect(groupedIds).toEqual(flatIds);
+    expect(groupedIds).toEqual([1, 2, 3]);
+  });
 });

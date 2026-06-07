@@ -451,6 +451,21 @@ pub(crate) async fn insert(pool: &SqlitePool, input: AddDownload) -> Result<Down
         }
         _ => resolve_output_path(pool, &filename, &output_path, category_id).await?,
     };
+    // When we chose the path ourselves (no caller-supplied `output_path`), the
+    // unique-path resolver may have appended " (n)" to dodge another in-flight
+    // download's path — e.g. two `drive.google.com/uc?id=…` links both reduce
+    // to the filename "uc". Keep the row's display `filename` in lock-step with
+    // the real file name so the two show DISTINCT names, not just distinct
+    // paths. Torrents (a content directory) and caller-supplied explicit paths
+    // keep their existing filename.
+    let filename = if matches!(kind, DownloadKind::Torrent) || output_path.is_some() {
+        filename
+    } else {
+        resolved_output
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or(filename)
+    };
     let segments = segments.unwrap_or(default_segments(pool).await?);
 
     let created_at = crate::now_iso();
@@ -981,23 +996,85 @@ pub(crate) async fn transition_status(
     }
 }
 
-/// Set a download's `category_id`. `None` clears the assignment.
-/// Validates the row exists; the caller is responsible for checking the
-/// category id (if `Some`) maps to a real row before calling.
+/// Reassign a download to a different category AND relocate its file into the
+/// new category's folder so the on-disk location matches the UI. `None` clears
+/// the assignment. Validates the row exists; the caller checks the category id
+/// (if `Some`) maps to a real row before calling.
+///
+/// Previously this only rewrote `category_id`, leaving a completed file behind
+/// in the *old* category's folder — the row said "Video" while the bytes still
+/// sat in "Music". Now, when it is safe to do so, the file (and its
+/// `.unduhin-meta` sidecar, if present) is moved and `output_path` / `filename`
+/// are updated to match.
+///
+/// Returns `Some((filename, new_path))` when the file actually moved (so the
+/// caller can emit `PathsChanged`); `None` when only the label changed.
+///
+/// No move (label-only) when:
+///  - the download is a **torrent** — `output_path` is a content DIRECTORY (a
+///    whole tree), and relocating that on a recategorize is out of scope;
+///  - it is **active / muxing** — the worker owns a live file handle and moving
+///    it underneath would corrupt the transfer;
+///  - **no file exists on disk yet** (a fresh `queued` row) — nothing to move;
+///  - the file is **already in the target folder**.
 pub(crate) async fn set_category(
     pool: &SqlitePool,
     id: DownloadId,
     category_id: Option<crate::category::CategoryId>,
-) -> Result<()> {
-    let res = sqlx::query("UPDATE downloads SET category_id = ? WHERE id = ?")
+) -> Result<Option<(String, PathBuf)>> {
+    // Snapshot first (also validates the row exists, surfacing DownloadNotFound).
+    let record = get(pool, id).await?;
+
+    // The assignment update always runs — that part already worked; the file
+    // move below is the bug fix.
+    sqlx::query("UPDATE downloads SET category_id = ? WHERE id = ?")
         .bind(category_id)
         .bind(id)
         .execute(pool)
         .await?;
-    if res.rows_affected() == 0 {
-        return Err(CoreError::DownloadNotFound(id));
+
+    let current_path = record.output_path.clone();
+    if record.kind == DownloadKind::Torrent
+        || matches!(record.status, Status::Active | Status::Muxing)
+        || tokio::fs::metadata(&current_path).await.is_err()
+    {
+        return Ok(None);
     }
-    Ok(())
+
+    let target_folder = category_target_folder(pool, category_id).await?;
+    if current_path.parent() == Some(target_folder.as_path()) {
+        return Ok(None);
+    }
+
+    let new_path = move_into_folder(&current_path, &target_folder).await;
+    if new_path == current_path {
+        // Move was a no-op or failed (IO error / cross-volume); the row still
+        // points at the real file rather than a phantom path.
+        return Ok(None);
+    }
+
+    // Carry the sidecar so a paused download can still resume from its new
+    // home. Best-effort: a completed file has none, and a failed sidecar move
+    // only costs a re-verify on resume.
+    let old_sidecar = engine::Meta::sidecar_path(&current_path);
+    if tokio::fs::metadata(&old_sidecar).await.is_ok() {
+        let _ = tokio::fs::rename(&old_sidecar, &engine::Meta::sidecar_path(&new_path)).await;
+    }
+
+    // A move may de-dupe the name (`clip (1).mp4`); keep filename + path in
+    // sync with what actually landed on disk.
+    let final_name = new_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| record.filename.clone());
+    sqlx::query("UPDATE downloads SET output_path = ?, filename = ? WHERE id = ?")
+        .bind(new_path.to_string_lossy().as_ref())
+        .bind(&final_name)
+        .bind(id)
+        .execute(pool)
+        .await?;
+
+    Ok(Some((final_name, new_path)))
 }
 
 /// Reconcile a yt-dlp row once the download finishes and the true
@@ -1166,7 +1243,18 @@ async fn decide_learned(
         return Ok(None);
     }
     let url_fallback = filename_from_url(url).map(|t| sanitize_filename(&t));
-    if url_fallback.as_deref() != Some(physical_name.as_str()) {
+    // The physical name must be one WE derived from the URL tail before the
+    // real name was known — either it *is* the tail, or it's the tail plus a
+    // " (n)" de-dup suffix we appended when two links share a tail (every
+    // `drive.usercontent.google.com/download?id=…` link reduces to the tail
+    // "download", so the 2nd becomes "download (1)"). Both are "our own" names,
+    // safe to upgrade to the learned Content-Disposition name; a user-typed or
+    // add-time-probed name is left alone. Without the de-dup branch, the second
+    // such download would stay stuck at its generic "download (1)" name.
+    let physical_base = strip_dedup_suffix(&physical_name);
+    if url_fallback.as_deref() != Some(physical_name.as_str())
+        && url_fallback.as_deref() != Some(physical_base.as_str())
+    {
         return Ok(None);
     }
 
@@ -1358,6 +1446,34 @@ async fn move_renamed(from: &Path, dest_dir: &Path, new_name: &std::ffi::OsStr) 
     }
 }
 
+/// Inverse of the `stem (n).ext` de-dup that [`dedupe_path`] /
+/// [`resolve_unique_output_path`] apply: strip a trailing " (n)" from the stem,
+/// preserving the extension. "download (1)" → "download", "clip (2).mp4" →
+/// "clip.mp4", "file.zip" → "file.zip" (unchanged), "My File (final).pdf" →
+/// unchanged (the parenthetical isn't a number). Lets [`decide_learned`]
+/// recognise a de-duped URL-tail name as one we picked, so the engine's learned
+/// Content-Disposition name can still replace it.
+fn strip_dedup_suffix(name: &str) -> String {
+    let path = Path::new(name);
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(name);
+    let ext = path.extension().and_then(|e| e.to_str());
+    let base = match stem.rfind(" (") {
+        Some(idx) if stem.ends_with(')') => {
+            let inner = &stem[idx + 2..stem.len() - 1];
+            if !inner.is_empty() && inner.bytes().all(|b| b.is_ascii_digit()) {
+                &stem[..idx]
+            } else {
+                stem
+            }
+        }
+        _ => stem,
+    };
+    match ext {
+        Some(e) => format!("{base}.{e}"),
+        None => base.to_string(),
+    }
+}
+
 /// Find the first non-colliding `stem (n).ext` path in `dir`.
 async fn dedupe_path(dir: &Path, file_name: &std::ffi::OsStr) -> PathBuf {
     let name = Path::new(file_name);
@@ -1396,6 +1512,29 @@ pub(crate) async fn mark_completed(pool: &SqlitePool, id: DownloadId, bytes: u64
     .bind(bytes as i64)
     .bind(bytes as i64)
     .bind(completed_at)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Reset a *completed* download so re-queueing it re-downloads from scratch.
+///
+/// A completed HTTP row otherwise has a finished file (and possibly a stale
+/// resume sidecar); simply re-queueing would make the worker `resume_at` and
+/// instantly re-complete against the existing bytes. So we drop the sidecar
+/// (forcing a fresh GET that overwrites the file) and zero the progress
+/// columns. The on-disk file is left in place — the fresh download overwrites
+/// it. Torrents have no sidecar; this just zeroes progress and the worker
+/// re-verifies the existing content.
+pub(crate) async fn reset_for_restart(pool: &SqlitePool, id: DownloadId) -> Result<()> {
+    let record = get(pool, id).await?;
+    let sidecar = engine::Meta::sidecar_path(&record.output_path);
+    let _ = tokio::fs::remove_file(&sidecar).await;
+    sqlx::query(
+        "UPDATE downloads SET downloaded_bytes = 0, completed_at = NULL, error = NULL \
+         WHERE id = ?",
+    )
     .bind(id)
     .execute(pool)
     .await?;
@@ -1792,7 +1931,7 @@ async fn resolve_output_path(
         if let Ok(cat) = crate::category::get(pool, id).await {
             if let Some(folder) = cat.default_output_path {
                 if !folder.as_os_str().is_empty() {
-                    return safe_join(&folder, filename);
+                    return resolve_unique_output_path(pool, &folder, filename).await;
                 }
             }
         }
@@ -1803,13 +1942,15 @@ async fn resolve_output_path(
         .and_then(|v| v.as_str().map(|s| s.to_string()))
         .filter(|s| !s.is_empty());
     if let Some(g) = global {
-        return safe_join(Path::new(&g), filename);
+        return resolve_unique_output_path(pool, Path::new(&g), filename).await;
     }
 
-    safe_join(
+    resolve_unique_output_path(
+        pool,
         &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         filename,
     )
+    .await
 }
 
 /// Join a download `filename` onto a base `folder`, guaranteeing the
@@ -1828,6 +1969,73 @@ fn safe_join(folder: &Path, filename: &str) -> Result<PathBuf> {
         )));
     }
     Ok(folder.join(filename))
+}
+
+/// Join `filename` onto `folder` like [`safe_join`], but guarantee the result
+/// collides with neither an existing file on disk NOR the `output_path` of
+/// another in-flight download row, appending `stem (n).ext` until a free slot
+/// is found.
+///
+/// This is the guard against the same-name/shared-progress bug: many hosts map
+/// every download to one URL-tail filename (e.g. every
+/// `drive.google.com/uc?id=…` link yields `uc`). Two such rows resolving to the
+/// same path would share ONE file and ONE `.unduhin-meta` sidecar — so their
+/// byte counters would clobber each other and the UI would render them as a
+/// single, identically-named download. A pure on-disk check is not enough: at
+/// add time the file usually doesn't exist yet, so we also reserve against
+/// other rows' paths.
+async fn resolve_unique_output_path(
+    pool: &SqlitePool,
+    folder: &Path,
+    filename: &str,
+) -> Result<PathBuf> {
+    // Reuse safe_join's path-traversal validation for the base candidate.
+    let base = safe_join(folder, filename)?;
+    if !output_path_taken(pool, &base).await {
+        return Ok(base);
+    }
+
+    let name = Path::new(filename);
+    let stem = name
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ext = name.extension().map(|e| e.to_string_lossy().into_owned());
+    for i in 1..10_000 {
+        let candidate_name = match &ext {
+            Some(e) => format!("{stem} ({i}).{e}"),
+            None => format!("{stem} ({i})"),
+        };
+        let candidate = folder.join(&candidate_name);
+        if !output_path_taken(pool, &candidate).await {
+            return Ok(candidate);
+        }
+    }
+    // Pathological (10k collisions): better to risk one collision than loop
+    // forever. The DB has no unique constraint, so this stays a soft guard.
+    Ok(base)
+}
+
+/// Is `path` already occupied? True when a real file exists there, OR an
+/// in-flight (`queued`/`active`/`paused`/`muxing`) download row already claims
+/// it. Terminal rows (completed/failed/cancelled) are intentionally ignored so
+/// a fresh download may reuse a freed name; the on-disk check still prevents
+/// clobbering a finished file that's still present.
+async fn output_path_taken(pool: &SqlitePool, path: &Path) -> bool {
+    if tokio::fs::metadata(path).await.is_ok() {
+        return true;
+    }
+    let claimed: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM downloads \
+         WHERE output_path = ? \
+           AND status IN ('queued', 'active', 'paused', 'muxing') \
+         LIMIT 1",
+    )
+    .bind(path.to_string_lossy().as_ref())
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None);
+    claimed.is_some()
 }
 
 #[cfg(test)]
@@ -1852,6 +2060,18 @@ mod tests {
     fn filename_from_url_percent_decoded() {
         let u: url::Url = "https://example.com/My%20File.zip".parse().unwrap();
         assert_eq!(filename_from_url(&u).as_deref(), Some("My File.zip"));
+    }
+
+    #[test]
+    fn strip_dedup_suffix_reverses_dedup_only() {
+        // Reverses our own " (n)" de-dup, preserving the extension...
+        assert_eq!(strip_dedup_suffix("download (1)"), "download");
+        assert_eq!(strip_dedup_suffix("clip (2).mp4"), "clip.mp4");
+        // ...and leaves everything else untouched.
+        assert_eq!(strip_dedup_suffix("download"), "download");
+        assert_eq!(strip_dedup_suffix("file.zip"), "file.zip");
+        assert_eq!(strip_dedup_suffix("My File (final).pdf"), "My File (final).pdf");
+        assert_eq!(strip_dedup_suffix("song (10).flac"), "song.flac");
     }
 
     #[test]
@@ -2026,6 +2246,161 @@ mod tests {
         let moved2 = move_into_folder(&src2, &dst_dir).await;
         assert_eq!(moved2, dst_dir.join("clip (1).mp4"));
         assert!(tokio::fs::metadata(&moved2).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn same_name_downloads_never_share_output_path() {
+        // Regression: hosts that map every link to one URL-tail filename
+        // (drive.google.com/uc?id=… → "uc") must NOT produce two rows on the
+        // same output_path. A shared path means a shared file AND a shared
+        // .unduhin-meta sidecar — i.e. identical names and corrupted, shared
+        // progress (the reported bug).
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_string_lossy().to_string();
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES ('default_output_path', ?) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(serde_json::to_string(&dir).unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Explicit filename "uc" for both ⇒ skips the network HEAD probe and
+        // reproduces the collision directly.
+        let mk = |u: &str| AddDownload {
+            url: u.parse().unwrap(),
+            filename: Some("uc".to_string()),
+            output_path: None,
+            category: None,
+            priority: 0,
+            segments: Some(1),
+            media_info: None,
+            headers: None,
+            source: DownloadSource::ExtensionPipe,
+            kind: DownloadKind::Http,
+            torrent: None,
+        };
+
+        let a = insert(&pool, mk("https://drive.google.com/uc?id=AAA"))
+            .await
+            .unwrap();
+        let b = insert(&pool, mk("https://drive.google.com/uc?id=BBB"))
+            .await
+            .unwrap();
+
+        assert_ne!(
+            a.output_path, b.output_path,
+            "different downloads must not share an output path"
+        );
+        assert_ne!(
+            a.filename, b.filename,
+            "different downloads must not share a display filename"
+        );
+        assert_eq!(a.filename, "uc");
+        assert_eq!(b.filename, "uc (1)");
+    }
+
+    #[tokio::test]
+    async fn reset_for_restart_clears_progress_and_drops_sidecar() {
+        // Restarting a *completed* download must zero its progress and remove
+        // the resume sidecar so the worker re-downloads from scratch instead of
+        // resuming straight back to "complete". The finished file is left for
+        // the fresh download to overwrite.
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("movie.mp4");
+        tokio::fs::write(&file, b"data").await.unwrap();
+        let sidecar = engine::Meta::sidecar_path(&file);
+        tokio::fs::write(&sidecar, b"meta").await.unwrap();
+
+        let id: i64 = sqlx::query(
+            "INSERT INTO downloads (url, filename, output_path, total_bytes, downloaded_bytes, \
+                                    status, category_id, priority, segments, created_at, completed_at) \
+             VALUES ('https://x/movie.mp4', 'movie.mp4', ?, 4, 4, 'completed', NULL, 0, 1, \
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:01:00Z') RETURNING id",
+        )
+        .bind(file.to_string_lossy().as_ref())
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("id");
+
+        reset_for_restart(&pool, id).await.unwrap();
+
+        let rec = get(&pool, id).await.unwrap();
+        assert_eq!(rec.downloaded_bytes, 0, "progress zeroed");
+        assert!(rec.completed_at.is_none(), "completed_at cleared");
+        assert!(
+            tokio::fs::metadata(&sidecar).await.is_err(),
+            "resume sidecar removed so the worker does a fresh download"
+        );
+        assert!(
+            tokio::fs::metadata(&file).await.is_ok(),
+            "finished file kept (fresh download overwrites it)"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_category_moves_the_file_into_the_new_folder() {
+        // Regression: recategorizing a completed download must relocate the
+        // file on disk, not just rewrite category_id.
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let music = tmp.path().join("Music");
+        let video = tmp.path().join("Video");
+        tokio::fs::create_dir_all(&music).await.unwrap();
+        tokio::fs::create_dir_all(&video).await.unwrap();
+
+        // A category whose files live in the Video folder. Use a name the
+        // migration doesn't already seed so the INSERT can't hit the UNIQUE
+        // constraint on categories.name.
+        let video_cat: i64 = sqlx::query(
+            "INSERT INTO categories (name, icon, default_output_path, extension_rules, display_order) \
+             VALUES ('Clips', 'video', ?, '[]', 0) RETURNING id",
+        )
+        .bind(video.to_string_lossy().as_ref())
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("id");
+
+        // A completed song sitting in the Music folder.
+        let file = music.join("song.mp3");
+        tokio::fs::write(&file, b"audio").await.unwrap();
+        let id: i64 = sqlx::query(
+            "INSERT INTO downloads (url, filename, output_path, total_bytes, downloaded_bytes, \
+                                    status, category_id, priority, segments, created_at) \
+             VALUES ('https://x/song.mp3', 'song.mp3', ?, 5, 5, 'completed', NULL, 0, 1, \
+                     '2026-01-01T00:00:00Z') RETURNING id",
+        )
+        .bind(file.to_string_lossy().as_ref())
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("id");
+
+        let moved = set_category(&pool, id, Some(video_cat)).await.unwrap();
+
+        let expected = video.join("song.mp3");
+        assert_eq!(
+            moved,
+            Some(("song.mp3".to_string(), expected.clone())),
+            "set_category should report the relocated path"
+        );
+        assert!(
+            tokio::fs::metadata(&expected).await.is_ok(),
+            "file must now be in the Video folder"
+        );
+        assert!(
+            tokio::fs::metadata(&file).await.is_err(),
+            "file must no longer be in the Music folder"
+        );
+
+        let rec = get(&pool, id).await.unwrap();
+        assert_eq!(rec.output_path, expected, "row points at the new path");
+        assert_eq!(rec.category_id, Some(video_cat));
     }
 
     #[tokio::test]

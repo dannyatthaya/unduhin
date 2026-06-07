@@ -330,11 +330,6 @@ pub async fn resume_download(core: State<'_, Core>, id: DownloadId) -> CommandRe
 }
 
 #[tauri::command]
-pub async fn cancel_download(core: State<'_, Core>, id: DownloadId) -> CommandResult<()> {
-    Ok(core.cancel(id).await?)
-}
-
-#[tauri::command]
 pub async fn retry_download(core: State<'_, Core>, id: DownloadId) -> CommandResult<()> {
     Ok(core.retry(id).await?)
 }

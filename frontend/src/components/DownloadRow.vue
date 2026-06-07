@@ -14,7 +14,6 @@ import {
   RotateCw,
   Trash2,
   Users,
-  XCircle,
 } from "lucide-vue-next";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 
@@ -108,14 +107,15 @@ const anyResumable = computed(() =>
     (r) => r.status === "paused" || r.status === "failed",
   ),
 );
-const anyCancellable = computed(() =>
-  targetRecords.value.some((r) =>
-    ["active", "queued", "paused", "muxing"].includes(r.status),
-  ),
-);
+// Restart applies to terminal rows: `failed` resumes from the partial,
+// `completed` re-downloads from scratch. (`cancelled` kept for defensiveness;
+// it's no longer user-creatable.)
 const anyRestartable = computed(() =>
   targetRecords.value.some(
-    (r) => r.status === "failed" || r.status === "cancelled",
+    (r) =>
+      r.status === "failed" ||
+      r.status === "cancelled" ||
+      r.status === "completed",
   ),
 );
 
@@ -139,14 +139,12 @@ const ctxResume = () =>
     (r) => r.status === "paused" || r.status === "failed",
     (id) => store.resume(id),
   );
-const ctxCancel = () =>
-  runOnTargets(
-    (r) => ["active", "queued", "paused", "muxing"].includes(r.status),
-    (id) => store.cancel(id),
-  );
 const ctxRetry = () =>
   runOnTargets(
-    (r) => r.status === "failed" || r.status === "cancelled",
+    (r) =>
+      r.status === "failed" ||
+      r.status === "cancelled" ||
+      r.status === "completed",
     (id) => restart(id),
   );
 const ctxDelete = () => deleteConfirm.requestDelete(targetIds.value);
@@ -337,29 +335,17 @@ const menuItems = computed(() => {
     case "completed":
       items.push({ label: t("downloads.rowOpenFile"), onSelect: openFile });
       items.push({ label: t("downloads.rowOpenFolder"), onSelect: openFolder });
+      // Re-download a finished file from scratch.
+      items.push({ label: t("downloads.menuRestart"), onSelect: () => restart(props.download.id) });
       break;
     case "active":
     case "queued":
       items.push({ label: t("downloads.menuPause"), onSelect: () => store.pause(props.download.id) });
-      items.push({
-        label: t("downloads.batchCancel"),
-        onSelect: () => store.cancel(props.download.id),
-      });
       break;
-    case "muxing":
-      // Pausing mid-mux would orphan partial streams on disk; only let
-      // the user bail out entirely.
-      items.push({
-        label: t("downloads.batchCancel"),
-        onSelect: () => store.cancel(props.download.id),
-      });
-      break;
+    // `muxing` has no specific action — you can't pause mid-merge, and there's
+    // no cancel; the Remove item appended below is the only way to stop it.
     case "paused":
       items.push({ label: t("downloads.menuResume"), onSelect: () => store.resume(props.download.id) });
-      items.push({
-        label: t("downloads.batchCancel"),
-        onSelect: () => store.cancel(props.download.id),
-      });
       break;
     case "failed":
       items.push({ label: t("downloads.batchRetry"), onSelect: () => restart(props.download.id) });
@@ -519,11 +505,6 @@ const menuItems = computed(() => {
         <Play class="h-3.5 w-3.5" />
         <span>{{ t("downloads.menuResume") }}</span>
         <ContextMenuShortcut>Space</ContextMenuShortcut>
-      </ContextMenuItem>
-
-      <ContextMenuItem v-if="anyCancellable" @select="ctxCancel">
-        <XCircle class="h-3.5 w-3.5" />
-        <span>{{ t("downloads.batchCancel") }}</span>
       </ContextMenuItem>
 
       <ContextMenuItem :disabled="!anyRestartable" @select="ctxRetry">

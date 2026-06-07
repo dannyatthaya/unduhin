@@ -419,7 +419,7 @@ function onMediaSubmitted(id: number) {
           <p
             v-if="isTorrentInput"
             :title="torrentDisplayName"
-            class="min-w-0 truncate text-[11px] text-primary"
+            class="min-w-0 break-words line-clamp-2 text-[11px] text-primary"
           >
             {{ t("addUrl.torrentDetected") }}
             <span v-if="torrentDisplayName" class="text-muted-foreground">

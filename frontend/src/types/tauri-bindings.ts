@@ -485,7 +485,6 @@ export const api = {
     invoke<DownloadRecord>("get_download", { id }),
   pauseDownload: (id: DownloadId) => invoke<void>("pause_download", { id }),
   resumeDownload: (id: DownloadId) => invoke<void>("resume_download", { id }),
-  cancelDownload: (id: DownloadId) => invoke<void>("cancel_download", { id }),
   retryDownload: (id: DownloadId) => invoke<void>("retry_download", { id }),
   removeDownload: (id: DownloadId, deleteData = false) =>
     invoke<void>("remove_download", { id, deleteData }),

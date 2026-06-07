@@ -210,8 +210,12 @@ Write-Host "[7/8] sign artefacts" -ForegroundColor DarkGray
 # Tauri NSIS/MSI artefacts so users can spot it on the Releases page.
 $extZipDir = "target\release\bundle\extension"
 New-Item -ItemType Directory -Force $extZipDir | Out-Null
+# Wipe stale extension zips from earlier builds. They accumulate in this
+# output dir, and a previous Unduhin_1.1.0_extension.zip once shipped *inside*
+# the 1.1.1 release because the upload glob (further down) was unversioned.
+# Keep this dir holding ONLY the current version's archive.
+Get-ChildItem -Path $extZipDir -Filter "*_extension.zip" -File -ErrorAction SilentlyContinue | Remove-Item -Force
 $extZipPath = "$extZipDir\Unduhin_${Version}_extension.zip"
-if (Test-Path $extZipPath) { Remove-Item $extZipPath -Force }
 Compress-Archive -Path "extension\dist\*" -DestinationPath $extZipPath -Force
 Write-Host "      extension zipped → $extZipPath" -ForegroundColor DarkGray
 
@@ -319,14 +323,32 @@ if (Test-Path $nsisDir) {
 if (Test-Path $msiDir) {
     $assets += Get-ChildItem -Path $msiDir -Filter "*_${Version}_*.msi" -File -ErrorAction SilentlyContinue
 }
-# Extension zip (Chromium browsers load this unpacked until the Web
-# Store listing is live).
+# Extension zip (Chromium browsers load this unpacked until the Web Store
+# listing is live). Version-pinned like the NSIS/MSI globs above so a prior
+# build's Unduhin_<old>_extension.zip can't be swept in — that exact bug put
+# 1.1.0's extension zip inside the 1.1.1 release.
 if (Test-Path $extZipDir) {
-    $assets += Get-ChildItem -Path $extZipDir -Filter "*_extension.zip" -File -ErrorAction SilentlyContinue
+    $assets += Get-ChildItem -Path $extZipDir -Filter "*_${Version}_extension.zip" -File -ErrorAction SilentlyContinue
 }
-$assets += Get-ChildItem -Path $bundleRoot -Filter "latest-*.json" -File -ErrorAction SilentlyContinue
+# Channel-pinned: a stable release must not sweep in a stale latest-beta.json
+# (the same class of bug — an unversioned glob catching a prior build's file).
+$assets += Get-ChildItem -Path $bundleRoot -Filter "latest-$Channel.json" -File -ErrorAction SilentlyContinue
 
 if (-not $assets) { throw "No release assets found under $bundleRoot." }
+
+# Safety net for the whole asset class: refuse to publish if any collected
+# asset carries a DIFFERENT version in its name (e.g. a stray
+# Unduhin_1.1.0_*). The globs above are version-pinned, so this should never
+# fire — it exists so a wrong-version asset can never silently reach a Release
+# again, however the globs might drift in future. Files without an embedded
+# version (latest-<channel>.json) are intentionally exempt.
+$wrongVersion = $assets | Where-Object {
+    $_.Name -match '_(\d+\.\d+\.\d+)_' -and $Matches[1] -ne $Version
+}
+if ($wrongVersion) {
+    $names = ($wrongVersion | ForEach-Object { $_.Name }) -join ', '
+    throw "Refusing to publish v$Version — asset(s) from another version were collected: $names.`nClean target\release\bundle\ and re-run."
+}
 
 $assetPaths = $assets | ForEach-Object { $_.FullName }
 

@@ -129,6 +129,11 @@ pub struct YtdlpJob {
     /// the engine's sanitization — captured `Range` or `Host` would
     /// break yt-dlp's own segment loop.
     pub extra_headers: Vec<(String, String)>,
+    /// Global download speed cap in bytes/sec, passed to yt-dlp as
+    /// `--limit-rate`. `None` or `0` means unlimited. Read from
+    /// `global_speed_limit_bps` at spawn time (yt-dlp is a subprocess, so this
+    /// is fixed for the run — unlike the HTTP engine's live token bucket).
+    pub limit_rate_bps: Option<u64>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -283,6 +288,11 @@ pub async fn download(
         .arg(&output_arg);
     if let Some(ffmpeg) = job.ffmpeg_path.as_deref() {
         cmd.arg("--ffmpeg-location").arg(ffmpeg);
+    }
+    // Global speed cap. yt-dlp's `--limit-rate` accepts a raw bytes/sec
+    // integer; `0`/`None` means no flag (unlimited).
+    if let Some(bps) = job.limit_rate_bps.filter(|b| *b > 0) {
+        cmd.arg("--limit-rate").arg(bps.to_string());
     }
     if let Some(ua) = job.user_agent.as_deref() {
         cmd.arg("--user-agent").arg(ua);

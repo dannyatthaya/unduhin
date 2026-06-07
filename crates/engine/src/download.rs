@@ -3,6 +3,7 @@
 //! ticker + per-segment telemetry) lives in [`crate::transfer`].
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::header::RANGE;
@@ -18,6 +19,7 @@ use crate::meta::Meta;
 use crate::progress::{ProgressEvent, DEFAULT_CHANNEL_CAPACITY};
 use crate::retry::Backoff;
 use crate::segment::{split, Segment};
+use crate::throttle::TokenBucket;
 use crate::transfer::{run_transfer, Control};
 
 /// Tunable inputs for a fresh download.
@@ -45,6 +47,13 @@ pub struct DownloadOptions {
     pub headers: Vec<(String, String)>,
     /// Broadcast channel capacity; only used when a sender is built internally.
     pub channel_capacity: usize,
+    /// Optional shared byte-rate limiter. When set, every segment's write loop
+    /// passes the bytes it is about to write through this bucket before
+    /// committing them, so all segments (and, when the caller hands the same
+    /// `Arc` to every download, all downloads) share one throughput cap. `None`
+    /// (the default) means unthrottled. The `core` queue feeds each worker a
+    /// clone of one process-wide bucket driven by `global_speed_limit_bps`.
+    pub rate_limiter: Option<Arc<TokenBucket>>,
 }
 
 impl DownloadOptions {
@@ -59,6 +68,7 @@ impl DownloadOptions {
             user_agent: None,
             headers: Vec::new(),
             channel_capacity: DEFAULT_CHANNEL_CAPACITY,
+            rate_limiter: None,
         }
     }
 }
@@ -310,6 +320,7 @@ pub async fn resume_at(
     headers: Vec<(String, String)>,
     cancel: CancellationToken,
     tx: Option<broadcast::Sender<ProgressEvent>>,
+    rate_limiter: Option<Arc<TokenBucket>>,
 ) -> Result<DownloadSummary> {
     resume_at_with_control(
         meta_path,
@@ -321,6 +332,7 @@ pub async fn resume_at(
         cancel,
         tx,
         None,
+        rate_limiter,
     )
     .await
 }
@@ -338,6 +350,7 @@ pub async fn resume_at_with_control(
     cancel: CancellationToken,
     tx: Option<broadcast::Sender<ProgressEvent>>,
     control_rx: Option<mpsc::Receiver<Control>>,
+    rate_limiter: Option<Arc<TokenBucket>>,
 ) -> Result<DownloadSummary> {
     let meta = Meta::load(&meta_path).await?;
     let url: Url = meta
@@ -371,6 +384,7 @@ pub async fn resume_at_with_control(
         user_agent,
         headers,
         channel_capacity: DEFAULT_CHANNEL_CAPACITY,
+        rate_limiter,
     };
 
     if !opts.output.exists() {

@@ -69,6 +69,7 @@
     "groupActive": "Active",
     "groupPausedQueued": "Paused & Queued",
     "groupNeedsAttention": "Needs attention",
+    "groupCancelled": "Cancelled",
     "groupCompletedToday": "Completed in the last 24h",
     "groupCompletedYesterday": "Completed yesterday",
     "groupCompletedOlder": "Completed earlier",

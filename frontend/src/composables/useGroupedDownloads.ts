@@ -19,6 +19,7 @@ export interface DownloadGroup {
     | "active"
     | "paused-queued"
     | "needs-attention"
+    | "cancelled"
     | "completed"
     | "completed-yesterday"
     | "completed-older";
@@ -81,6 +82,11 @@ export function useGroupedDownloads(
     );
     const pq = rows.filter((r) => r.status === "paused" || r.status === "queued");
     const attention = rows.filter((r) => r.status === "failed");
+    // Cancelled rows are terminal but not failures. They previously matched no
+    // bucket and silently vanished from the Grouped view, even though the Flat
+    // view and the sidebar category / "All downloads" counts both include them
+    // — so a cancelled download read as a phantom +1. Give them their own group.
+    const cancelled = rows.filter((r) => r.status === "cancelled");
 
     // Bucket *every* completed row by age so none disappear: rows older
     // than 24h (previously dropped entirely) fall into Yesterday/Older, and
@@ -97,6 +103,7 @@ export function useGroupedDownloads(
     if (active.length) out.push({ key: "active", label: "Active", rows: active });
     if (pq.length) out.push({ key: "paused-queued", label: "Paused & Queued", rows: pq });
     if (attention.length) out.push({ key: "needs-attention", label: "Needs attention", rows: attention });
+    if (cancelled.length) out.push({ key: "cancelled", label: "Cancelled", rows: cancelled });
     // Label reflects the rolling-24h window (not a calendar day); the real
     // label is resolved by `DownloadGroup.vue` from the key via i18n.
     if (today.length) out.push({ key: "completed", label: "Completed in the last 24h", rows: today });

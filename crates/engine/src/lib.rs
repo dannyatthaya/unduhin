@@ -51,6 +51,7 @@ pub mod meta;
 pub mod progress;
 pub mod retry;
 pub mod segment;
+pub mod throttle;
 pub mod transfer;
 
 pub use download::{
@@ -64,6 +65,7 @@ pub use meta::{Meta, SegmentState, META_SUFFIX};
 pub use progress::{ProgressEvent, SegmentRuntimeState, DEFAULT_CHANNEL_CAPACITY};
 pub use retry::{Backoff, RetryClass};
 pub use segment::Segment;
+pub use throttle::TokenBucket;
 pub use transfer::{Control, MAX_SEGMENTS, MIN_SEGMENTS};
 
 pub use tokio_util::sync::CancellationToken;

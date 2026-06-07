@@ -135,11 +135,31 @@ async fn build_torrent_config(pool: &SqlitePool) -> Result<torrent::TorrentConfi
         .flatten()
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
+    // Seed-until ratio in thousandths; `0` (the seeded default) = forget at
+    // 100 %, no seeding. Clamp into u32 — the UI bounds it to 0..=100_000.
+    let seed_ratio_milli = settings::get(pool, "torrent_seed_ratio_milli")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        .min(u32::MAX as u64) as u32;
+    // Global (cross-backend) download speed cap, in bytes/sec. Shared with the
+    // HTTP engine and yt-dlp; `0` = unlimited. Live changes are pushed to the
+    // running session by `Core::set_setting`.
+    let download_limit_bps = settings::get(pool, settings::settings_keys::GLOBAL_SPEED_LIMIT_BPS)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
 
     let mut cfg = torrent::TorrentConfig::new(download_dir, state_dir);
     cfg.listen_port = listen_port;
     cfg.enable_dht = enable_dht;
     cfg.enable_upnp = enable_upnp;
+    cfg.seed_ratio_milli = seed_ratio_milli;
+    cfg.download_limit_bps = download_limit_bps;
     Ok(cfg)
 }
 
@@ -219,6 +239,9 @@ pub(crate) struct QueueManager {
     /// Shared lazy torrent session (design §3.D). Threaded into each torrent
     /// worker so they all reuse one process-wide librqbit session.
     torrent_engine: Arc<TorrentEngineCell>,
+    /// Process-wide global speed limiter, handed to every HTTP worker so the
+    /// `global_speed_limit_bps` cap applies across all downloads at once.
+    rate_limiter: Arc<engine::TokenBucket>,
 }
 
 /// Debounce state for the `QueueEmptied` emission. Owned by the manager
@@ -251,6 +274,7 @@ impl QueueManager {
         events: broadcast::Sender<CoreEvent>,
         schedules: Arc<RwLock<SchedulesCache>>,
         torrent_engine: Arc<TorrentEngineCell>,
+        rate_limiter: Arc<engine::TokenBucket>,
     ) -> QueueHandle {
         let shutdown = CancellationToken::new();
         let (wake_tx, wake_rx) = mpsc::channel(1);
@@ -263,6 +287,7 @@ impl QueueManager {
             drain: Mutex::new(DrainTracker::default()),
             schedules,
             torrent_engine,
+            rate_limiter,
         });
         let handle_manager = manager.clone();
         let join = tokio::spawn(async move {
@@ -440,6 +465,7 @@ impl QueueManager {
                 cancel.clone(),
                 control_rx,
                 self.torrent_engine.clone(),
+                self.rate_limiter.clone(),
             );
             active.insert(
                 id,
@@ -503,9 +529,19 @@ fn spawn_worker(
     cancel: CancellationToken,
     control_rx: Option<mpsc::Receiver<Control>>,
     torrent_engine: Arc<TorrentEngineCell>,
+    rate_limiter: Arc<engine::TokenBucket>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        run_worker(pool, events, record, cancel, control_rx, torrent_engine).await;
+        run_worker(
+            pool,
+            events,
+            record,
+            cancel,
+            control_rx,
+            torrent_engine,
+            rate_limiter,
+        )
+        .await;
     })
 }
 
@@ -516,6 +552,7 @@ async fn run_worker(
     cancel: CancellationToken,
     control_rx: Option<mpsc::Receiver<Control>>,
     torrent_engine: Arc<TorrentEngineCell>,
+    rate_limiter: Arc<engine::TokenBucket>,
 ) {
     let id = record.id;
     let output_path = record.output_path.clone();
@@ -813,6 +850,8 @@ async fn run_worker(
                         user_agent.clone(),
                         cancel.clone(),
                         tx.clone(),
+                        // Current global cap (live value from the shared bucket).
+                        rate_limiter.rate().await,
                     )
                     .await
                 }
@@ -835,6 +874,8 @@ async fn run_worker(
                 cancel.clone(),
                 Some(tx.clone()),
                 control_rx,
+                // Global speed cap also applies to resumed transfers.
+                Some(rate_limiter.clone()),
             )
             .await
         }
@@ -849,6 +890,8 @@ async fn run_worker(
             opts.backoff = backoff;
             opts.user_agent = user_agent.clone();
             opts.headers = record.headers.clone().unwrap_or_default();
+            // Global speed cap: all HTTP workers share this one bucket.
+            opts.rate_limiter = Some(rate_limiter.clone());
             engine::download_with_control(opts, cancel.clone(), Some(tx.clone()), control_rx).await
         }
     };
@@ -1106,6 +1149,7 @@ async fn run_torrent(
 /// Drive a yt-dlp child process for a media-info-tagged download. Wraps
 /// the result in [`engine::EngineError`] so the caller's match arms work
 /// uniformly across engine and yt-dlp paths.
+#[allow(clippy::too_many_arguments)]
 async fn run_ytdlp(
     pool: &SqlitePool,
     events: &broadcast::Sender<CoreEvent>,
@@ -1114,6 +1158,7 @@ async fn run_ytdlp(
     user_agent: Option<String>,
     cancel: CancellationToken,
     tx: tokio::sync::broadcast::Sender<engine::ProgressEvent>,
+    limit_rate_bps: u64,
 ) -> Result<engine::DownloadSummary, engine::EngineError> {
     let binary = tooling::resolve_path(Tool::YtDlp, pool)
         .await
@@ -1160,6 +1205,7 @@ async fn run_ytdlp(
         ffmpeg_path: ffmpeg,
         user_agent,
         extra_headers: record.headers.clone().unwrap_or_default(),
+        limit_rate_bps: (limit_rate_bps > 0).then_some(limit_rate_bps),
     };
 
     let parsed_url = record

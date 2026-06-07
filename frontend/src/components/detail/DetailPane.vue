@@ -221,10 +221,11 @@ const moreMenu = computed(() => {
       },
     },
   ];
-  if (record.value.status !== "completed") {
+  if (record.value.status === "completed") {
+    // Re-download a finished file from scratch.
     items.push({
-      label: t("downloads.batchCancel"),
-      onSelect: () => downloads.cancel(id),
+      label: t("downloads.menuRestart"),
+      onSelect: () => void downloads.retry(id),
     });
   }
   return items;

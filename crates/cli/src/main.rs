@@ -56,9 +56,8 @@ enum Command {
     Pause(IdArg),
     /// Re-queue a paused or failed download.
     Continue(IdArg),
-    /// Cancel a download (preserves the sidecar; use `remove` to delete).
-    Cancel(IdArg),
-    /// Re-queue a failed or cancelled download.
+    /// Restart a download: resume a failed one, or re-download a completed one
+    /// from scratch.
     Retry(IdArg),
     /// Remove a download from the database.
     Remove(RemoveArgs),
@@ -190,7 +189,6 @@ async fn main() -> anyhow::Result<()> {
         Command::List(args) => run_list(db, args).await,
         Command::Pause(args) => with_core(db, |c| async move { c.pause(args.id).await }).await,
         Command::Continue(args) => with_core(db, |c| async move { c.resume(args.id).await }).await,
-        Command::Cancel(args) => with_core(db, |c| async move { c.cancel(args.id).await }).await,
         Command::Retry(args) => with_core(db, |c| async move { c.retry(args.id).await }).await,
         Command::Remove(args) => {
             let id = args.id;
@@ -240,6 +238,7 @@ async fn run_download(args: DownloadArgs) -> anyhow::Result<()> {
                 Vec::new(),
                 cancel,
                 Some(tx),
+                None,
             )
         })
         .await;
@@ -264,6 +263,7 @@ async fn run_resume(args: ResumeArgs) -> anyhow::Result<()> {
             Vec::new(),
             cancel,
             Some(tx),
+            None,
         )
     })
     .await
