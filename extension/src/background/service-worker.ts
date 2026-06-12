@@ -12,9 +12,7 @@
 
 import { HOST_NAME } from "../shared/types.js";
 import type {
-  DownloadJob,
   ExtensionSettings,
-  HandoffDecision,
   Inbound,
   MediaStream,
   Outbound,
@@ -53,43 +51,11 @@ async function readHostName(): Promise<string> {
 
 const headerCache = installHeaderCapture();
 
-// Outstanding `ask-first` prompts. The bridge's unsolicited
-// handler resolves these on `Outbound::HandoffDecision`. Keyed by the
-// extension-generated correlation id.
-const pendingHandoffs = new Map<
-  string,
-  { resolve: (d: HandoffDecision) => void; timer: ReturnType<typeof setTimeout> }
->();
-
-// If Tauri never replies (panel closed, app crash mid-prompt), default
-// to the safer choice — leave the download with the browser. 60s is
-// long enough for a human read; longer than that the user has moved on.
-const ASK_HANDOFF_TIMEOUT_MS = 60_000;
-
-function resolveHandoff(id: string, decision: HandoffDecision): void {
-  const pending = pendingHandoffs.get(id);
-  if (!pending) return;
-  pendingHandoffs.delete(id);
-  clearTimeout(pending.timer);
-  pending.resolve(decision);
-}
-
-async function askHandoff(id: string, job: DownloadJob): Promise<HandoffDecision> {
-  return new Promise<HandoffDecision>((resolve) => {
-    const timer = setTimeout(() => {
-      pendingHandoffs.delete(id);
-      log.info("ask-first prompt timed out — defaulting to passthrough", id);
-      resolve("passthrough");
-    }, ASK_HANDOFF_TIMEOUT_MS);
-    pendingHandoffs.set(id, { resolve, timer });
-    rawBridge.send({ type: "askHandoff", id, job }).catch((err) => {
-      // Ack failure — fail closed (passthrough). Clear the slot so a
-      // late HandoffDecision doesn't fire a stale resolver.
-      log.warn("ask-first send failed; defaulting to passthrough", err);
-      resolveHandoff(id, "passthrough");
-    });
-  });
-}
+// `ask-first` no longer round-trips a capture/passthrough decision through
+// the service worker. The interceptor sends the job to the app as an
+// `askHandoff`; the app shows its full config dialog and starts the download
+// itself via `start_handoff_download`. There is nothing for the SW to track
+// and no `HandoffDecision` to resolve — cancelling the app dialog just aborts.
 
 const rawBridge = createNativeBridge(
   readHostName,
@@ -103,12 +69,10 @@ const rawBridge = createNativeBridge(
       void applyServerSettings(full);
       return;
     }
-    // ask-first prompt resolution. Match by id; tolerate stale acks
-    // (e.g. after a port rebind) silently.
-    if (msg.type === "handoffDecision") {
-      const reply = msg as { id: string; decision: HandoffDecision };
-      resolveHandoff(reply.id, reply.decision);
-    }
+    // `handoffDecision` frames are vestigial — the app no longer drives the
+    // ask-first download through the extension, so we just ignore them. They
+    // stay routed here (not through the reply FIFO) via the bridge's
+    // UNSOLICITED_TYPES so a stray frame can't hijack a pending ack.
   },
   // On every (re)connect, replay the current settings to the host. The
   // storage→bridge forward in `chrome.storage.onChanged` fails silently
@@ -152,7 +116,7 @@ const bridge: NativeBridge = {
 
 const mediaSniffer = installMediaSniffer({ headerCache, settings });
 
-installDownloadInterceptor({ headerCache, bridge, settings, askHandoff });
+installDownloadInterceptor({ headerCache, bridge, settings });
 installContextMenu({ headerCache, bridge, settings });
 
 // `chrome.runtime.sendMessage` excludes the sender from delivery, so the

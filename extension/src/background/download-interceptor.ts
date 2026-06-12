@@ -1,46 +1,51 @@
 // Download interceptor.
 //
-// We intercept on `chrome.downloads.onCreated` — the EARLIEST download
-// event. `onCreated` fires before `onDeterminingFilename`, which in turn
-// fires before Chrome shows the "Save As" prompt; cancelling here (rather
-// than at the later `onDeterminingFilename`, which does NOT reliably
-// suppress that dialog) stops the browser before any dialog or bytes.
+// We intercept at `chrome.downloads.onDeterminingFilename` and use it as a
+// BARRIER. That event fires while Chrome is still deciding the target path —
+// *before* the "Save As" prompt is shown and before any bytes are committed
+// to the Downloads folder. Crucially, a listener that returns `true` tells
+// Chrome "I'll suggest a filename asynchronously", so Chrome BLOCKS the
+// download (and therefore the dialog) until we respond. For a captured
+// download we never suggest a filename; we cancel the download out from
+// under the determination instead. Because Chrome never reaches the prompt
+// step, the dialog can NEVER appear for a captured download.
 //
-// Flow for a captured download: decide (`shouldIntercept`) → if the app is
-// reachable, cancel the browser's copy immediately → hand the job to the
-// native app. If the app is unreachable we leave the download to the
-// browser as a fallback (and never cancel). For `ask-first` we cancel
-// up front to kill the dialog, prompt, and re-issue the browser download
-// if the user declines.
+// This replaces the older `onCreated` + `cancel` approach. `onCreated` is a
+// non-blocking notification: Chrome keeps advancing toward the dialog while
+// the (possibly asleep) service worker wakes and runs `cancel`, so the
+// cancel raced the dialog and frequently lost — the dialog flashed, and
+// whether it did was timing-dependent ("sometimes blocks, sometimes
+// doesn't"). The determining-filename barrier removes the race entirely:
+// the dialog is held shut by the `return true`, and the cancel only has to
+// clean up the held download, which it does off the dialog's critical path.
+//
+// Flow for a captured download: hold the dialog (`return true`) → cancel the
+// browser's copy → hand the job to the native app. If the app is unreachable
+// we never hold — the browser keeps the download as a fallback. For
+// `ask-first` we still hold (so the browser dialog never appears) and hand the
+// job to the app as an `askHandoff`; the app shows its own config dialog
+// (category / location / segments) and starts the download itself. We never
+// re-issue an `ask-first` download to the browser — cancelling the app dialog
+// just aborts. The only mode that lets the browser keep a download is
+// `passthrough` (extension off).
 //
 // The decision is split in two: `shouldIntercept` in `intercept-rules.ts`
 // is pure and exhaustively tested; this module wires it to the chrome
 // APIs and the bridge.
 
 import { log } from "../shared/log.js";
-import type { DownloadJob, HandoffDecision, RequestHeader } from "../shared/types.js";
+import type { DownloadJob, RequestHeader } from "../shared/types.js";
 import { buildCookieHeader } from "./cookie-forwarder.js";
 import type { HeaderCache } from "./header-capture.js";
 import type { NativeBridge } from "./native-bridge.js";
-import { shouldIntercept } from "./intercept-rules.js";
+import { shouldIntercept, type ShouldInterceptDecision } from "./intercept-rules.js";
 import { recordRuleHit } from "./rule-metrics.js";
 import type { SettingsReader } from "../shared/settings.js";
-
-/**
- * Round-trip an `ask-first` prompt. Implementation lives in
- * `service-worker.ts` because it needs the unsolicited frame router
- * already wired up there. Returns the user's choice or
- * `"passthrough"` if no response arrives within the timeout — we
- * default to the safer option (leave the download in the browser)
- * when the Tauri side never replies.
- */
-export type AskHandoffFn = (id: string, job: DownloadJob) => Promise<HandoffDecision>;
 
 export interface InterceptorDeps {
   readonly headerCache: HeaderCache;
   readonly bridge: NativeBridge;
   readonly settings: SettingsReader;
-  readonly askHandoff: AskHandoffFn;
 }
 
 /**
@@ -62,38 +67,97 @@ const NOTIFICATION_ICON =
 
 /**
  * Guards against handling the same `DownloadItem.id` twice (defensive —
- * `onCreated` fires once per id, but a stray duplicate would otherwise
- * re-run the cancel/forward pipeline and the second `cancel` would reject
- * once Chrome has torn the record down). Short-lived: cleared after the
- * handler finishes, so SW eviction can't leak it.
+ * `onDeterminingFilename` normally fires once per id, but a stray duplicate
+ * would otherwise re-run the cancel/forward pipeline and the second
+ * `cancel` would reject once Chrome has torn the record down). While an id
+ * is in this set we keep holding the dialog (`return true`) without
+ * re-handing-off. Short-lived: cleared after the handler finishes, so SW
+ * eviction can't leak it.
  */
 const handlingIds = new Set<number>();
 
 /**
  * URLs we deliberately re-issued to the browser (after an `ask-first`
  * decline, or when a hand-off failed post-cancel). The resulting
- * `onCreated` for that URL is passed through once instead of being
- * re-intercepted — without this guard an `ask-first` decline would loop
- * forever (cancel → re-download → prompt → decline → …).
+ * `onDeterminingFilename` for that URL is passed through once (not held,
+ * not re-intercepted) — without this guard an `ask-first` decline would
+ * loop forever (cancel → re-download → prompt → decline → …).
  */
 const letThrough = new Set<string>();
 
 export function installDownloadInterceptor(deps: InterceptorDeps): void {
-  chrome.downloads.onCreated.addListener((item) => {
-    // Only act on freshly-started downloads. `onCreated` can also fire for
-    // history rows restored on startup (state "complete"/"interrupted") —
-    // never cancel those.
+  // The listener decides SYNCHRONOUSLY whether to hold the dialog
+  // (`return true`) — every input it needs (`shouldIntercept`,
+  // `bridge.isHealthy`, the `letThrough` set) is synchronous. The slow
+  // work (cancel, cookie/header lookup, bridge round-trip, ask-first
+  // prompt) runs afterwards in `handleCapture`, while the dialog stays
+  // held. Returning `true` is the documented contract for "I will call
+  // `suggest()` asynchronously"; for a captured download we deliberately
+  // never call it and cancel instead.
+  //
+  // `onDeterminingFilename`'s callback is typed `=> void`, but the runtime
+  // honours a `boolean` return (the async-suggest signal). TypeScript's
+  // void-returning-callback rule lets us return `boolean | void` here.
+  const onDetermining = (
+    item: chrome.downloads.DownloadItem,
+    _suggest: (suggestion?: chrome.downloads.DownloadFilenameSuggestion) => void,
+  ): boolean | void => {
+    // Determining-filename only fires for live downloads, never for
+    // history rows restored on startup — but guard anyway.
     if (item.state !== "in_progress") return;
-    if (handlingIds.has(item.id)) {
-      log.debug("dedup: skipping duplicate onCreated for", item.id);
+
+    const url = pickUrl(item);
+
+    // A download we re-issued ourselves (post-decline / post-failure
+    // fallback): let the browser keep it exactly once — including its
+    // own "Save As" dialog if the user has that enabled. Do NOT hold.
+    if (letThrough.delete(url)) {
+      log.debug("passthrough: re-issued browser download", url);
       return;
     }
+
+    // Already holding + handling this id (duplicate event): keep the
+    // dialog held until the in-flight handler cancels the download.
+    if (handlingIds.has(item.id)) {
+      log.debug("dedup: still handling", item.id, "— keep holding");
+      return true;
+    }
+
+    const settings = deps.settings.current();
+    const filename = pickFilename(item);
+    const decision = shouldIntercept({ url, filename, size: item.totalBytes, settings });
+    // Record a hit for any rule that decided the outcome. Buffered;
+    // the alarm tick pushes the snapshot to Tauri every 6 s.
+    if (decision.kind !== "ask" && decision.matchedPattern) {
+      recordRuleHit(decision.matchedPattern);
+    }
+
+    if (decision.kind === "passthrough") {
+      log.debug("passthrough:", decision.reason, "→", url);
+      return; // let Chrome name + save it normally (dialog included).
+    }
+
+    // Bridge unreachable: do NOT hold. The user's download proceeds in the
+    // browser, and we toast once per session so they know why we let it go.
+    if (!deps.bridge.isHealthy()) {
+      log.info("bridge unhealthy — leaving download to the browser:", url);
+      void notifyNotRunningOnce();
+      return;
+    }
+
+    // CAPTURE or ASK. Hold the dialog (the `return true` below) and run the
+    // cancel + hand-off off the dialog's critical path.
     handlingIds.add(item.id);
-    void handleItem(item, deps)
-      .catch((err) => log.warn("handleItem failed", err))
+    void handleCapture(item, decision, url, filename, deps)
+      .catch((err) => log.warn("handleCapture failed", err))
       .finally(() => handlingIds.delete(item.id));
-  });
-  log.info("download-interceptor installed (onCreated)");
+    return true; // BARRIER — blocks the "Save As" dialog until we cancel.
+  };
+
+  // The callback is declared `=> void` upstream; the `boolean | void` return
+  // is accepted by the void-returning-callback rule and honoured at runtime.
+  chrome.downloads.onDeterminingFilename.addListener(onDetermining);
+  log.info("download-interceptor installed (onDeterminingFilename barrier)");
 }
 
 /** Cancel the browser's copy of `id`, then erase it from the shelf when
@@ -117,7 +181,7 @@ async function cancelBrowserDownload(id: number, hideShelf: boolean): Promise<vo
 
 /** Re-issue a browser download we previously cancelled (ask-first decline,
  * or a hand-off that failed after we already cancelled). Marked in
- * `letThrough` so the resulting `onCreated` isn't re-intercepted. */
+ * `letThrough` so the resulting `onDeterminingFilename` isn't re-intercepted. */
 async function redownloadInBrowser(url: string): Promise<void> {
   if (url.length === 0) return;
   letThrough.add(url);
@@ -130,84 +194,43 @@ async function redownloadInBrowser(url: string): Promise<void> {
   }
 }
 
-async function handleItem(
+/**
+ * Runs while the dialog is held by the barrier (`return true`). Cancels the
+ * browser's copy, then hands the job to the app. The dialog is already held
+ * shut, so the `cancel` here only has to tear down the held download — it is
+ * no longer racing the prompt.
+ *
+ * `intercept` (catch-all / rules-only): send the job straight to the app,
+ * which auto-starts it.
+ *
+ * `ask`: send the job as an `askHandoff`. The app shows its full config
+ * dialog (category / location / segments / …) and starts the download itself
+ * (`start_handoff_download`) with the user's choices — so we send NO
+ * `download` frame here. We never re-issue the download to the browser on a
+ * decline: cancelling the app dialog simply aborts. The only mode that hands
+ * a download to the browser is `passthrough` (extension off).
+ *
+ * The lone exception is a genuine send failure after we've already cancelled
+ * (the app died mid-handoff). That's equivalent to "extension off", so we
+ * re-download in the browser rather than silently drop the file. It's rare —
+ * the bridge proved healthy moments earlier in the listener.
+ */
+async function handleCapture(
   item: chrome.downloads.DownloadItem,
+  decision: ShouldInterceptDecision,
+  url: string,
+  filename: string,
   deps: InterceptorDeps,
 ): Promise<void> {
   const settings = deps.settings.current();
-  const url = pickUrl(item);
-  const filename = pickFilename(item);
-
-  // A download we re-issued ourselves (post-decline / post-failure
-  // fallback): let the browser keep it exactly once.
-  if (letThrough.delete(url)) {
-    log.debug("passthrough: re-issued browser download", url);
-    return;
-  }
-
-  const decision = shouldIntercept({
-    url,
-    filename,
-    size: item.totalBytes,
-    settings,
-  });
-  // Record a hit for any rule that decided the outcome. Buffered;
-  // the alarm tick pushes the snapshot to Tauri every 6 s.
-  if (decision.kind !== "ask" && decision.matchedPattern) {
-    recordRuleHit(decision.matchedPattern);
-  }
-  if (decision.kind === "passthrough") {
-    log.debug("passthrough:", decision.reason, "→", url);
-    return;
-  }
-
-  // The bridge-unreachable path: do *not* cancel. The user's download
-  // proceeds in the browser, and we toast once per session so they know
-  // why we didn't grab it.
-  if (!deps.bridge.isHealthy()) {
-    log.info("bridge unhealthy — leaving download to the browser:", url);
-    await notifyNotRunningOnce();
-    return;
-  }
-
   const referrer = item.referrer && item.referrer.length > 0 ? item.referrer : null;
 
-  // ask-first: cancel up front so no "Save As" dialog appears while the
-  // prompt is open, then ask. On decline, hand the download back to the
-  // browser. We build the job first because the prompt needs it.
-  if (decision.kind === "ask") {
-    const job = await buildJob({
-      item,
-      url,
-      filename,
-      referrer,
-      cached: deps.headerCache.getHeadersFor(url) ?? [],
-      forwardCookies: settings.forwardCookies,
-    });
-    await cancelBrowserDownload(item.id, settings.hideShelf);
-    const choice = await deps.askHandoff(newAskId(), job);
-    if (choice !== "capture") {
-      log.debug("ask-first: user declined → re-download in browser", url);
-      await redownloadInBrowser(url);
-      return;
-    }
-    try {
-      await deps.bridge.send({ type: "download", job });
-    } catch (err) {
-      log.warn("bridge.send(download) failed after cancel; re-downloading", err);
-      await notifyNotRunningOnce();
-      await redownloadInBrowser(url);
-    }
-    return;
-  }
-
-  // Immediate intercept: cancel the browser's copy NOW — at `onCreated`
-  // this lands before Chrome reaches the "Save As" prompt, so no dialog
-  // appears and nothing is written to the Downloads folder. Then hand the
-  // job to the app. The app already proved reachable (`isHealthy`), so a
-  // post-cancel send failure is rare; if it happens we re-download in the
-  // browser rather than silently drop the file.
+  // Tear down the held download. The dialog is already blocked by the
+  // barrier, so this cancel only removes the item from the downloads tray —
+  // it's off the dialog's critical path. We never call `suggest()`; the
+  // cancel is how we resolve the held determination.
   await cancelBrowserDownload(item.id, settings.hideShelf);
+
   const job = await buildJob({
     item,
     url,
@@ -216,10 +239,16 @@ async function handleItem(
     cached: deps.headerCache.getHeadersFor(url) ?? [],
     forwardCookies: settings.forwardCookies,
   });
+
+  const message =
+    decision.kind === "ask"
+      ? ({ type: "askHandoff", id: newAskId(), job } as const)
+      : ({ type: "download", job } as const);
+
   try {
-    await deps.bridge.send({ type: "download", job });
+    await deps.bridge.send(message);
   } catch (err) {
-    log.warn("bridge.send(download) failed after cancel; re-downloading", err);
+    log.warn("bridge.send failed after cancel; re-downloading", err);
     await notifyNotRunningOnce();
     await redownloadInBrowser(url);
   }

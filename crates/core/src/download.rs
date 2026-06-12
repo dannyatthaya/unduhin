@@ -667,8 +667,9 @@ async fn resolve_torrent_output_dir(
     }
 
     // Base folder: the torrent-specific download dir, else the global default,
-    // else the current dir — mirroring `category_target_folder`'s fallback
-    // chain but rooted at the `torrent_download_dir` setting (design §3.G).
+    // else the user's Downloads folder — mirroring `category_target_folder`'s
+    // fallback chain but rooted at the `torrent_download_dir` setting
+    // (design §3.G).
     let base = torrent_base_dir(pool).await?;
     // Per-download subdir name: the sanitized provisional/real name, suffixed
     // with the infohash so distinct torrents that happen to share a name stay
@@ -683,8 +684,62 @@ async fn resolve_torrent_output_dir(
     safe_join(&base, &sanitize_filename(&subdir))
 }
 
+/// Startup repair for rows created while the no-config output fallback was
+/// the process CWD: an app autostarted by Windows resolved those into
+/// `C:\WINDOWS\system32`, where every write fails with "Access is denied"
+/// (os error 5). Any non-terminal row whose `output_path` is relative or
+/// rooted under the Windows directory is re-resolved through the normal
+/// folder chain (category folder → global default → Downloads). No files
+/// are moved: nothing was ever written at the broken paths.
+pub(crate) async fn repair_unwritable_output_paths(pool: &SqlitePool) -> Result<()> {
+    let records = list(pool, DownloadFilter::default()).await?;
+    for r in &records {
+        let in_flight = matches!(
+            r.status,
+            Status::Queued | Status::Active | Status::Muxing | Status::Paused | Status::Failed
+        );
+        if !in_flight || !is_broken_output_path(&r.output_path) {
+            continue;
+        }
+        let new_path = match r.kind {
+            DownloadKind::Torrent => {
+                resolve_torrent_output_dir(pool, &r.filename, &None, r.torrent.as_ref()).await?
+            }
+            _ => resolve_output_path(pool, &r.filename, &None, r.category_id).await?,
+        };
+        tracing::info!(
+            id = r.id,
+            old = %r.output_path.display(),
+            new = %new_path.display(),
+            "startup repair: rewrote unwritable output path"
+        );
+        sqlx::query("UPDATE downloads SET output_path = ? WHERE id = ?")
+            .bind(new_path.to_string_lossy().as_ref())
+            .bind(r.id)
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
+/// True when `path` could never have been a sane download target: relative
+/// (resolved against whatever directory the process happened to start in)
+/// or rooted under the Windows directory (`%SystemRoot%` — the CWD of an
+/// app autostarted by Windows).
+fn is_broken_output_path(path: &Path) -> bool {
+    if path.is_relative() {
+        return true;
+    }
+    let windir = std::env::var("SystemRoot")
+        .or_else(|_| std::env::var("WINDIR"))
+        .unwrap_or_else(|_| r"C:\Windows".to_string());
+    let w = windir.trim_end_matches(['\\', '/']).to_ascii_lowercase();
+    let p = path.to_string_lossy().to_ascii_lowercase();
+    p == w || p.starts_with(&format!("{w}\\")) || p.starts_with(&format!("{w}/"))
+}
+
 /// Base folder torrents download into: `torrent_download_dir` setting, else
-/// the global `default_output_path`, else the current working directory.
+/// the global `default_output_path`, else the user's Downloads folder.
 async fn torrent_base_dir(pool: &SqlitePool) -> Result<PathBuf> {
     let torrent_dir = crate::settings::get(pool, "torrent_download_dir")
         .await?
@@ -700,7 +755,7 @@ async fn torrent_base_dir(pool: &SqlitePool) -> Result<PathBuf> {
     if let Some(g) = global {
         return Ok(PathBuf::from(g));
     }
-    Ok(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+    Ok(crate::fallback_download_dir())
 }
 
 /// Reconcile a torrent row's DISPLAY metadata once librqbit resolves the real
@@ -763,7 +818,7 @@ pub(crate) async fn reconcile_torrent_filename(
 /// so it must never emit a separator, a `..`, or an empty string. yt-dlp's
 /// own `--restrict-filenames` does similar work but we want consistency
 /// with the rest of our filename derivation.
-fn sanitize_filename(s: &str) -> String {
+pub(crate) fn sanitize_filename(s: &str) -> String {
     let mut out: String = s
         .chars()
         .map(|c| match c {
@@ -1379,8 +1434,8 @@ pub(crate) async fn apply_engine_filename(
 }
 
 /// Resolve the folder a download in `category_id` should live in: the
-/// category's configured folder, else the global default, else the current
-/// directory. Mirrors the folder selection in [`resolve_output_path`].
+/// category's configured folder, else the global default, else the user's
+/// Downloads folder. Mirrors the folder selection in [`resolve_output_path`].
 async fn category_target_folder(pool: &SqlitePool, category_id: Option<i64>) -> Result<PathBuf> {
     if let Some(id) = category_id {
         if let Ok(cat) = crate::category::get(pool, id).await {
@@ -1398,7 +1453,7 @@ async fn category_target_folder(pool: &SqlitePool, category_id: Option<i64>) -> 
     if let Some(g) = global {
         return Ok(PathBuf::from(g));
     }
-    Ok(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+    Ok(crate::fallback_download_dir())
 }
 
 /// Move `from` into `dest_dir`, keeping the file name. Returns the path the
@@ -1909,8 +1964,11 @@ async fn default_segments(pool: &SqlitePool) -> Result<u32> {
 }
 
 /// Combine the category's default folder (if any) with the filename to
-/// produce an absolute path. If neither category nor global default
-/// supplies one, we fall back to the current working directory.
+/// produce an absolute path. Category folders are seeded with concrete
+/// `<Downloads>/<Name>` paths at startup ([`crate::category::seed_default_folders`]),
+/// so the trailing Downloads fallback only fires when the user has cleared
+/// both the category folder and the global default — it must never be the
+/// process CWD (`C:\WINDOWS\system32` for an autostarted app).
 async fn resolve_output_path(
     pool: &SqlitePool,
     filename: &str,
@@ -1945,12 +2003,7 @@ async fn resolve_output_path(
         return resolve_unique_output_path(pool, Path::new(&g), filename).await;
     }
 
-    resolve_unique_output_path(
-        pool,
-        &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        filename,
-    )
-    .await
+    resolve_unique_output_path(pool, &crate::fallback_download_dir(), filename).await
 }
 
 /// Join a download `filename` onto a base `folder`, guaranteeing the
@@ -2132,6 +2185,122 @@ mod tests {
             .unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         pool
+    }
+
+    /// Regression for the system32 sidecar failure: with NO category folder
+    /// and NO global default configured, the fallback used to be the process
+    /// CWD — `C:\WINDOWS\system32` for an autostarted app, where creating
+    /// `<name>.unduhin-meta.tmp` fails with "Access is denied" (os error 5).
+    /// The last-resort folder must be the user's Downloads directory, never
+    /// the CWD. (In a real database the category folders are seeded with
+    /// concrete paths at startup — see `category::seed_default_folders` —
+    /// so this fallback only fires when the user cleared everything.)
+    #[tokio::test]
+    async fn unconfigured_paths_fall_back_to_downloads_not_cwd() {
+        let pool = fresh_pool().await;
+        let downloads = crate::fallback_download_dir();
+
+        let music = crate::category::find_by_name(&pool, "Music")
+            .await
+            .unwrap()
+            .unwrap();
+        let p = resolve_output_path(&pool, "song.mp3", &None, Some(music.id))
+            .await
+            .unwrap();
+        assert!(p.is_absolute(), "resolved path must be absolute: {p:?}");
+        assert_eq!(p.parent(), Some(downloads.as_path()));
+
+        // No category at all resolves the same way.
+        let p = resolve_output_path(&pool, "blob", &None, None).await.unwrap();
+        assert_eq!(p.parent(), Some(downloads.as_path()));
+
+        // The move target used on re-categorize follows the same chain.
+        let folder = category_target_folder(&pool, Some(music.id)).await.unwrap();
+        assert_eq!(folder, downloads);
+
+        // Torrents root at Downloads too.
+        let base = torrent_base_dir(&pool).await.unwrap();
+        assert_eq!(base, downloads);
+    }
+
+    /// Startup repair rewrites rows whose `output_path` was captured while
+    /// the no-config fallback was the process CWD (e.g. a torrent rooted in
+    /// `C:\WINDOWS\system32`), and leaves healthy and terminal rows alone.
+    #[tokio::test]
+    async fn repair_rewrites_system32_and_relative_paths() {
+        let pool = fresh_pool().await;
+        let downloads = crate::fallback_download_dir();
+
+        async fn raw_row(pool: &SqlitePool, name: &str, path: &str, status: &str) -> i64 {
+            let row = sqlx::query(
+                "INSERT INTO downloads (url, filename, output_path, total_bytes, \
+                                        downloaded_bytes, status, priority, segments, created_at) \
+                 VALUES ('https://example.com/x', ?, ?, NULL, 0, ?, 0, 1, '2026-01-01T00:00:00Z') \
+                 RETURNING id",
+            )
+            .bind(name)
+            .bind(path)
+            .bind(status)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            row.get("id")
+        }
+        async fn path_of(pool: &SqlitePool, id: i64) -> String {
+            sqlx::query_scalar("SELECT output_path FROM downloads WHERE id = ?")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .unwrap()
+        }
+
+        let broken_abs =
+            raw_row(&pool, "fg-01.bin", r"C:\WINDOWS\system32\fg-01.bin", "failed").await;
+        let broken_rel = raw_row(&pool, "fg-02.bin", "fg-02.bin", "queued").await;
+        let healthy_path = downloads.join("keep.bin").to_string_lossy().into_owned();
+        let healthy = raw_row(&pool, "keep.bin", &healthy_path, "failed").await;
+        let terminal =
+            raw_row(&pool, "old.bin", r"C:\WINDOWS\system32\old.bin", "completed").await;
+
+        repair_unwritable_output_paths(&pool).await.unwrap();
+
+        for id in [broken_abs, broken_rel] {
+            let p = PathBuf::from(path_of(&pool, id).await);
+            assert!(p.is_absolute(), "repaired path must be absolute: {p:?}");
+            assert_eq!(p.parent(), Some(downloads.as_path()), "row {id}");
+        }
+        assert_eq!(path_of(&pool, healthy).await, healthy_path);
+        assert_eq!(
+            path_of(&pool, terminal).await,
+            r"C:\WINDOWS\system32\old.bin",
+            "terminal rows are historical records — left untouched"
+        );
+    }
+
+    /// An explicitly configured global `default_output_path` beats the
+    /// Downloads last resort when the category has no folder of its own.
+    #[tokio::test]
+    async fn global_default_beats_downloads_fallback() {
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().to_string_lossy().to_string();
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES ('default_output_path', ?) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(serde_json::to_string(&global).unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let music = crate::category::find_by_name(&pool, "Music")
+            .await
+            .unwrap()
+            .unwrap();
+        let p = resolve_output_path(&pool, "song.mp3", &None, Some(music.id))
+            .await
+            .unwrap();
+        assert_eq!(p, tmp.path().join("song.mp3"));
     }
 
     /// Insert a download row directly, bypassing the higher-level

@@ -157,6 +157,51 @@ pub(crate) async fn auto_categorize_for_filename(
     Ok(other_category_id(pool).await.ok())
 }
 
+/// One-time backfill of concrete per-category download folders, run at
+/// startup right after migrations. Every category whose folder is still
+/// unset gets `<Downloads>/<Name>` — plain `<Downloads>` for the "Other"
+/// catch-all — so the settings UI shows real paths and downloads never
+/// fall back to the process CWD (`C:\WINDOWS\system32` for an autostarted
+/// app, where writes fail with os error 5).
+///
+/// Guarded by the `category_folders_seeded` settings flag so it runs
+/// exactly once per database: a folder the user later clears on purpose
+/// stays cleared instead of being re-filled on every launch.
+pub(crate) async fn seed_default_folders(pool: &SqlitePool) -> Result<()> {
+    let done: Option<String> =
+        sqlx::query_scalar("SELECT value FROM settings WHERE key = 'category_folders_seeded'")
+            .fetch_optional(pool)
+            .await?;
+    if done.is_some() {
+        return Ok(());
+    }
+
+    let downloads = crate::fallback_download_dir();
+    for cat in list(pool).await? {
+        let already_set = cat
+            .default_output_path
+            .as_ref()
+            .is_some_and(|p| !p.as_os_str().is_empty());
+        if already_set {
+            continue;
+        }
+        let folder = if cat.name == "Other" {
+            downloads.clone()
+        } else {
+            downloads.join(crate::download::sanitize_filename(&cat.name))
+        };
+        sqlx::query("UPDATE categories SET default_output_path = ? WHERE id = ?")
+            .bind(folder.to_string_lossy().as_ref())
+            .bind(cat.id)
+            .execute(pool)
+            .await?;
+    }
+    sqlx::query("INSERT INTO settings (key, value) VALUES ('category_folders_seeded', 'true')")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 async fn other_category_id(pool: &SqlitePool) -> Result<CategoryId> {
     let row = sqlx::query("SELECT id FROM categories WHERE name = 'Other'")
         .fetch_optional(pool)
@@ -275,6 +320,73 @@ mod tests {
     fn extensions_normalized() {
         let v = normalize_extensions(&[".MP3".into(), "WAV".into(), "".into(), ".".into()]);
         assert_eq!(v, vec!["mp3", "wav"]);
+    }
+
+    /// First-run seeding fills every unset category folder with a concrete
+    /// path under the user's Downloads directory — `Downloads/<Name>` for
+    /// real categories, plain `Downloads` for the "Other" catch-all — and
+    /// leaves folders the user already configured untouched.
+    #[tokio::test]
+    async fn seed_default_folders_fills_unset_categories() {
+        let pool = fresh_pool().await;
+        let downloads = crate::fallback_download_dir();
+
+        // Pre-configure one category to prove seeding does not clobber it.
+        let video = find_by_name(&pool, "Video").await.unwrap().unwrap();
+        let custom = PathBuf::from("D:/My Videos");
+        update(
+            &pool,
+            video.id,
+            NewCategory {
+                name: video.name.clone(),
+                icon: video.icon.clone(),
+                default_output_path: Some(custom.clone()),
+                extension_rules: video.extension_rules.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        seed_default_folders(&pool).await.unwrap();
+
+        for name in ["Documents", "Music", "Compressed", "Programs"] {
+            let cat = find_by_name(&pool, name).await.unwrap().unwrap();
+            assert_eq!(
+                cat.default_output_path.as_deref(),
+                Some(downloads.join(name).as_path()),
+                "{name} should be seeded under Downloads"
+            );
+        }
+        let other = find_by_name(&pool, "Other").await.unwrap().unwrap();
+        assert_eq!(other.default_output_path.as_deref(), Some(downloads.as_path()));
+        let video = find_by_name(&pool, "Video").await.unwrap().unwrap();
+        assert_eq!(video.default_output_path, Some(custom));
+    }
+
+    /// Seeding runs exactly once: a folder the user clears afterwards stays
+    /// cleared on the next startup instead of being re-filled.
+    #[tokio::test]
+    async fn seed_default_folders_runs_once() {
+        let pool = fresh_pool().await;
+        seed_default_folders(&pool).await.unwrap();
+
+        let music = find_by_name(&pool, "Music").await.unwrap().unwrap();
+        update(
+            &pool,
+            music.id,
+            NewCategory {
+                name: music.name.clone(),
+                icon: music.icon.clone(),
+                default_output_path: None,
+                extension_rules: music.extension_rules.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        seed_default_folders(&pool).await.unwrap();
+        let music = find_by_name(&pool, "Music").await.unwrap().unwrap();
+        assert_eq!(music.default_output_path, None, "cleared folder must stay cleared");
     }
 
     /// Regression for the yt-dlp finalize flow: an extensionless title

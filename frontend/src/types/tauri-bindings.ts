@@ -8,6 +8,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
+import type { DownloadJob } from "./wire";
+
 // ---------------------------------------------------------------------------
 // Primitive shapes (snake_case to match Serde defaults)
 // ---------------------------------------------------------------------------
@@ -479,6 +481,29 @@ export const api = {
 
   addDownload: (input: AddDownloadInput) =>
     invoke<DownloadId>("add_download", { input }),
+  /**
+   * Start a download the extension captured in `ask-first` mode, with the
+   * options the user picked in the in-app config dialog. The captured HTTP
+   * context (cookies / referer / user-agent / headers) travels inside `job`
+   * and is folded in server-side, so authenticated downloads keep working;
+   * the row is tagged as a browser hand-off (`ExtensionPipe`).
+   */
+  startHandoffDownload: (
+    job: DownloadJob,
+    overrides: {
+      filename?: string | null;
+      outputPath?: string | null;
+      categoryId?: CategoryId | null;
+      segments?: number | null;
+    } = {},
+  ) =>
+    invoke<DownloadId>("start_handoff_download", {
+      job,
+      filename: overrides.filename ?? null,
+      outputPath: overrides.outputPath ?? null,
+      categoryId: overrides.categoryId ?? null,
+      segments: overrides.segments ?? null,
+    }),
   listDownloads: (filter?: DownloadFilter) =>
     invoke<DownloadRecord[]>("list_downloads", { filter: filter ?? null }),
   getDownload: (id: DownloadId) =>

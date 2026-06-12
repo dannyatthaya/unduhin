@@ -136,6 +136,14 @@ impl Core {
 
     async fn from_pool(pool: SqlitePool) -> Result<Self> {
         db::migrate(&pool).await?;
+        // First-run backfill: give every category a concrete download folder
+        // (`<Downloads>/<Name>`, plain `<Downloads>` for "Other") so the
+        // settings UI shows real paths and nothing resolves to the CWD.
+        category::seed_default_folders(&pool).await?;
+        // Rows captured while the output fallback was still the process CWD
+        // may point into C:\WINDOWS\system32 — rewrite them before the queue
+        // gets a chance to retry them at the unwritable location.
+        download::repair_unwritable_output_paths(&pool).await?;
         let (tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         // On restart, any download stuck in `active` *or* `muxing` was
         // interrupted mid-flight (the latter when a crash hit a yt-dlp
@@ -754,6 +762,28 @@ pub fn directories_root() -> Option<PathBuf> {
         );
     }
     None
+}
+
+/// The user's Downloads folder — where downloads land when neither a
+/// category folder nor the global `default_output_path` setting supplies
+/// one. Same env-var approach as [`directories_root`] to keep deps tight.
+///
+/// Deliberately NOT the process CWD: when the app autostarts with Windows
+/// the CWD is `C:\WINDOWS\system32`, so a CWD fallback makes every
+/// unconfigured download fail with "Access is denied" (os error 5).
+pub fn fallback_download_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(profile) = std::env::var("USERPROFILE") {
+            return Path::new(&profile).join("Downloads");
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return Path::new(&home).join("Downloads");
+    }
+    // No user profile at all (service-like context): a writable temp dir
+    // still beats failing the download outright.
+    std::env::temp_dir().join("unduhin")
 }
 
 #[doc(hidden)]

@@ -92,8 +92,10 @@ impl TorrentEngineCell {
 /// state survives content moves.
 async fn build_torrent_config(pool: &SqlitePool) -> Result<torrent::TorrentConfig, engine::EngineError> {
     // Session-default content dir: `torrent_download_dir`, else the global
-    // default, else the cwd. This is only the session default librqbit records;
-    // each `run` passes an explicit per-download content dir that overrides it.
+    // default, else the user's Downloads folder (never the CWD — that is
+    // `C:\WINDOWS\system32` when the app autostarts with Windows). This is
+    // only the session default librqbit records; each `run` passes an
+    // explicit per-download content dir that overrides it.
     let configured = settings::get(pool, "torrent_download_dir")
         .await
         .ok()
@@ -109,7 +111,7 @@ async fn build_torrent_config(pool: &SqlitePool) -> Result<torrent::TorrentConfi
             .and_then(|v| v.as_str().map(|s| s.to_string()))
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
+            .unwrap_or_else(crate::fallback_download_dir),
     };
 
     let state_dir = crate::directories_root()

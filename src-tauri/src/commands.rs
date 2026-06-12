@@ -12,7 +12,7 @@ use tauri::State;
 
 use unduhin_core::{
     tooling::{Tool, ToolStatus},
-    wire::{ExtensionSettings, HandoffDecision, RuleMetric, SettingsPatch},
+    wire::{DownloadJob, ExtensionSettings, HandoffDecision, RuleMetric, SettingsPatch},
     ytdlp::{MediaInfo, ProbeResult},
     AddDownload, Category, CategoryId, CategorySelector, Core, DownloadFilter, DownloadId,
     DownloadKind, DownloadRecord, DownloadSource, NewCategory, NewSchedule, QuietHoursState,
@@ -288,6 +288,59 @@ pub async fn add_download(
             source: DownloadSource::Manual,
             kind,
             torrent: input.torrent,
+        })
+        .await?;
+    Ok(id)
+}
+
+/// Start a download the extension captured in `ask-first` mode, applying the
+/// choices the user made in the in-app config dialog.
+///
+/// Unlike the auto-capture pipe path (`Inbound::Download` → `handle_download`),
+/// the extension does NOT initiate the download for `ask-first` — it just
+/// hands the [`DownloadJob`] to the app and blocks the browser's own dialog.
+/// The app owns the download from here so it can attach the user's category,
+/// segment count, and output folder, which the wire `DownloadJob` can't carry.
+///
+/// The captured HTTP context (cookies / referer / user-agent / observed
+/// headers) is folded in via [`unduhin_core::wire::headers_from_job`] — the
+/// exact mapping the pipe path uses — so authenticated downloads keep working,
+/// and the row is tagged `ExtensionPipe` like every other browser hand-off.
+#[tauri::command]
+pub async fn start_handoff_download(
+    core: State<'_, Core>,
+    job: DownloadJob,
+    filename: Option<String>,
+    output_path: Option<String>,
+    category_id: Option<i64>,
+    segments: Option<u32>,
+) -> CommandResult<DownloadId> {
+    let url = url::Url::parse(&job.final_url).map_err(|e| CommandError {
+        message: format!("invalid URL: {e}"),
+    })?;
+    let headers = unduhin_core::wire::headers_from_job(&job);
+    let category = category_id.map(CategorySelector::Id);
+
+    let id = core
+        .add_download(AddDownload {
+            url,
+            // An explicit override wins; otherwise fall back to the job's
+            // captured filename hint (the engine still derives a name if both
+            // are absent).
+            filename: filename.filter(|s| !s.is_empty()).or(job.filename),
+            output_path: output_path.filter(|s| !s.is_empty()).map(PathBuf::from),
+            category,
+            priority: 0,
+            segments,
+            media_info: None,
+            headers: if headers.is_empty() {
+                None
+            } else {
+                Some(headers)
+            },
+            source: DownloadSource::ExtensionPipe,
+            kind: DownloadKind::Http,
+            torrent: None,
         })
         .await?;
     Ok(id)

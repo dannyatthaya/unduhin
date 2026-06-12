@@ -268,6 +268,12 @@ pub struct TorrentRunSummary {
 pub struct TorrentEngine {
     session: Arc<Session>,
     download_dir: PathBuf,
+    /// Scratch folder for metadata probes. librqbit creates the torrent's
+    /// WHOLE (empty) file tree in the output folder as soon as metadata
+    /// resolves — even for a probe that downloads nothing — so probes must
+    /// never point at a user-visible folder. Lives under the managed state
+    /// dir; probe placeholders are deleted again right after the probe.
+    probe_dir: PathBuf,
     /// Seed-until ratio (thousandths); `0` = forget at 100 %. Read once from
     /// the session config — like `listen_port` / DHT / UPnP, this is fixed for
     /// the life of the process-wide session, so a change takes effect on the
@@ -320,6 +326,14 @@ impl TorrentEngine {
             ..Default::default()
         };
 
+        let probe_dir = cfg.state_dir.join("probe");
+        if let Err(e) = tokio::fs::create_dir_all(&probe_dir).await {
+            return Err(TorrentError::Backend(format!(
+                "creating torrent probe dir {}: {e}",
+                probe_dir.display()
+            )));
+        }
+
         let session = Session::new_with_opts(cfg.download_dir.clone(), opts)
             .await
             .map_err(|e| TorrentError::Backend(format!("starting torrent session: {e}")))?;
@@ -327,6 +341,7 @@ impl TorrentEngine {
         Ok(Self {
             session,
             download_dir: cfg.download_dir,
+            probe_dir,
             seed_ratio_milli: cfg.seed_ratio_milli,
         })
     }
@@ -375,11 +390,16 @@ impl TorrentEngine {
         // resolve only via its trackers). A real add announces the real listen
         // port, so metadata resolves via the torrent's TRACKERS as well as DHT.
         // We forget the probe torrent once we've read its file list.
+        //
+        // The output folder is the managed probe scratch dir, NOT the session
+        // download dir: librqbit creates the torrent's whole (empty) file tree
+        // there the moment metadata resolves, and a probe must neither litter
+        // the user's folder nor fail on an unwritable one.
         let add_fut = self.session.add_torrent(
             add,
             Some(AddTorrentOptions {
                 only_files: Some(Vec::new()),
-                output_folder: Some(self.download_dir.to_string_lossy().into_owned()),
+                output_folder: Some(self.probe_dir.to_string_lossy().into_owned()),
                 ..Default::default()
             }),
         );
@@ -409,9 +429,12 @@ impl TorrentEngine {
         let info_hash = handle.info_hash().as_string();
         let meta = self.snapshot_metadata(&handle, &info_hash);
         if probe_added {
+            // delete_files=true: removes the empty placeholder tree librqbit
+            // created under the probe scratch dir. Never reached for an
+            // `AlreadyManaged` torrent (a real download in progress).
             let _ = self
                 .session
-                .delete(handle.id().into(), /* delete_files = */ false)
+                .delete(handle.id().into(), /* delete_files = */ true)
                 .await;
         }
         Ok(meta)
@@ -433,39 +456,64 @@ impl TorrentEngine {
         cancel: CancellationToken,
         tx: Option<broadcast::Sender<engine::ProgressEvent>>,
     ) -> Result<TorrentRunSummary, TorrentError> {
-        let add = input.to_add_torrent()?;
-
-        // The add itself can block on metadata resolution for a magnet; bound it
-        // the same way the probe is bounded (design §5.5) and honor cancel.
-        let add_fut = self.session.add_torrent(
-            add,
-            Some(AddTorrentOptions {
-                only_files,
-                output_folder: Some(download_dir.to_string_lossy().into_owned()),
-                // Allow resuming on top of existing partial content.
-                overwrite: true,
-                ..Default::default()
-            }),
-        );
-
-        let resp = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return Err(TorrentError::Cancelled),
-            r = tokio::time::timeout(DEFAULT_METADATA_TIMEOUT, add_fut) => {
-                r.map_err(|_| TorrentError::Timeout(DEFAULT_METADATA_TIMEOUT))?
-                    .map_err(TorrentError::backend)?
-            }
-        };
-
         // Q7: a duplicate add returns AlreadyManaged — same handle, no second
         // copy. Treat Added and AlreadyManaged identically; both yield a handle.
-        let (resumed, handle) = match resp {
-            AddTorrentResponse::Added(_, h) => (false, h),
-            AddTorrentResponse::AlreadyManaged(_, h) => (true, h),
-            AddTorrentResponse::ListOnly(_) => {
-                return Err(TorrentError::Backend(
-                    "run add returned list_only (bug: list_only was not requested)".into(),
-                ));
+        //
+        // One caveat: `output_folder` is ignored for an AlreadyManaged torrent —
+        // librqbit keeps whatever the entry was persisted with (session.json).
+        // An entry captured with a broken folder (e.g. the pre-fix CWD fallback
+        // `C:\WINDOWS\system32`) restores into the `Error` state — its files can
+        // never be created — and would stay broken forever no matter what folder
+        // this row asks for. Forget such an entry once (keeping any files) and
+        // re-add it fresh at the requested folder.
+        let mut retried_errored = false;
+        let (resumed, handle) = loop {
+            let add = input.to_add_torrent()?;
+            // The add itself can block on metadata resolution for a magnet; bound
+            // it the same way the probe is bounded (design §5.5) and honor cancel.
+            let add_fut = self.session.add_torrent(
+                add,
+                Some(AddTorrentOptions {
+                    only_files: only_files.clone(),
+                    output_folder: Some(download_dir.to_string_lossy().into_owned()),
+                    // Allow resuming on top of existing partial content.
+                    overwrite: true,
+                    ..Default::default()
+                }),
+            );
+
+            let resp = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(TorrentError::Cancelled),
+                r = tokio::time::timeout(DEFAULT_METADATA_TIMEOUT, add_fut) => {
+                    r.map_err(|_| TorrentError::Timeout(DEFAULT_METADATA_TIMEOUT))?
+                        .map_err(TorrentError::backend)?
+                }
+            };
+
+            match resp {
+                AddTorrentResponse::Added(_, h) => break (false, h),
+                AddTorrentResponse::AlreadyManaged(_, h) => {
+                    let errored = matches!(h.stats().state, TorrentStatsState::Error);
+                    if errored && !retried_errored {
+                        tracing::info!(
+                            info_hash = %h.info_hash().as_string(),
+                            "torrent: managed entry is in an error state — forgetting and re-adding"
+                        );
+                        let _ = self
+                            .session
+                            .delete(h.id().into(), /* delete_files = */ false)
+                            .await;
+                        retried_errored = true;
+                        continue;
+                    }
+                    break (true, h);
+                }
+                AddTorrentResponse::ListOnly(_) => {
+                    return Err(TorrentError::Backend(
+                        "run add returned list_only (bug: list_only was not requested)".into(),
+                    ));
+                }
             }
         };
 

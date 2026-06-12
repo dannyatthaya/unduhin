@@ -636,7 +636,7 @@ async fn handle_download(
     job: unduhin_core::wire::DownloadJob,
 ) -> Result<unduhin_core::DownloadId, String> {
     let url = url::Url::parse(&job.final_url).map_err(|e| format!("invalid URL: {e}"))?;
-    let headers = headers_from_job(&job);
+    let headers = unduhin_core::wire::headers_from_job(&job);
 
     let input = unduhin_core::AddDownload {
         url,
@@ -747,43 +747,10 @@ async fn handle_status(core: &Core) -> Result<Vec<unduhin_core::wire::StatusEntr
         .collect())
 }
 
-/// Build the captured-headers vector from a `DownloadJob`. The engine
-/// will replay these on every request (including segment ranges), so
-/// `Cookie`, `Referer`, and `User-Agent` are prepended in front of the
-/// extension's `webRequest` observations. `engine::http::sanitize_headers`
-/// applies the final drop-list — we don't deduplicate here.
-#[cfg(windows)]
-fn headers_from_job(job: &unduhin_core::wire::DownloadJob) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
-    if let Some(c) = job.cookie_header.as_ref().filter(|s| !s.is_empty()) {
-        out.push(("Cookie".to_string(), c.clone()));
-    }
-    if let Some(r) = job.referrer.as_ref().filter(|s| !s.is_empty()) {
-        out.push(("Referer".to_string(), r.clone()));
-    }
-    if let Some(ua) = job.user_agent.as_ref().filter(|s| !s.is_empty()) {
-        out.push(("User-Agent".to_string(), ua.clone()));
-    }
-    for h in &job.request_headers {
-        // `Cookie`/`Referer`/`User-Agent` already came from the job's
-        // dedicated fields above; skip any duplicate the extension also
-        // captured via `webRequest` so reqwest doesn't send two.
-        if is_prepended_header(&h.name) {
-            continue;
-        }
-        out.push((h.name.clone(), h.value.clone()));
-    }
-    out
-}
-
-/// Header names that `headers_from_*` prepend from dedicated job fields and
-/// must therefore not be appended a second time from captured headers.
-#[cfg(windows)]
-fn is_prepended_header(name: &str) -> bool {
-    name.eq_ignore_ascii_case("cookie")
-        || name.eq_ignore_ascii_case("referer")
-        || name.eq_ignore_ascii_case("user-agent")
-}
+// `headers_from_job` now lives in `unduhin_core::wire` so the `ask-first`
+// Tauri command (`commands::start_handoff_download`) folds headers
+// identically; `handle_download` calls it directly via the fully-qualified
+// path. `headers_from_media` stays here — it operates on a `MediaStream`.
 
 #[cfg(windows)]
 fn headers_from_media(stream: &unduhin_core::wire::MediaStream) -> Vec<(String, String)> {
@@ -798,7 +765,7 @@ fn headers_from_media(stream: &unduhin_core::wire::MediaStream) -> Vec<(String, 
         out.push(("User-Agent".to_string(), ua.clone()));
     }
     for h in &stream.request_headers {
-        if is_prepended_header(&h.name) {
+        if unduhin_core::wire::is_prepended_header(&h.name) {
             continue;
         }
         out.push((h.name.clone(), h.value.clone()));
@@ -809,7 +776,7 @@ fn headers_from_media(stream: &unduhin_core::wire::MediaStream) -> Vec<(String, 
 #[cfg(all(windows, test))]
 mod tests {
     use super::*;
-    use unduhin_core::wire::{DownloadJob, MediaStream, RequestHeader};
+    use unduhin_core::wire::{headers_from_job, DownloadJob, MediaStream, RequestHeader};
 
     #[test]
     fn prepends_cookie_referer_ua_then_captured_headers() {

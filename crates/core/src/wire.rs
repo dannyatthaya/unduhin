@@ -63,6 +63,45 @@ pub struct DownloadJob {
     pub page_url: Option<String>,
 }
 
+/// `true` when `name` is one of the headers `headers_from_job` /
+/// `headers_from_media` prepend from a job's dedicated fields, and so must
+/// not be appended a second time from the captured `request_headers` (else
+/// reqwest sends two copies).
+pub fn is_prepended_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("cookie")
+        || name.eq_ignore_ascii_case("referer")
+        || name.eq_ignore_ascii_case("user-agent")
+}
+
+/// Build the captured-headers vector from a [`DownloadJob`]. `Cookie`,
+/// `Referer`, and `User-Agent` are taken from the job's dedicated fields and
+/// prepended ahead of the extension's `webRequest` observations; duplicates
+/// of those three in `request_headers` are dropped. The engine replays these
+/// on every request (including segment ranges) and re-applies its own
+/// drop-list defensively, so we don't deduplicate further here.
+///
+/// Shared by the pipe server's auto-capture path and the `ask-first` Tauri
+/// command so both fold headers identically.
+pub fn headers_from_job(job: &DownloadJob) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    if let Some(c) = job.cookie_header.as_ref().filter(|s| !s.is_empty()) {
+        out.push(("Cookie".to_string(), c.clone()));
+    }
+    if let Some(r) = job.referrer.as_ref().filter(|s| !s.is_empty()) {
+        out.push(("Referer".to_string(), r.clone()));
+    }
+    if let Some(ua) = job.user_agent.as_ref().filter(|s| !s.is_empty()) {
+        out.push(("User-Agent".to_string(), ua.clone()));
+    }
+    for h in &job.request_headers {
+        if is_prepended_header(&h.name) {
+            continue;
+        }
+        out.push((h.name.clone(), h.value.clone()));
+    }
+    out
+}
+
 /// Container format of a sniffed streaming manifest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-rs-export", derive(TS))]

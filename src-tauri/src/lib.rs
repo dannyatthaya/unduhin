@@ -184,6 +184,7 @@ pub fn run() {
             commands::apply_extension_settings_patch,
             commands::get_rule_metrics,
             commands::respond_handoff,
+            commands::start_handoff_download,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build tauri app")
