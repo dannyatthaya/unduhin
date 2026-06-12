@@ -1,7 +1,10 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, onMounted, ref } from "vue";
 import { useI18n } from "vue-i18n";
-import { RefreshCw } from "lucide-vue-next";
+import { Check, Copy, FolderOpen, RefreshCw } from "lucide-vue-next";
+
+import { invoke } from "@tauri-apps/api/core";
+import { openPath } from "@tauri-apps/plugin-opener";
 
 import Button from "@/components/ui/Button.vue";
 import BrowserCard from "@/components/settings/browser/BrowserCard.vue";
@@ -36,6 +39,38 @@ const firefox = computed<BrowserRow | null>(() =>
 const safari = computed<BrowserRow | null>(() =>
   props.browsers.find((b) => b.id === "safari") ?? null,
 );
+
+/** App-managed canonical unpacked-extension folder. Users Load-unpacked
+ *  it once; the app refreshes its contents on every launch and the
+ *  extension reloads itself. `null` hides the strip (command failed —
+ *  non-Windows dev shell, most likely). */
+const extensionDir = ref<string | null>(null);
+const copied = ref(false);
+
+onMounted(async () => {
+  try {
+    extensionDir.value = await invoke<string>("extension_folder_path");
+  } catch {
+    extensionDir.value = null;
+  }
+});
+
+function openFolder(): void {
+  if (!extensionDir.value) return;
+  void openPath(extensionDir.value).catch((e) =>
+    console.error("openPath(extension folder) failed", e),
+  );
+}
+
+function copyPath(): void {
+  if (!extensionDir.value) return;
+  void navigator.clipboard.writeText(extensionDir.value).then(() => {
+    copied.value = true;
+    setTimeout(() => {
+      copied.value = false;
+    }, 1_500);
+  });
+}
 </script>
 
 <template>
@@ -84,6 +119,33 @@ const safari = computed<BrowserRow | null>(() =>
         />
         <BrowserCard v-if="firefox" :primary="firefox" />
         <BrowserCard v-if="safari" :primary="safari" />
+      </div>
+    </div>
+    <div
+      v-if="extensionDir"
+      class="flex flex-col gap-2 border-t border-border px-5 py-4"
+    >
+      <p class="text-xs text-muted-foreground">
+        {{ t("settings.browserExtensionInstallHint") }}
+      </p>
+      <div class="flex items-center gap-2">
+        <code
+          class="min-w-0 flex-1 truncate rounded border border-border bg-muted/40 px-2 py-1.5 text-xs"
+          :title="extensionDir"
+        >{{ extensionDir }}</code>
+        <Button variant="secondary" size="sm" @click="copyPath">
+          <Check v-if="copied" class="h-3.5 w-3.5" />
+          <Copy v-else class="h-3.5 w-3.5" />
+          {{
+            copied
+              ? t("settings.browserExtensionPathCopied")
+              : t("settings.browserExtensionCopyPath")
+          }}
+        </Button>
+        <Button variant="secondary" size="sm" @click="openFolder">
+          <FolderOpen class="h-3.5 w-3.5" />
+          {{ t("settings.browserExtensionOpenFolder") }}
+        </Button>
       </div>
     </div>
   </article>

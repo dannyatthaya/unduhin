@@ -9,6 +9,7 @@
 pub mod browser_integration;
 pub mod commands;
 pub mod error;
+pub mod extension_sync;
 pub mod i18n;
 pub mod manifest;
 pub mod pipe;
@@ -117,6 +118,38 @@ pub fn run() {
                     tracing::warn!(error = %e, "failed to reconcile native-host manifest path");
                 }
                 pipe::install(app.handle().clone(), core.clone());
+                // Refresh the canonical unpacked-extension folder from the
+                // bundled payload, then let any connected extension know.
+                // Off the setup path: it's file IO, and a failure only
+                // costs auto-update, never startup.
+                tauri::async_runtime::spawn(async move {
+                    let synced =
+                        tauri::async_runtime::spawn_blocking(extension_sync::sync).await;
+                    match synced {
+                        Ok(Ok(changed)) => {
+                            // Greetings need the staged version even on
+                            // no-op runs; re-read it from the canonical
+                            // folder when nothing changed.
+                            let version = changed.clone().or_else(|| {
+                                extension_sync::canonical_dir()
+                                    .ok()
+                                    .and_then(|dir| extension_sync::staged_version(&dir))
+                            });
+                            if let Some(version) = version {
+                                pipe::set_canonical_extension_version(version).await;
+                            }
+                            if let Some(new_version) = changed {
+                                pipe::broadcast_extension_updated(new_version).await;
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!(error = %e, "extension folder sync failed");
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "extension sync task panicked");
+                        }
+                    }
+                });
                 reconcile_autostart(app.handle().clone(), core.clone(), runtime.clone());
                 // tauri.conf.json now has the main window at `visible:
                 // false`. We surface it here unless the user asked for
@@ -185,6 +218,7 @@ pub fn run() {
             commands::get_rule_metrics,
             commands::respond_handoff,
             commands::start_handoff_download,
+            commands::extension_folder_path,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build tauri app")

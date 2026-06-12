@@ -53,11 +53,14 @@ export type UnsolicitedHandler = (msg: Outbound) => void;
 /** Set of `Outbound.type` strings the bridge routes to `UnsolicitedHandler`
  *  instead of the FIFO reply queue. `handoffDecision` arrives
  *  unsolicited because the user response is async — the original
- *  `askHandoff` `send()` has already resolved by then. */
+ *  `askHandoff` `send()` has already resolved by then. `extensionUpdated`
+ *  is the app's push (connection greeting / post-sync broadcast) telling
+ *  us the canonical folder now holds a different version. */
 const UNSOLICITED_TYPES = new Set<Outbound["type"]>([
   "settings",
   "settingsChanged",
   "handoffDecision",
+  "extensionUpdated",
 ]);
 
 /** Resolved on every reply except `pong` (which is consumed by the health check). */

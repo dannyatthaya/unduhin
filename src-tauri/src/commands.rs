@@ -788,6 +788,19 @@ pub async fn get_rule_metrics(_core: State<'_, Core>) -> CommandResult<Vec<RuleM
     }
 }
 
+/// Absolute path of the app-managed canonical unpacked-extension folder,
+/// created on demand so the Settings → Browser "Open folder" affordance
+/// never points at a missing directory. Users Load-unpacked this folder
+/// once; `extension_sync` keeps its contents current on every launch.
+#[tauri::command]
+pub async fn extension_folder_path() -> CommandResult<String> {
+    crate::extension_sync::canonical_dir()
+        .map(|p| p.display().to_string())
+        .map_err(|e| CommandError {
+            message: format!("{e:#}"),
+        })
+}
+
 /// Resolve a pending `ask-first` prompt — broadcast the user's choice
 /// to every connected pipe client. The extension matches by `id` and
 /// resumes the corresponding handoff decision. Unknown `id`s are

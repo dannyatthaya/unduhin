@@ -89,6 +89,28 @@ fn rule_metrics_cache() -> &'static AsyncMutex<Vec<RuleMetric>> {
     RULE_METRICS_CACHE.get_or_init(|| AsyncMutex::new(Vec::new()))
 }
 
+/// Version of the extension currently staged in the app-managed canonical
+/// folder (`extension_sync`). Set once by the startup sync task — on
+/// no-op runs too, because the connection greeting needs it either way.
+/// `None` until the sync has run (or when no bundle ships with this
+/// build, e.g. a dev shell that never built the extension).
+#[cfg(windows)]
+static CANONICAL_EXT_VERSION: OnceLock<AsyncMutex<Option<String>>> = OnceLock::new();
+
+#[cfg(windows)]
+fn canonical_ext_version() -> &'static AsyncMutex<Option<String>> {
+    CANONICAL_EXT_VERSION.get_or_init(|| AsyncMutex::new(None))
+}
+
+/// Record the canonical extension version for connection greetings.
+#[cfg(windows)]
+pub async fn set_canonical_extension_version(version: String) {
+    *canonical_ext_version().lock().await = Some(version);
+}
+
+#[cfg(not(windows))]
+pub async fn set_canonical_extension_version(_version: String) {}
+
 /// Read-only accessor for the cached rule-metrics snapshot. Returns
 /// an empty vec until the first push arrives.
 #[cfg(windows)]
@@ -182,6 +204,35 @@ pub async fn broadcast_handoff_decision(
     _decision: unduhin_core::wire::HandoffDecision,
 ) {
 }
+
+/// Broadcast an `ExtensionUpdated { version }` frame to every connected
+/// pipe client. Mirrors [`broadcast_settings_changed`]: snapshot-then-fan-out
+/// so a slow client only blocks its own per-writer mutex. Sent by the
+/// startup sync after the canonical extension folder was replaced; the
+/// extension reloads itself when its running version is older.
+#[cfg(windows)]
+pub async fn broadcast_extension_updated(version: String) {
+    use unduhin_core::wire::framing::write_frame;
+    use unduhin_core::wire::Outbound;
+
+    let frame = match serde_json::to_vec(&Outbound::ExtensionUpdated { version }) {
+        Ok(buf) => buf,
+        Err(e) => {
+            tracing::warn!(error = %e, "serialize ExtensionUpdated failed");
+            return;
+        }
+    };
+    let snapshot: Vec<Arc<ClientWriter>> = connected_clients().lock().await.clone();
+    for client in snapshot {
+        let mut writer = client.lock().await;
+        if let Err(e) = write_frame(&mut *writer, &frame).await {
+            tracing::debug!(error = %e, "extension-updated broadcast write failed (client likely gone)");
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub async fn broadcast_extension_updated(_version: String) {}
 
 #[cfg(not(windows))]
 pub async fn cached_extension_settings() -> Option<unduhin_core::wire::ExtensionSettings> {
@@ -483,6 +534,25 @@ async fn handle_connection(stream: NamedPipeServer, core: Core) -> std::io::Resu
     let (mut reader, writer) = tokio::io::split(stream);
     let writer = Arc::new(AsyncMutex::new(writer));
     connected_clients().lock().await.push(writer.clone());
+
+    // Greeting: announce the canonical extension version so a session
+    // that connects *after* a folder swap (the pipe connects lazily on
+    // the extension's first non-Ping send) still learns it should
+    // reload. The frame is unsolicited; the extension bridge routes it
+    // outside the reply FIFO and ignores it unless its running version
+    // is older.
+    if let Some(version) = canonical_ext_version().lock().await.clone() {
+        let frame = serde_json::to_vec(&unduhin_core::wire::Outbound::ExtensionUpdated { version })
+            .unwrap_or_default();
+        if !frame.is_empty() {
+            let mut w = writer.lock().await;
+            if let Err(e) =
+                unduhin_core::wire::framing::write_frame(&mut *w, &frame).await
+            {
+                tracing::debug!(error = %e, "extension-version greeting write failed");
+            }
+        }
+    }
 
     let result: std::io::Result<()> = async {
         loop {

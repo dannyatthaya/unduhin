@@ -103,7 +103,7 @@ export type Inbound = { "type": "ping" } | { "type": "download", job: DownloadJo
  */
 id: string, job: DownloadJob, } | { "type": "ruleMetrics", metrics: Array<RuleMetric>, };
 
-export type Outbound = { "type": "pong" } | { "type": "ack", id: number, } | { "type": "status", downloads: Array<StatusEntry>, } | { "type": "error", message: string, } | { "type": "settings", full: ExtensionSettings, } | { "type": "settingsChanged", full: ExtensionSettings, } | { "type": "handoffDecision", id: string, decision: HandoffDecision, };
+export type Outbound = { "type": "pong" } | { "type": "ack", id: number, } | { "type": "status", downloads: Array<StatusEntry>, } | { "type": "error", message: string, } | { "type": "settings", full: ExtensionSettings, } | { "type": "settingsChanged", full: ExtensionSettings, } | { "type": "handoffDecision", id: string, decision: HandoffDecision, } | { "type": "extensionUpdated", version: string, };
 
 export const HOST_NAME = "com.unduhin.host" as const;
 export const ALLOWED_DEV_EXTENSION_ID = "blbgjagjodpiiclpecohlfhebgddkejn" as const;

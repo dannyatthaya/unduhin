@@ -164,6 +164,19 @@ finally {
     Pop-Location
 }
 
+# The built dist ships INSIDE the installer (`bundle.resources` →
+# `<install dir>\extension`, synced to %LOCALAPPDATA%\unduhin\extension on
+# launch), so a stale or version-mismatched dist must fail the release
+# here — not silently ship to every user's machine.
+$distManifest = "extension\dist\manifest.json"
+if (-not (Test-Path $distManifest)) {
+    throw "extension/dist/manifest.json missing after build — nothing to bundle into the installer"
+}
+$distVersion = (Get-Content -Raw $distManifest | ConvertFrom-Json).version
+if ($distVersion -ne $Version) {
+    throw "extension dist version '$distVersion' does not match release version '$Version' — did bump-version.ps1 run?"
+}
+
 # 5. tauri build
 Write-Host "[6/8] cargo tauri build (NSIS + MSI)" -ForegroundColor DarkGray
 

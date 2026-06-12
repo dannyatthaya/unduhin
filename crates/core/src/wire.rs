@@ -499,6 +499,16 @@ pub enum Outbound {
         id: String,
         decision: HandoffDecision,
     },
+    /// Announces the extension version staged in the app-managed canonical
+    /// folder (`%LOCALAPPDATA%\unduhin\extension`). Sent unsolicited
+    /// as a greeting on every new pipe connection and broadcast after a
+    /// startup sync replaces the folder contents. The extension reloads
+    /// itself via `chrome.runtime.reload()` only when its running version is
+    /// strictly OLDER than `version`, so a dev running a newer local build
+    /// never enters a reconnect→greet→reload loop.
+    ExtensionUpdated {
+        version: String,
+    },
 }
 
 /// The well-known Native Messaging host name registered under
@@ -638,6 +648,15 @@ mod tests {
         let s = roundtrip(&Outbound::Ack { id: 42 });
         assert!(s.contains("\"type\": \"ack\""));
         assert!(s.contains("\"id\": 42"));
+    }
+
+    #[test]
+    fn extension_updated_roundtrip() {
+        let s = roundtrip(&Outbound::ExtensionUpdated {
+            version: "1.2.3".into(),
+        });
+        assert!(s.contains("\"type\": \"extensionUpdated\""));
+        assert!(s.contains("\"version\": \"1.2.3\""));
     }
 
     #[test]

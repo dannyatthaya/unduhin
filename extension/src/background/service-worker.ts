@@ -27,6 +27,7 @@ import {
   SETTINGS_KEY,
   toSettingsPatch,
 } from "../shared/settings.js";
+import { compareVersions } from "../shared/version.js";
 import { installHeaderCapture } from "./header-capture.js";
 import { createNativeBridge } from "./native-bridge.js";
 import type { NativeBridge } from "./native-bridge.js";
@@ -69,6 +70,10 @@ const rawBridge = createNativeBridge(
       void applyServerSettings(full);
       return;
     }
+    if (msg.type === "extensionUpdated") {
+      handleExtensionUpdated(msg.version);
+      return;
+    }
     // `handoffDecision` frames are vestigial — the app no longer drives the
     // ask-first download through the extension, so we just ignore them. They
     // stay routed here (not through the reply FIFO) via the bridge's
@@ -80,6 +85,39 @@ const rawBridge = createNativeBridge(
   // during an outage would never reach the host until the *next* edit.
   pushCurrentSettings,
 );
+
+// True once a reload is scheduled — the post-sync broadcast and the
+// connection greeting can both arrive in one session; reload once.
+let reloadScheduled = false;
+
+/** Reload window: long enough for any in-flight pipe ack to resolve,
+ *  short enough that the new version is live before the user's next
+ *  download. */
+const RELOAD_DELAY_MS = 2_000;
+
+/** The app replaced the canonical extension folder on disk. We're an
+ *  unpacked extension, so Chrome never auto-reloads us —
+ *  `chrome.runtime.reload()` re-reads the folder and boots the new
+ *  version. Strictly-older check only: a dev running a newer local build
+ *  gets greeted with the (older) bundled version on every reconnect, and
+ *  reloading then would loop forever without ever changing anything. */
+function handleExtensionUpdated(diskVersion: string): void {
+  const running = chrome.runtime.getManifest().version;
+  if (compareVersions(diskVersion, running) <= 0) {
+    log.debug(
+      `extensionUpdated: disk ${diskVersion} not newer than running ${running} — ignoring`,
+    );
+    return;
+  }
+  if (reloadScheduled) return;
+  reloadScheduled = true;
+  log.info(
+    `extension updated on disk (${running} → ${diskVersion}) — reloading in ${RELOAD_DELAY_MS}ms`,
+  );
+  setTimeout(() => {
+    chrome.runtime.reload();
+  }, RELOAD_DELAY_MS);
+}
 
 /** Push the current local settings to the host. Called on bridge
  *  (re)connect to deliver any edits made while it was disconnected. */

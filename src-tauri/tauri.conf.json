@@ -46,7 +46,8 @@
     "category": "Productivity",
     "resources": {
       "native-host/unduhin-native-host.exe": "native-host/unduhin-native-host.exe",
-      "native-host/com.unduhin.host.json": "native-host/com.unduhin.host.json"
+      "native-host/com.unduhin.host.json": "native-host/com.unduhin.host.json",
+      "../extension/dist": "extension"
     },
     "windows": {
       "nsis": {

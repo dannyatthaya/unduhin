@@ -57,17 +57,24 @@ You'll need [Rust](https://rustup.rs/) (stable, MSVC toolchain),
 ```powershell
 cargo install tauri-cli --version "^2.0" --locked
 bun install --cwd frontend
+bun install --cwd extension
+bun run --cwd extension build   # required: extension/dist ships as a bundled resource
 cargo tauri dev
 ```
 
-Build the browser extension:
+Install the browser extension (once):
 
 ```powershell
-cd extension
-bun install
-bun run build
-# chrome://extensions → enable Developer mode → Load unpacked → extension/dist
+# chrome://extensions → enable Developer mode → Load unpacked →
+#   installed builds: %LOCALAPPDATA%\unduhin\extension
+#   working in this repo: extension/dist
 ```
+
+The app maintains `%LOCALAPPDATA%\unduhin\extension` itself: every
+launch syncs the bundled extension into it, and a running extension
+reloads itself when the version changes — load it once and updates are
+automatic from then on. (If you loaded the extension from an older
+release's zip, re-load it from that folder to start getting updates.)
 
 [`CONTRIBUTING.md`](./CONTRIBUTING.md) covers the architecture, repo
 tour, and the release/packaging scripts.
@@ -80,6 +87,9 @@ tour, and the release/packaging scripts.
   `%LOCALAPPDATA%\unduhin\unduhin.db`.
 - **Logs** rotate in `%LOCALAPPDATA%\unduhin\logs\`; yt-dlp and ffmpeg
   install into `%LOCALAPPDATA%\unduhin\binaries\`.
+- **The browser extension** you Load-unpacked lives in
+  `%LOCALAPPDATA%\unduhin\extension\` — managed by the app, refreshed on
+  every launch.
 
 Uninstalling leaves `%LOCALAPPDATA%\unduhin\` in place so a reinstall
 resumes where you left off — delete it by hand to start clean.
