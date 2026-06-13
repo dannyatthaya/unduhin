@@ -275,8 +275,12 @@ if (-not $Publish) {
 Write-Host ""
 Write-Host "[8/8] publishing v$Version" -ForegroundColor DarkGray
 
-# Stage only the files bump-version.ps1 touches, so we don't accidentally
-# sweep in unrelated edits even though the pre-flight required a clean tree.
+# Stage only the files this release run regenerates (the version bump from
+# bump-version.ps1, plus the licence manifest from step 3), so we don't
+# accidentally sweep in unrelated edits even though the pre-flight required a
+# clean tree. `frontend/src/generated/licences.json` is regenerated every run
+# (its `generated_at` timestamp always changes), so it must be staged here or
+# its diff is orphaned and never committed.
 $bumpedPaths = @(
     "Cargo.toml",
     "Cargo.lock",
@@ -284,7 +288,8 @@ $bumpedPaths = @(
     "frontend/package.json",
     "frontend/package-lock.json",
     "extension/package.json",
-    "extension/manifest.json"
+    "extension/manifest.json",
+    "frontend/src/generated/licences.json"
 ) | Where-Object { Test-Path $_ }
 
 git add -- $bumpedPaths
