@@ -773,7 +773,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "cli"
-version = "1.1.6"
+version = "1.1.7"
 dependencies = [
  "anyhow",
  "clap",
@@ -1387,7 +1387,7 @@ checksum = "66b7e2430c6dff6a955451e2cfc438f09cea1965a9d6f87f7e3b90decc014099"
 
 [[package]]
 name = "engine"
-version = "1.1.6"
+version = "1.1.7"
 dependencies = [
  "anyhow",
  "bytes",
@@ -6294,7 +6294,7 @@ checksum = "756daf9b1013ebe47a8776667b466417e2d4c5679d441c26230efd9ef78692db"
 
 [[package]]
 name = "torrent"
-version = "1.1.6"
+version = "1.1.7"
 dependencies = [
  "anyhow",
  "aws-lc-sys",
@@ -6511,7 +6511,7 @@ dependencies = [
 
 [[package]]
 name = "unduhin-app"
-version = "1.1.6"
+version = "1.1.7"
 dependencies = [
  "anyhow",
  "chrono",
@@ -6543,7 +6543,7 @@ dependencies = [
 
 [[package]]
 name = "unduhin-core"
-version = "1.1.6"
+version = "1.1.7"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -6574,7 +6574,7 @@ dependencies = [
 
 [[package]]
 name = "unduhin-native-host"
-version = "1.1.6"
+version = "1.1.7"
 dependencies = [
  "anyhow",
  "serde",
