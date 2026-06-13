@@ -58,6 +58,17 @@ export interface PopupSnapshotRequest {
   readonly tabId?: number;
 }
 
+/** One selectable quality from an HLS master playlist
+ * (`#EXT-X-STREAM-INF`). `url` is absolute (resolved against the master).
+ * `label` is the human-facing pick, e.g. "720p". */
+export interface MediaVariant {
+  readonly url: string;
+  readonly height: number | null;
+  readonly resolution: string | null;
+  readonly bandwidth: number | null;
+  readonly label: string;
+}
+
 /** A media stream surfaced to the popup. Mirrors the wire `MediaStream` but
  * with `tabId` as a JS `number` (the popup never re-serialises it). */
 export interface PopupMediaStream {
@@ -66,6 +77,10 @@ export interface PopupMediaStream {
   readonly pageUrl: string | null;
   readonly tabId: number;
   readonly suggestedFilename: string | null;
+  /** Present when `manifestUrl` is an HLS master playlist: the qualities
+   * the popup offers as individual rows. Absent/empty for a plain media
+   * playlist. */
+  readonly variants?: readonly MediaVariant[];
 }
 
 /** A recent download/downloadMedia job remembered for the popup. The ring
@@ -88,6 +103,10 @@ export interface PopupDownloadMediaRequest {
   readonly kind: "popup-download-media";
   readonly tabId: number;
   readonly manifestUrl: string;
+  /** When set, `manifestUrl` is a variant URL chosen from this master
+   * playlist's quality rows. The SW validates it against the sniffed
+   * master and reuses the master's enriched headers for the variant. */
+  readonly masterUrl?: string;
 }
 
 export interface PopupDownloadMediaResponse {

@@ -33,6 +33,7 @@ import { createNativeBridge } from "./native-bridge.js";
 import type { NativeBridge } from "./native-bridge.js";
 import { installDownloadInterceptor } from "./download-interceptor.js";
 import { installMediaSniffer } from "./media-sniffer.js";
+import { loadVariants } from "./hls-master.js";
 import { installContextMenu } from "./context-menu.js";
 import { mergeStatus, readRecentJobs, recordAck } from "./recent-jobs.js";
 import { pruneTo, snapshotForWire } from "./rule-metrics.js";
@@ -180,8 +181,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
   if ("kind" in msg && msg.kind === "popup-download-media") {
-    const req = msg as { tabId: number; manifestUrl: string };
-    void handleDownloadMedia(req.tabId, req.manifestUrl).then(sendResponse);
+    const req = msg as { tabId: number; manifestUrl: string; masterUrl?: string };
+    void handleDownloadMedia(req.tabId, req.manifestUrl, req.masterUrl).then(
+      sendResponse,
+    );
     return true;
   }
   if ("kind" in msg && msg.kind === "popup-refresh-status") {
@@ -195,16 +198,38 @@ async function buildSnapshot(
   tabIdOverride: number | undefined,
 ): Promise<PopupSnapshotResponse> {
   const tabId = tabIdOverride ?? (await activeTabId());
-  const streams: PopupMediaStream[] =
-    tabId == null
-      ? []
-      : mediaSniffer.getStreamsForTab(tabId).map((s) => ({
-          kind: s.kind,
-          manifestUrl: s.manifestUrl,
-          pageUrl: s.pageUrl,
-          tabId: Number(s.tabId ?? tabId),
-          suggestedFilename: s.suggestedFilename,
-        }));
+  const sniffed = tabId == null ? [] : mediaSniffer.getStreamsForTab(tabId);
+
+  // Resolve HLS master playlists into their selectable qualities. Each
+  // fetch is bounded + cached inside `loadVariants`; a non-master (or a
+  // failed fetch) yields no variants and renders as a plain row.
+  const parsed = await Promise.all(
+    sniffed.map(async (s) => ({
+      s,
+      variants: s.kind === "hls" ? await loadVariants(s.manifestUrl) : [],
+    })),
+  );
+
+  // A master's renditions are themselves media playlists the sniffer often
+  // also caught (e.g. the one hls.js auto-selected). Collect every master's
+  // variant URLs so we can drop those twin rows — the master's quality rows
+  // already cover them.
+  const variantUrls = new Set<string>();
+  for (const p of parsed) {
+    for (const v of p.variants) variantUrls.add(v.url);
+  }
+
+  const streams: PopupMediaStream[] = parsed
+    .filter((p) => !(p.variants.length === 0 && variantUrls.has(p.s.manifestUrl)))
+    .map((p) => ({
+      kind: p.s.kind,
+      manifestUrl: p.s.manifestUrl,
+      pageUrl: p.s.pageUrl,
+      tabId: Number(p.s.tabId ?? tabId),
+      suggestedFilename: p.s.suggestedFilename,
+      ...(p.variants.length > 0 ? { variants: p.variants } : {}),
+    }));
+
   const recentJobs = await readRecentJobs();
   return {
     bridgeStatus: bridge.status(),
@@ -216,15 +241,26 @@ async function buildSnapshot(
 async function handleDownloadMedia(
   tabId: number,
   manifestUrl: string,
+  masterUrl?: string,
 ): Promise<PopupDownloadMediaResponse> {
   const streams = mediaSniffer.getStreamsForTab(tabId);
-  const target = streams.find((s) => s.manifestUrl === manifestUrl);
+
+  // A variant pick from a master playlist's quality rows: validate the
+  // master is still sniffed and the chosen variant is same-origin, then
+  // reuse the master's enriched context (cookies/UA/Referer/headers are
+  // origin-scoped, so they apply to the variant too).
+  const lookupUrl = masterUrl ?? manifestUrl;
+  const target = streams.find((s) => s.manifestUrl === lookupUrl);
   if (!target) {
     return { ok: false, error: "stream no longer available" };
+  }
+  if (masterUrl && !sameOrigin(manifestUrl, masterUrl)) {
+    return { ok: false, error: "invalid variant" };
   }
   if (!bridge.isHealthy()) {
     return { ok: false, error: "Unduhin is not running" };
   }
+
   let enriched: MediaStream;
   try {
     enriched = await mediaSniffer.enrich(target);
@@ -234,6 +270,19 @@ async function handleDownloadMedia(
       error: err instanceof Error ? err.message : String(err),
     };
   }
+
+  // Point the job at the chosen variant when one was picked.
+  if (masterUrl) {
+    enriched = { ...enriched, manifestUrl };
+  }
+
+  // Filename: the manifest tail is usually generic ("video", "playlist").
+  // When it is, prefer the page's og:title, falling back to the tab title.
+  if (isGenericName(enriched.suggestedFilename)) {
+    const title = await captureTitle(tabId);
+    if (title) enriched = { ...enriched, suggestedFilename: title };
+  }
+
   try {
     const reply = await bridge.send({ type: "downloadMedia", stream: enriched });
     if (reply.type === "error") {
@@ -245,6 +294,73 @@ async function handleDownloadMedia(
       ok: false,
       error: err instanceof Error ? err.message : String(err),
     };
+  }
+}
+
+/** Generic manifest basenames that carry no useful filename — the cue to
+ * fall back to the page title. */
+const GENERIC_NAMES = new Set([
+  "video",
+  "playlist",
+  "media",
+  "index",
+  "master",
+  "stream",
+  "chunklist",
+  "manifest",
+]);
+
+function isGenericName(name: string | null): boolean {
+  if (!name) return true;
+  return GENERIC_NAMES.has(name.trim().toLowerCase());
+}
+
+/** Read the page's og:title (most accurate), falling back to the tab
+ * title. Returns a filesystem-safe string, or null if neither is usable
+ * (e.g. a restricted page where scripting is blocked). */
+async function captureTitle(tabId: number): Promise<string | null> {
+  try {
+    const [injection] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const el = document.querySelector(
+          'meta[property="og:title"], meta[name="og:title"]',
+        );
+        return el?.getAttribute("content") ?? null;
+      },
+    });
+    const og = injection?.result;
+    if (typeof og === "string" && og.trim().length > 0) {
+      return sanitizeName(og);
+    }
+  } catch {
+    // chrome:// page, no host access, or tab gone — fall back to the title.
+  }
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.title && tab.title.trim().length > 0) return sanitizeName(tab.title);
+  } catch {
+    // tab gone — give up; the host keeps the manifest-derived name.
+  }
+  return null;
+}
+
+/** Collapse whitespace and strip characters illegal in filenames, capped
+ * to a sane length. The host re-derives the extension. */
+function sanitizeName(raw: string): string {
+  const cleaned = raw
+    .replace(/[\\/:*?"<>|]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 120);
+  return cleaned.length > 0 ? cleaned : raw.trim().slice(0, 120);
+}
+
+function sameOrigin(a: string, b: string): boolean {
+  try {
+    return new URL(a).origin === new URL(b).origin;
+  } catch {
+    return false;
   }
 }
 

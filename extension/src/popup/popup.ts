@@ -105,37 +105,72 @@ function renderMedia(streams: readonly PopupMediaStream[]): void {
   els.mediaList.hidden = false;
   els.mediaEmpty.hidden = true;
   for (const stream of streams) {
-    els.mediaList.appendChild(buildMediaRow(stream));
+    const variants = stream.variants ?? [];
+    if (variants.length > 0) {
+      // Master playlist → one row per quality, under a group label.
+      els.mediaList.appendChild(buildGroupHeader(stream));
+      for (const v of variants) {
+        els.mediaList.appendChild(
+          buildDownloadRow(v.label, v.resolution ?? stream.kind.toUpperCase(), v.url, {
+            manifestUrl: v.url,
+            masterUrl: stream.manifestUrl,
+          }),
+        );
+      }
+    } else {
+      const name =
+        stream.suggestedFilename && stream.suggestedFilename.length > 0
+          ? stream.suggestedFilename
+          : stream.manifestUrl;
+      els.mediaList.appendChild(
+        buildDownloadRow(name, stream.kind.toUpperCase(), stream.manifestUrl, {
+          manifestUrl: stream.manifestUrl,
+        }),
+      );
+    }
   }
 }
 
-function buildMediaRow(stream: PopupMediaStream): HTMLLIElement {
+function buildGroupHeader(stream: PopupMediaStream): HTMLLIElement {
+  const li = document.createElement("li");
+  li.className = "media-list__group";
+  const label =
+    stream.suggestedFilename && stream.suggestedFilename.length > 0
+      ? stream.suggestedFilename
+      : "Adaptive stream";
+  li.textContent = `${label} · ${stream.kind.toUpperCase()}`;
+  return li;
+}
+
+function buildDownloadRow(
+  name: string,
+  meta: string,
+  titleAttr: string,
+  req: { manifestUrl: string; masterUrl?: string },
+): HTMLLIElement {
   const li = document.createElement("li");
   li.className = "media-list__item";
 
   const main = document.createElement("div");
   main.className = "media-list__main";
 
-  const name = document.createElement("span");
-  name.className = "media-list__name";
-  name.textContent =
-    stream.suggestedFilename && stream.suggestedFilename.length > 0
-      ? stream.suggestedFilename
-      : stream.manifestUrl;
-  name.title = stream.manifestUrl;
+  const nameEl = document.createElement("span");
+  nameEl.className = "media-list__name";
+  nameEl.textContent = name;
+  nameEl.title = titleAttr;
 
-  const meta = document.createElement("span");
-  meta.className = "media-list__meta";
-  meta.textContent = stream.kind;
+  const metaEl = document.createElement("span");
+  metaEl.className = "media-list__meta";
+  metaEl.textContent = meta;
 
-  main.append(name, meta);
+  main.append(nameEl, metaEl);
 
   const button = document.createElement("button");
   button.type = "button";
   button.className = "button";
   button.textContent = "Download";
   button.addEventListener("click", () => {
-    void requestDownloadMedia(stream, button);
+    void requestDownloadMedia(req, button);
   });
 
   li.append(main, button);
@@ -227,7 +262,7 @@ async function requestSnapshot(
 }
 
 async function requestDownloadMedia(
-  stream: PopupMediaStream,
+  opts: { manifestUrl: string; masterUrl?: string },
   button: HTMLButtonElement,
 ): Promise<void> {
   if (currentTabId == null) {
@@ -238,7 +273,8 @@ async function requestDownloadMedia(
   const req: PopupDownloadMediaRequest = {
     kind: "popup-download-media",
     tabId: currentTabId,
-    manifestUrl: stream.manifestUrl,
+    manifestUrl: opts.manifestUrl,
+    ...(opts.masterUrl ? { masterUrl: opts.masterUrl } : {}),
   };
   try {
     const reply = (await chrome.runtime.sendMessage(
