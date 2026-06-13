@@ -45,6 +45,7 @@ const els = {
   recentEmpty: document.querySelector<HTMLParagraphElement>("#recent-empty")!,
   refreshButton: document.querySelector<HTMLButtonElement>("#refresh-button")!,
   optionsLink: document.querySelector<HTMLButtonElement>("#options-link")!,
+  version: document.querySelector<HTMLSpanElement>("#ext-version")!,
 };
 
 let currentTabId: number | null = null;
@@ -53,6 +54,7 @@ let toastTimer: ReturnType<typeof setTimeout> | null = null;
 void boot();
 
 async function boot(): Promise<void> {
+  els.version.textContent = `v${chrome.runtime.getManifest().version}`;
   els.optionsLink.addEventListener("click", () => {
     chrome.runtime.openOptionsPage();
   });

@@ -312,13 +312,33 @@ pub async fn download(
     if job.impersonate {
         cmd.arg("--extractor-args").arg("generic:impersonate");
     }
-    if let Some(ua) = job.user_agent.as_deref() {
+    // Route the captured User-Agent and Referer through yt-dlp's dedicated
+    // flags rather than `--add-header`. `--add-header User-Agent:…` is
+    // unreliable — extractors set their own UA and can override it, and a
+    // non-browser UA is exactly what trips Referer/hotlink-protection 403s.
+    // `--user-agent` / `--referer` are authoritative. A custom UA from the
+    // global `user_agent` setting still wins over the captured one.
+    let sanitized = sanitize_extra_headers(&job.extra_headers);
+    let captured_ua = sanitized
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case("user-agent"))
+        .map(|(_, v)| v.clone());
+    if let Some(ua) = job.user_agent.clone().or(captured_ua) {
         cmd.arg("--user-agent").arg(ua);
     }
-    for (name, value) in sanitize_extra_headers(&job.extra_headers) {
-        // yt-dlp accepts `--add-header NAME:VALUE`. The name is already
-        // ASCII-validated by `sanitize_extra_headers`; the value cannot
-        // contain CR/LF since that would terminate the arg.
+    if let Some((_, referer)) = sanitized
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case("referer"))
+    {
+        cmd.arg("--referer").arg(referer);
+    }
+    for (name, value) in &sanitized {
+        // User-Agent and Referer are sent via their dedicated flags above;
+        // skip them here so yt-dlp doesn't see conflicting duplicates. The
+        // name is ASCII-validated and the value CR/LF-free per `sanitize`.
+        if name.eq_ignore_ascii_case("user-agent") || name.eq_ignore_ascii_case("referer") {
+            continue;
+        }
         cmd.arg("--add-header").arg(format!("{name}:{value}"));
     }
     cmd.arg(&job.url)

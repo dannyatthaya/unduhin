@@ -239,10 +239,16 @@ body {
 
 .footer {
   display: flex;
-  justify-content: flex-end;
+  align-items: center;
+  justify-content: space-between;
   padding: 8px 14px;
   background: hsl(var(--muted));
   border-top: 1px solid hsl(var(--border));
+}
+
+.footer__version {
+  font-size: 11px;
+  color: hsl(var(--muted-foreground));
 }
 
 .toast {
