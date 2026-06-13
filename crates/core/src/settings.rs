@@ -37,6 +37,18 @@ pub mod settings_keys {
     pub const YTDLP_PROBE_TIMEOUT_MS: &str = "ytdlp_probe_timeout_ms";
     pub const YTDLP_CONSENT_ACCEPTED_AT: &str = "ytdlp_consent_accepted_at";
 
+    /// When `true`, yt-dlp downloads are launched with
+    /// `--extractor-args "generic:impersonate"`, which makes the *generic*
+    /// extractor mimic a real browser's TLS/HTTP fingerprint via curl_cffi.
+    /// This is what defeats Cloudflare's anti-bot challenge (HTTP 403) on
+    /// browser-captured HLS/DASH manifests and pasted stream URLs — header
+    /// forwarding alone can't, because the block is on the TLS handshake,
+    /// not the headers. The arg only affects the generic extractor, so
+    /// site-specific extractors (YouTube, etc.) are unchanged. Default
+    /// `true`; degrades to a warning (not a failure) if the bundled yt-dlp
+    /// lacks impersonation targets.
+    pub const YTDLP_IMPERSONATE: &str = "ytdlp_impersonate";
+
     // Installer + auto-updates + About page.
     /// Release channel: `"stable"` or `"beta"`. Selects which manifest the
     /// updater fetches.
@@ -291,7 +303,7 @@ fn validate(key: &str, value: &SettingValue) -> Result<()> {
             Ok(())
         }
         AUTOSTART | START_MINIMIZED | CONFIRM_ON_QUIT | NOTIFY_COMPLETE | NOTIFY_FAIL
-        | NOTIFY_QUEUE_EMPTY | ALWAYS_ASK_FILENAME | WATCH_CLIPBOARD => {
+        | NOTIFY_QUEUE_EMPTY | ALWAYS_ASK_FILENAME | WATCH_CLIPBOARD | YTDLP_IMPERSONATE => {
             value.as_bool().ok_or_else(|| CoreError::InvalidSetting {
                 key: key.into(),
                 message: "expected a boolean".into(),
@@ -370,6 +382,7 @@ mod tests {
             settings_keys::NOTIFY_QUEUE_EMPTY,
             settings_keys::ALWAYS_ASK_FILENAME,
             settings_keys::WATCH_CLIPBOARD,
+            settings_keys::YTDLP_IMPERSONATE,
         ] {
             assert!(validate(k, &vbool(true)).is_ok());
             assert!(validate(k, &vbool(false)).is_ok());

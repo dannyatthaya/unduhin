@@ -1198,6 +1198,16 @@ async fn run_ytdlp(
         })
         .unwrap_or_else(|| "%(title)s.%(ext)s".to_string());
 
+    // Browser impersonation toggle. Defaults to `true` when the row is
+    // absent so a fresh DB (pre-migration cache, tests) still defeats
+    // Cloudflare on captured streams.
+    let impersonate = settings::get(pool, settings::settings_keys::YTDLP_IMPERSONATE)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
     let job = YtdlpJob {
         url: info.original_url.clone(),
         format_selector: info.format_selector.clone(),
@@ -1208,6 +1218,7 @@ async fn run_ytdlp(
         user_agent,
         extra_headers: record.headers.clone().unwrap_or_default(),
         limit_rate_bps: (limit_rate_bps > 0).then_some(limit_rate_bps),
+        impersonate,
     };
 
     let parsed_url = record

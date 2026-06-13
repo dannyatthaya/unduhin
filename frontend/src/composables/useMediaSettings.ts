@@ -17,6 +17,19 @@ function typedString(key: string, fallback = ""): WritableComputedRef<string> {
   });
 }
 
+function typedBool(key: string, fallback: boolean): WritableComputedRef<boolean> {
+  const s = useSettingsStore();
+  return computed({
+    get() {
+      const v = s.values[key];
+      return typeof v === "boolean" ? v : fallback;
+    },
+    set(next) {
+      void s.set(key, next);
+    },
+  });
+}
+
 function typedNumber(
   key: string,
   fallback: number,
@@ -48,6 +61,7 @@ export function useMediaSettings() {
       min: 500,
       max: 30_000,
     }),
+    impersonate: typedBool("ytdlp_impersonate", true),
     consentAcceptedAt: typedString("ytdlp_consent_accepted_at", ""),
   };
 }

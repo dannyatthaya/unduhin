@@ -573,6 +573,8 @@
     "ytdlpDefaultFormatDesc": "yt-dlp format expression used when the formats dialog opens. bv*+ba/b is best video plus best audio, falling back to best combined.",
     "ytdlpProbeTimeout": "Probe timeout",
     "ytdlpProbeTimeoutDesc": "How long Unduhin waits for yt-dlp to recognize a pasted URL before falling through to the regular engine.",
+    "ytdlpImpersonate": "Impersonate a browser",
+    "ytdlpImpersonateDesc": "Make yt-dlp mimic a real browser's TLS fingerprint when downloading generic streams (captured HLS/DASH, pasted stream URLs). Needed to get past Cloudflare anti-bot blocks that return HTTP 403. Only affects the generic extractor, not sites like YouTube.",
     "ytdlpVersion": "Version",
     "latestPinned": "Latest pinned",
     "installingProgress": "Installing… {progress}",

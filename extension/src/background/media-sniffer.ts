@@ -116,8 +116,21 @@ export function installMediaSniffer(deps: MediaSnifferDeps): MediaSniffer {
           name: h.name,
           value: typeof h.value === "string" ? h.value : "",
         }));
+      // Forward the Referer. The native side treats `referrer` as a
+      // dedicated field and drops any `Referer` left in `requestHeaders`
+      // (see `is_prepended_header` in `wire.rs`), so a Referer that only
+      // lived in the captured headers would otherwise be lost for media
+      // captures. Pull it out of the observed request headers, falling
+      // back to the page origin (`pageUrl`/initiator) when the browser
+      // sent none.
+      const capturedReferer = requestHeaders.find(
+        (h) => h.name.toLowerCase() === "referer",
+      )?.value;
+      const referrer =
+        capturedReferer && capturedReferer.length > 0 ? capturedReferer : stream.pageUrl;
       return {
         ...stream,
+        referrer,
         cookieHeader: cookieHeader.length > 0 ? cookieHeader : null,
         userAgent:
           typeof navigator !== "undefined" && typeof navigator.userAgent === "string"

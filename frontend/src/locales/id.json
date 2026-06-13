@@ -573,6 +573,8 @@
     "ytdlpDefaultFormatDesc": "Ekspresi format yt-dlp yang dipakai saat dialog format dibuka. bv*+ba/b adalah video terbaik plus audio terbaik, jatuh ke gabungan terbaik.",
     "ytdlpProbeTimeout": "Batas waktu probe",
     "ytdlpProbeTimeoutDesc": "Berapa lama Unduhin menunggu yt-dlp mengenali URL sebelum jatuh ke mesin biasa.",
+    "ytdlpImpersonate": "Tiru browser",
+    "ytdlpImpersonateDesc": "Membuat yt-dlp meniru sidik jari TLS browser asli saat mengunduh stream generik (HLS/DASH hasil tangkapan, URL stream yang ditempel). Diperlukan untuk melewati blokir anti-bot Cloudflare yang mengembalikan HTTP 403. Hanya memengaruhi extractor generik, bukan situs seperti YouTube.",
     "ytdlpVersion": "Versi",
     "latestPinned": "Terbaru terpaku",
     "installingProgress": "Memasang… {progress}",

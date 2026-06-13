@@ -7,6 +7,7 @@ import SettingsSection from "@/components/settings/SettingsSection.vue";
 import SettingCard from "@/components/settings/SettingCard.vue";
 import SettingRow from "@/components/settings/SettingRow.vue";
 import SliderField from "@/components/settings/controls/SliderField.vue";
+import ToggleSwitch from "@/components/settings/controls/ToggleSwitch.vue";
 import Button from "@/components/ui/Button.vue";
 import Input from "@/components/ui/Input.vue";
 
@@ -141,6 +142,15 @@ function formatTimeout(ms: number): string {
         :hidden="isHidden('media/default-format')"
       >
         <Input v-model="s.defaultFormat.value" placeholder="bv*+ba/b" class="w-48" />
+      </SettingRow>
+
+      <SettingRow
+        id="media/impersonate"
+        :label="t('settings.ytdlpImpersonate')"
+        :description="t('settings.ytdlpImpersonateDesc')"
+        :hidden="isHidden('media/impersonate')"
+      >
+        <ToggleSwitch v-model="s.impersonate.value" />
       </SettingRow>
     </SettingCard>
 

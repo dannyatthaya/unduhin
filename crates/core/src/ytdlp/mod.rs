@@ -134,6 +134,14 @@ pub struct YtdlpJob {
     /// `global_speed_limit_bps` at spawn time (yt-dlp is a subprocess, so this
     /// is fixed for the run — unlike the HTTP engine's live token bucket).
     pub limit_rate_bps: Option<u64>,
+    /// When `true`, pass `--extractor-args "generic:impersonate"` so the
+    /// generic extractor mimics a real browser's TLS/HTTP fingerprint
+    /// (curl_cffi). Defeats Cloudflare's anti-bot 403 on browser-captured
+    /// HLS/DASH and pasted stream URLs — a TLS-handshake block that header
+    /// forwarding cannot fix. Scoped to the generic extractor, so
+    /// site-specific extractors are unaffected. Read from the
+    /// `ytdlp_impersonate` setting at spawn time.
+    pub impersonate: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -293,6 +301,16 @@ pub async fn download(
     // integer; `0`/`None` means no flag (unlimited).
     if let Some(bps) = job.limit_rate_bps.filter(|b| *b > 0) {
         cmd.arg("--limit-rate").arg(bps.to_string());
+    }
+    // Browser impersonation. With no explicit target yt-dlp auto-selects an
+    // available impersonation client (curl_cffi) for the generic extractor,
+    // matching a real browser's TLS/HTTP fingerprint so Cloudflare's anti-bot
+    // challenge stops returning 403. Scoped to `generic:` — site-specific
+    // extractors keep their own request logic. If the bundled yt-dlp has no
+    // impersonation support it logs a warning and continues unimpersonated,
+    // so leaving this on is safe.
+    if job.impersonate {
+        cmd.arg("--extractor-args").arg("generic:impersonate");
     }
     if let Some(ua) = job.user_agent.as_deref() {
         cmd.arg("--user-agent").arg(ua);
