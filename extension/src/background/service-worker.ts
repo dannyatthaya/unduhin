@@ -33,7 +33,8 @@ import { createNativeBridge } from "./native-bridge.js";
 import type { NativeBridge } from "./native-bridge.js";
 import { installDownloadInterceptor } from "./download-interceptor.js";
 import { installMediaSniffer } from "./media-sniffer.js";
-import { loadVariants } from "./hls-master.js";
+import { labelFor, loadVariants } from "./hls-master.js";
+import type { ProbeViaApp } from "./hls-master.js";
 import { installContextMenu } from "./context-menu.js";
 import { mergeStatus, readRecentJobs, recordAck } from "./recent-jobs.js";
 import { pruneTo, snapshotForWire } from "./rule-metrics.js";
@@ -72,7 +73,7 @@ const rawBridge = createNativeBridge(
       return;
     }
     if (msg.type === "extensionUpdated") {
-      handleExtensionUpdated(msg.version);
+      void handleExtensionUpdated(msg.version);
       return;
     }
     // `handoffDecision` frames are vestigial — the app no longer drives the
@@ -96,28 +97,82 @@ let reloadScheduled = false;
  *  download. */
 const RELOAD_DELAY_MS = 2_000;
 
+/** storage.local key remembering the disk version we last reloaded for.
+ *  Persists across `chrome.runtime.reload()` (unlike `chrome.storage.session`
+ *  and module state), which is what lets us detect a reload that didn't
+ *  take effect and avoid looping. */
+const RELOAD_MARKER_KEY = "extReloadAttemptedFor";
+
 /** The app replaced the canonical extension folder on disk. We're an
  *  unpacked extension, so Chrome never auto-reloads us —
- *  `chrome.runtime.reload()` re-reads the folder and boots the new
- *  version. Strictly-older check only: a dev running a newer local build
- *  gets greeted with the (older) bundled version on every reconnect, and
- *  reloading then would loop forever without ever changing anything. */
-function handleExtensionUpdated(diskVersion: string): void {
+ *  `chrome.runtime.reload()` re-reads the folder and boots the new version.
+ *
+ *  Reload AT MOST ONCE per disk version. The pipe server re-announces the
+ *  version on every (re)connect, so without a persisted guard a reload that
+ *  doesn't raise `running` to `diskVersion` would loop forever. That happens
+ *  whenever Chrome loaded the unpacked extension from a folder *other* than
+ *  the canonical one the app updates (`%LOCALAPPDATA%\unduhin\extension`):
+ *  the reload re-reads the stale folder and the version never moves. So if
+ *  we already tried for this exact version and we're still older, stop and
+ *  warn rather than thrash the browser.
+ *
+ *  Strictly-older check only: a dev running a newer local build gets greeted
+ *  with the (older) bundled version on every reconnect and must never reload. */
+async function handleExtensionUpdated(diskVersion: string): Promise<void> {
   const running = chrome.runtime.getManifest().version;
+
   if (compareVersions(diskVersion, running) <= 0) {
     log.debug(
       `extensionUpdated: disk ${diskVersion} not newer than running ${running} — ignoring`,
     );
+    // We're current (or newer): drop any stale marker so the next genuine
+    // upgrade can reload again.
+    await setReloadMarker(null);
     return;
   }
+
   if (reloadScheduled) return;
+
+  const attempted = await getReloadMarker();
+  if (attempted === diskVersion) {
+    log.warn(
+      `extension is still ${running} after a reload for ${diskVersion} — the browser is ` +
+        `loading a different folder than the app updates. Load-unpack the canonical ` +
+        `extension at %LOCALAPPDATA%\\unduhin\\extension. Not reloading again to avoid a loop.`,
+    );
+    return;
+  }
+
   reloadScheduled = true;
+  // Persist the attempt BEFORE reloading so the post-reload session can see
+  // it. If the reload works, the next greeting hits the "current" branch
+  // above and clears the marker.
+  await setReloadMarker(diskVersion);
   log.info(
     `extension updated on disk (${running} → ${diskVersion}) — reloading in ${RELOAD_DELAY_MS}ms`,
   );
   setTimeout(() => {
     chrome.runtime.reload();
   }, RELOAD_DELAY_MS);
+}
+
+function getReloadMarker(): Promise<string | null> {
+  return new Promise((resolve) => {
+    chrome.storage.local.get({ [RELOAD_MARKER_KEY]: null }, (items) => {
+      const v = items[RELOAD_MARKER_KEY];
+      resolve(typeof v === "string" ? v : null);
+    });
+  });
+}
+
+function setReloadMarker(version: string | null): Promise<void> {
+  return new Promise((resolve) => {
+    if (version === null) {
+      chrome.storage.local.remove(RELOAD_MARKER_KEY, () => resolve());
+    } else {
+      chrome.storage.local.set({ [RELOAD_MARKER_KEY]: version }, () => resolve());
+    }
+  });
 }
 
 /** Push the current local settings to the host. Called on bridge
@@ -194,6 +249,48 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   return undefined;
 });
 
+/** Last-resort variant source handed to `loadVariants`: ask the app to
+ *  probe the manifest with yt-dlp. Only reached once the in-page fetch and
+ *  the service-worker fetch have both failed — a restricted or closed tab,
+ *  or a CDN that rejects both — because it spawns a subprocess on the
+ *  native side and is slow relative to either fetch.
+ *
+ *  Returns `null` for anything short of a real answer (host down, error
+ *  reply, unexpected frame). `loadVariants` treats `null` as "couldn't
+ *  answer" and negative-caches it briefly, so a probe outage never
+ *  masquerades as "this stream has no qualities" — an empty array would.
+ *
+ *  `referrer` is the page the manifest was sniffed on, and it is not
+ *  optional in practice: the hotlink-protected CDNs this tier exists for
+ *  reject a request carrying no Referer regardless of impersonation.
+ *
+ *  Labels are computed here rather than on the wire — `MediaFormat`
+ *  carries no `label`, so both discovery paths format through the same
+ *  `labelFor`. */
+function makeAppProber(referrer: string | null): ProbeViaApp {
+  return async (manifestUrl) => {
+    if (!bridge.isHealthy()) return null;
+    try {
+      const reply = await bridge.send({
+        type: "probeMedia",
+        url: manifestUrl,
+        referrer,
+      });
+      if (reply.type !== "mediaFormats") return null;
+      return reply.formats.map((f) => ({
+        url: f.url,
+        height: f.height,
+        resolution: f.resolution,
+        bandwidth: f.bandwidth,
+        label: labelFor(f.height, f.bandwidth, f.resolution),
+      }));
+    } catch (err) {
+      log.debug("probeMedia failed (expected when the host is down):", err);
+      return null;
+    }
+  };
+}
+
 async function buildSnapshot(
   tabIdOverride: number | undefined,
 ): Promise<PopupSnapshotResponse> {
@@ -201,12 +298,15 @@ async function buildSnapshot(
   const sniffed = tabId == null ? [] : mediaSniffer.getStreamsForTab(tabId);
 
   // Resolve HLS master playlists into their selectable qualities. Each
-  // fetch is bounded + cached inside `loadVariants`; a non-master (or a
-  // failed fetch) yields no variants and renders as a plain row.
+  // tier is bounded + cached inside `loadVariants`; a non-master (or a
+  // failed lookup) yields no variants and renders as a plain row.
   const parsed = await Promise.all(
     sniffed.map(async (s) => ({
       s,
-      variants: s.kind === "hls" ? await loadVariants(s.manifestUrl) : [],
+      variants:
+        s.kind === "hls"
+          ? await loadVariants(s.manifestUrl, tabId, makeAppProber(s.pageUrl))
+          : [],
     })),
   );
 

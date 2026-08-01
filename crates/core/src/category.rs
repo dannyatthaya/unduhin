@@ -358,7 +358,10 @@ mod tests {
             );
         }
         let other = find_by_name(&pool, "Other").await.unwrap().unwrap();
-        assert_eq!(other.default_output_path.as_deref(), Some(downloads.as_path()));
+        assert_eq!(
+            other.default_output_path.as_deref(),
+            Some(downloads.as_path())
+        );
         let video = find_by_name(&pool, "Video").await.unwrap().unwrap();
         assert_eq!(video.default_output_path, Some(custom));
     }
@@ -386,7 +389,10 @@ mod tests {
 
         seed_default_folders(&pool).await.unwrap();
         let music = find_by_name(&pool, "Music").await.unwrap().unwrap();
-        assert_eq!(music.default_output_path, None, "cleared folder must stay cleared");
+        assert_eq!(
+            music.default_output_path, None,
+            "cleared folder must stay cleared"
+        );
     }
 
     /// Regression for the yt-dlp finalize flow: an extensionless title

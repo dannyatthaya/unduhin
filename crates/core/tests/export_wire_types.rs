@@ -16,9 +16,9 @@ use std::path::{Path, PathBuf};
 
 use ts_rs::TS;
 use unduhin_core::wire::{
-    DownloadJob, ExtensionSettings, HandoffDecision, HandoffMode, HostRule, Inbound, MediaKind,
-    MediaStream, Outbound, RequestHeader, RuleMetric, SettingsPatch, StatusEntry, TorrentJob,
-    ALLOWED_DEV_EXTENSION_ID, HOST_NAME,
+    DownloadJob, ExtensionSettings, HandoffDecision, HandoffMode, HostRule, Inbound, MediaFormat,
+    MediaKind, MediaStream, Outbound, RequestHeader, RuleMetric, SettingsPatch, StatusEntry,
+    TorrentJob, ALLOWED_DEV_EXTENSION_ID, HOST_NAME,
 };
 
 /// Build the concatenated `.d.ts` body. Order matters — referenced types
@@ -37,6 +37,7 @@ fn render() -> String {
         RequestHeader::decl(),
         MediaKind::decl(),
         MediaStream::decl(),
+        MediaFormat::decl(),
         DownloadJob::decl(),
         TorrentJob::decl(),
         StatusEntry::decl(),

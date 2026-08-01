@@ -131,6 +131,37 @@ pub struct MediaStream {
     pub request_headers: Vec<RequestHeader>,
 }
 
+/// One playable/downloadable format URL discovered for an
+/// [`Inbound::ProbeMedia`] request — the extension's Cloudflare-bypass
+/// discovery path (Phase 3). Deliberately a separate type from
+/// [`crate::ytdlp::Format`] / [`crate::ytdlp::ProbeResult`], which stay
+/// exactly as they were: this reply is internal-only, sent over the pipe
+/// to the extension, and never touches a Tauri command or
+/// `tauri-bindings.ts` — so the desktop UI's existing format picker keeps
+/// its own unrelated shape and no CDN URL leaks into a frontend binding
+/// that wasn't designed to carry one.
+///
+/// Named `MediaFormat`, NOT `MediaVariant`: `extension/src/shared/types.ts`
+/// already hand-defines its own `MediaVariant` and re-exports every
+/// `wire.d.ts` type wholesale, so a same-named export here would collide
+/// as a duplicate TS identifier and break the extension's typecheck.
+///
+/// No `label` field on purpose — computing a display label (e.g. "1080p ·
+/// 4.2 Mbps") from `height`/`bandwidth` stays single-sourced in the
+/// extension's TS, not duplicated here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-rs-export", derive(TS))]
+#[cfg_attr(feature = "ts-rs-export", ts(export, export_to = "wire.d.ts"))]
+#[serde(rename_all = "camelCase")]
+pub struct MediaFormat {
+    pub url: String,
+    #[cfg_attr(feature = "ts-rs-export", ts(type = "number | null"))]
+    pub height: Option<u32>,
+    pub resolution: Option<String>,
+    #[cfg_attr(feature = "ts-rs-export", ts(type = "number | null"))]
+    pub bandwidth: Option<u64>,
+}
+
 /// A BitTorrent download captured by the extension — a clicked
 /// `magnet:` link or a downloaded `.torrent` file. Mirrors
 /// [`DownloadJob`] but for the torrent path (design §3.E). Routed to
@@ -425,6 +456,18 @@ pub enum Inbound {
     DownloadMedia {
         stream: MediaStream,
     },
+    /// Extension asks the native side to probe a URL (typically an
+    /// HLS/DASH manifest or a Cloudflare-fronted direct-media URL) via
+    /// yt-dlp and return its playable format URLs — reusing the same
+    /// `--impersonate` + `--referer` fix Phase 1 gave the desktop
+    /// download path, so a stream that 403s the extension's own fetch
+    /// can still be resolved. `url` and `referrer` are untrusted browser
+    /// input; the pipe handler rejects anything that doesn't parse as an
+    /// `http`/`https` URL before either reaches a yt-dlp argument.
+    ProbeMedia {
+        url: String,
+        referrer: Option<String>,
+    },
     /// Browser captured a `magnet:` link or a `.torrent` file. The native
     /// side validates the untrusted payload, writes any `.torrent` bytes
     /// into the managed dir, and builds an `AddDownload { kind: Torrent,
@@ -508,6 +551,17 @@ pub enum Outbound {
     /// never enters a reconnect→greet→reload loop.
     ExtensionUpdated {
         version: String,
+    },
+    /// Reply to [`Inbound::ProbeMedia`] — the playable format URLs yt-dlp
+    /// found for the requested URL, ordered best-first (height descending,
+    /// then bandwidth descending — see [`MediaFormat`]). `formats` is
+    /// empty when yt-dlp *succeeded* but reported nothing eligible after
+    /// filtering (e.g. audio-only, or every format missing a URL) — a
+    /// genuine failure (unsupported URL, invalid `url`/`referrer`, yt-dlp
+    /// not installed, timeout, …) still comes back as
+    /// [`Outbound::Error`], not an empty list.
+    MediaFormats {
+        formats: Vec<MediaFormat>,
     },
 }
 
@@ -641,6 +695,36 @@ mod tests {
     fn status_request_roundtrip() {
         let s = roundtrip(&Inbound::Status);
         assert!(s.contains("\"type\": \"status\""));
+    }
+
+    #[test]
+    fn probe_media_roundtrip() {
+        let msg = Inbound::ProbeMedia {
+            url: "https://cdn.example.com/master.m3u8".into(),
+            referrer: Some("https://example.com/watch".into()),
+        };
+        let s = roundtrip(&msg);
+        assert!(s.contains("\"type\": \"probeMedia\""));
+        assert!(s.contains("\"url\": \"https://cdn.example.com/master.m3u8\""));
+        assert!(s.contains("\"referrer\": \"https://example.com/watch\""));
+    }
+
+    #[test]
+    fn media_formats_roundtrip() {
+        let msg = Outbound::MediaFormats {
+            formats: vec![MediaFormat {
+                url: "https://cdn.example.com/1080.m3u8".into(),
+                height: Some(1080),
+                resolution: Some("1920x1080".into()),
+                bandwidth: Some(6_000_000),
+            }],
+        };
+        let s = roundtrip(&msg);
+        assert!(s.contains("\"type\": \"mediaFormats\""));
+        assert!(s.contains("\"height\": 1080"));
+        assert!(s.contains("\"bandwidth\": 6000000"));
+        // No `label` field — that stays computed on the TS side.
+        assert!(!s.contains("\"label\""));
     }
 
     #[test]

@@ -934,8 +934,7 @@ pub(crate) async fn remove(
             {
                 if let Some(root) = torrent_state_root() {
                     let _ = tokio::fs::remove_file(root.join(format!("{info_hash}.bitv"))).await;
-                    let _ =
-                        tokio::fs::remove_file(root.join(format!("{info_hash}.torrent"))).await;
+                    let _ = tokio::fs::remove_file(root.join(format!("{info_hash}.torrent"))).await;
                 }
             }
         } else {
@@ -2123,7 +2122,10 @@ mod tests {
         // ...and leaves everything else untouched.
         assert_eq!(strip_dedup_suffix("download"), "download");
         assert_eq!(strip_dedup_suffix("file.zip"), "file.zip");
-        assert_eq!(strip_dedup_suffix("My File (final).pdf"), "My File (final).pdf");
+        assert_eq!(
+            strip_dedup_suffix("My File (final).pdf"),
+            "My File (final).pdf"
+        );
         assert_eq!(strip_dedup_suffix("song (10).flac"), "song.flac");
     }
 
@@ -2211,7 +2213,9 @@ mod tests {
         assert_eq!(p.parent(), Some(downloads.as_path()));
 
         // No category at all resolves the same way.
-        let p = resolve_output_path(&pool, "blob", &None, None).await.unwrap();
+        let p = resolve_output_path(&pool, "blob", &None, None)
+            .await
+            .unwrap();
         assert_eq!(p.parent(), Some(downloads.as_path()));
 
         // The move target used on re-categorize follows the same chain.
@@ -2254,13 +2258,23 @@ mod tests {
                 .unwrap()
         }
 
-        let broken_abs =
-            raw_row(&pool, "fg-01.bin", r"C:\WINDOWS\system32\fg-01.bin", "failed").await;
+        let broken_abs = raw_row(
+            &pool,
+            "fg-01.bin",
+            r"C:\WINDOWS\system32\fg-01.bin",
+            "failed",
+        )
+        .await;
         let broken_rel = raw_row(&pool, "fg-02.bin", "fg-02.bin", "queued").await;
         let healthy_path = downloads.join("keep.bin").to_string_lossy().into_owned();
         let healthy = raw_row(&pool, "keep.bin", &healthy_path, "failed").await;
-        let terminal =
-            raw_row(&pool, "old.bin", r"C:\WINDOWS\system32\old.bin", "completed").await;
+        let terminal = raw_row(
+            &pool,
+            "old.bin",
+            r"C:\WINDOWS\system32\old.bin",
+            "completed",
+        )
+        .await;
 
         repair_unwritable_output_paths(&pool).await.unwrap();
 
@@ -2806,15 +2820,14 @@ mod tests {
         // A media-style row left at the default 'http' kind. Use a
         // complete `MediaInfo` JSON so the (non-defensive) media_info read
         // in `record_from_row` doesn't fail when we read the row back.
-        let media_info_json =
-            serde_json::to_string(&crate::ytdlp::MediaInfo {
-                extractor: "test".to_string(),
-                format_selector: "best".to_string(),
-                title: "v".to_string(),
-                original_url: "https://x/v".to_string(),
-                needs_ffmpeg: false,
-            })
-            .unwrap();
+        let media_info_json = serde_json::to_string(&crate::ytdlp::MediaInfo {
+            extractor: "test".to_string(),
+            format_selector: "best".to_string(),
+            title: "v".to_string(),
+            original_url: "https://x/v".to_string(),
+            needs_ffmpeg: false,
+        })
+        .unwrap();
         let media_id: i64 = sqlx::query(
             "INSERT INTO downloads (url, filename, output_path, downloaded_bytes, status, \
                                     priority, segments, created_at, media_info, kind) \
@@ -2842,15 +2855,25 @@ mod tests {
         .get("id");
 
         // The migration's backfill statement, verbatim.
-        sqlx::query("UPDATE downloads SET kind = 'media' WHERE media_info IS NOT NULL AND media_info <> ''")
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE downloads SET kind = 'media' WHERE media_info IS NOT NULL AND media_info <> ''",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let media_rec = get(&pool, media_id).await.unwrap();
         let http_rec = get(&pool, http_id).await.unwrap();
-        assert_eq!(media_rec.kind, DownloadKind::Media, "media_info row upgraded");
-        assert_eq!(http_rec.kind, DownloadKind::Http, "plain http row untouched");
+        assert_eq!(
+            media_rec.kind,
+            DownloadKind::Media,
+            "media_info row upgraded"
+        );
+        assert_eq!(
+            http_rec.kind,
+            DownloadKind::Http,
+            "plain http row untouched"
+        );
     }
 
     #[tokio::test]
@@ -2992,8 +3015,8 @@ mod tests {
         let on_disk = other_dir.join(slug);
         tokio::fs::write(&on_disk, b"video bytes").await.unwrap();
         let url = format!("https://dl.fuckingfast.co/dl/{slug}");
-        let id = seed_row_with_url(&pool, &url, slug, on_disk.to_str().unwrap(), Some(other.id))
-            .await;
+        let id =
+            seed_row_with_url(&pool, &url, slug, on_disk.to_str().unwrap(), Some(other.id)).await;
 
         let renamed = apply_engine_filename(&pool, id, &url.parse().unwrap(), "clip.mp4")
             .await
@@ -3010,16 +3033,14 @@ mod tests {
         assert!(tokio::fs::metadata(&moved).await.is_ok());
         assert!(tokio::fs::metadata(&on_disk).await.is_err());
 
-        let row = sqlx::query("SELECT filename, output_path, category_id FROM downloads WHERE id = ?")
-            .bind(id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let row =
+            sqlx::query("SELECT filename, output_path, category_id FROM downloads WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(row.get::<String, _>("filename"), "clip.mp4");
-        assert_eq!(
-            row.get::<String, _>("output_path"),
-            moved.to_string_lossy()
-        );
+        assert_eq!(row.get::<String, _>("output_path"), moved.to_string_lossy());
         assert_eq!(row.get::<i64, _>("category_id"), video.id);
     }
 
@@ -3050,8 +3071,8 @@ mod tests {
         let on_disk = dir.join(slug);
         tokio::fs::write(&on_disk, b"x").await.unwrap();
         let url = format!("https://host.example/d/{slug}");
-        let id = seed_row_with_url(&pool, &url, slug, on_disk.to_str().unwrap(), Some(other.id))
-            .await;
+        let id =
+            seed_row_with_url(&pool, &url, slug, on_disk.to_str().unwrap(), Some(other.id)).await;
 
         let renamed = apply_engine_filename(&pool, id, &url.parse().unwrap(), "data.dat")
             .await
@@ -3077,14 +3098,20 @@ mod tests {
         let on_disk = tmp.path().join("My Report.pdf");
         tokio::fs::write(&on_disk, b"pdf").await.unwrap();
         let url = "https://host.example.com/d/abc123xyz";
-        let id = seed_row_with_url(&pool, url, "My Report.pdf", on_disk.to_str().unwrap(), None)
-            .await;
+        let id =
+            seed_row_with_url(&pool, url, "My Report.pdf", on_disk.to_str().unwrap(), None).await;
 
         let got = apply_engine_filename(&pool, id, &url.parse().unwrap(), "something-else.bin")
             .await
             .unwrap();
-        assert!(got.is_none(), "a deliberately-chosen name is never overridden");
-        assert!(tokio::fs::metadata(&on_disk).await.is_ok(), "file untouched");
+        assert!(
+            got.is_none(),
+            "a deliberately-chosen name is never overridden"
+        );
+        assert!(
+            tokio::fs::metadata(&on_disk).await.is_ok(),
+            "file untouched"
+        );
     }
 
     #[tokio::test]
@@ -3126,8 +3153,8 @@ mod tests {
         let on_disk = tmp.path().join(slug);
         tokio::fs::write(&on_disk, b"partial").await.unwrap();
         let url = format!("https://dl.fuckingfast.co/dl/{slug}");
-        let id = seed_row_with_url(&pool, &url, slug, on_disk.to_str().unwrap(), Some(other.id))
-            .await;
+        let id =
+            seed_row_with_url(&pool, &url, slug, on_disk.to_str().unwrap(), Some(other.id)).await;
 
         let learned = mark_learned_filename(&pool, id, &url.parse().unwrap(), "clip.mp4")
             .await
@@ -3140,13 +3167,16 @@ mod tests {
         // The file has NOT moved: still at the slug path, no clip.mp4 yet.
         assert_eq!(learned.output_path, on_disk);
         assert!(tokio::fs::metadata(&on_disk).await.is_ok());
-        assert!(tokio::fs::metadata(tmp.path().join("clip.mp4")).await.is_err());
-
-        let row = sqlx::query("SELECT filename, output_path, category_id FROM downloads WHERE id = ?")
-            .bind(id)
-            .fetch_one(&pool)
+        assert!(tokio::fs::metadata(tmp.path().join("clip.mp4"))
             .await
-            .unwrap();
+            .is_err());
+
+        let row =
+            sqlx::query("SELECT filename, output_path, category_id FROM downloads WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(row.get::<String, _>("filename"), "clip.mp4");
         // output_path still points at the working (slug) file.
         assert_eq!(
@@ -3193,8 +3223,8 @@ mod tests {
         let on_disk = other_dir.join(slug);
         tokio::fs::write(&on_disk, b"video bytes").await.unwrap();
         let url = format!("https://dl.fuckingfast.co/dl/{slug}");
-        let id = seed_row_with_url(&pool, &url, slug, on_disk.to_str().unwrap(), Some(other.id))
-            .await;
+        let id =
+            seed_row_with_url(&pool, &url, slug, on_disk.to_str().unwrap(), Some(other.id)).await;
 
         // Mid-flight: display name + category already updated, file unmoved.
         mark_learned_filename(&pool, id, &url.parse().unwrap(), "clip.mp4")
@@ -3229,7 +3259,8 @@ mod tests {
             Some("6f84758b0ddd8dc05840bf932a77935d8b5b8b93")
         );
         // Case-insensitive scheme + extra params in any order.
-        let m2 = "magnet:?tr=udp%3A%2F%2Ftracker&XT=URN:BTIH:abcdef0123456789abcdef0123456789abcdef01";
+        let m2 =
+            "magnet:?tr=udp%3A%2F%2Ftracker&XT=URN:BTIH:abcdef0123456789abcdef0123456789abcdef01";
         assert_eq!(
             info_hash_from_magnet(m2).as_deref(),
             Some("abcdef0123456789abcdef0123456789abcdef01")
@@ -3252,7 +3283,10 @@ mod tests {
             files: None,
             swarm: None,
         };
-        assert_eq!(provisional_torrent_name(Some(&magnet), &url), "My Linux ISO");
+        assert_eq!(
+            provisional_torrent_name(Some(&magnet), &url),
+            "My Linux ISO"
+        );
 
         // .torrent file → stem.
         let file = TorrentMeta {
@@ -3344,10 +3378,11 @@ mod tests {
         let second = insert(&pool, make()).await.unwrap();
         assert_eq!(first.id, second.id, "duplicate add must be a no-op");
 
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM downloads WHERE kind = 'torrent'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM downloads WHERE kind = 'torrent'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(count, 1, "only one row for the swarm");
     }
 
@@ -3403,11 +3438,10 @@ mod tests {
         // Provisional torrent row: a name with no extension auto-routes to Other.
         let id = seed_row(&pool, "magnet-provisional", Some(other.id), None).await;
 
-        let (name, cat, changed) =
-            reconcile_torrent_filename(&pool, id, "Big Buck Bunny.mp4")
-                .await
-                .unwrap()
-                .expect("a real name reconciles");
+        let (name, cat, changed) = reconcile_torrent_filename(&pool, id, "Big Buck Bunny.mp4")
+            .await
+            .unwrap()
+            .expect("a real name reconciles");
         assert_eq!(name, "Big Buck Bunny.mp4");
         assert!(changed);
         assert_eq!(cat, Some(video.id));
@@ -3535,11 +3569,12 @@ mod tests {
         };
         // Does not error and leaves the column NULL.
         persist_swarm(&pool, id, &snap).await.unwrap();
-        let torrent: Option<String> = sqlx::query_scalar("SELECT torrent FROM downloads WHERE id = ?")
-            .bind(id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let torrent: Option<String> =
+            sqlx::query_scalar("SELECT torrent FROM downloads WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert!(torrent.is_none(), "no torrent blob fabricated");
     }
 }

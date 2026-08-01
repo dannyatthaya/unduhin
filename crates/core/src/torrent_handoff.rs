@@ -333,18 +333,15 @@ mod tests {
     #[test]
     fn magnet_without_btih_is_rejected() {
         // A magnet with only a `dn=` and no xt= hash is meaningless to us.
-        let err =
-            add_download_from_torrent_job(magnet_job("magnet:?dn=NoHash"), None).unwrap_err();
+        let err = add_download_from_torrent_job(magnet_job("magnet:?dn=NoHash"), None).unwrap_err();
         assert!(matches!(err, CoreError::InvalidArgument(_)), "{err:?}");
     }
 
     #[test]
     fn non_magnet_uri_is_rejected() {
-        let err = add_download_from_torrent_job(
-            magnet_job("https://evil.example/not-a-magnet"),
-            None,
-        )
-        .unwrap_err();
+        let err =
+            add_download_from_torrent_job(magnet_job("https://evil.example/not-a-magnet"), None)
+                .unwrap_err();
         assert!(matches!(err, CoreError::InvalidArgument(_)), "{err:?}");
     }
 
@@ -390,7 +387,10 @@ mod tests {
         // The file landed under the managed dir with a content-hash name, and
         // the bytes round-trip.
         assert!(written.starts_with(dir.path()), "{written:?}");
-        assert_eq!(written.extension().and_then(|e| e.to_str()), Some("torrent"));
+        assert_eq!(
+            written.extension().and_then(|e| e.to_str()),
+            Some("torrent")
+        );
         let on_disk = std::fs::read(&written).unwrap();
         assert_eq!(on_disk, bytes);
         // The filename is pure hex — no path separators could have leaked in.
@@ -428,8 +428,7 @@ mod tests {
             suggested_filename: None,
         };
         let dir = tempfile::tempdir().unwrap();
-        let err =
-            add_download_from_torrent_job(job, Some(dir.path().to_path_buf())).unwrap_err();
+        let err = add_download_from_torrent_job(job, Some(dir.path().to_path_buf())).unwrap_err();
         assert!(matches!(err, CoreError::InvalidArgument(_)), "{err:?}");
     }
 
@@ -443,8 +442,7 @@ mod tests {
             suggested_filename: None,
         };
         let dir = tempfile::tempdir().unwrap();
-        let err =
-            add_download_from_torrent_job(job, Some(dir.path().to_path_buf())).unwrap_err();
+        let err = add_download_from_torrent_job(job, Some(dir.path().to_path_buf())).unwrap_err();
         assert!(matches!(err, CoreError::InvalidArgument(_)), "{err:?}");
     }
 
@@ -460,8 +458,7 @@ mod tests {
             suggested_filename: None,
         };
         let dir = tempfile::tempdir().unwrap();
-        let err =
-            add_download_from_torrent_job(job, Some(dir.path().to_path_buf())).unwrap_err();
+        let err = add_download_from_torrent_job(job, Some(dir.path().to_path_buf())).unwrap_err();
         assert!(matches!(err, CoreError::InvalidArgument(_)), "{err:?}");
     }
 

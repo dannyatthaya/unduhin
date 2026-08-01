@@ -565,7 +565,12 @@ pub async fn probe_media_url(
     url: String,
 ) -> CommandResult<Option<ProbeResult>> {
     use unduhin_core::ytdlp::YtdlpError;
-    match core.probe_media_url(&url).await {
+    // Command signature stays exactly as-is (no `referrer` param) so the
+    // Tauri binding / `tauri-bindings.ts` doesn't regenerate — `Core`
+    // gained the parameter for the pipe-side `ProbeMedia` path (Phase 3),
+    // but this desktop paste-a-URL dialog has no browser referrer to
+    // source one from.
+    match core.probe_media_url(&url, None).await {
         Ok(result) => Ok(Some(result)),
         Err(e @ (YtdlpError::Unsupported | YtdlpError::Timeout(_) | YtdlpError::Process { .. })) => {
             tracing::debug!(%url, error = %e, "probe_media_url: not media, falling back to HTTP engine");

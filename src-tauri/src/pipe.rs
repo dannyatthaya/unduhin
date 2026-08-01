@@ -632,6 +632,12 @@ async fn dispatch(core: &Core, msg: unduhin_core::wire::Inbound) -> unduhin_core
                 message: e.to_string(),
             },
         },
+        Inbound::ProbeMedia { url, referrer } => {
+            match handle_probe_media(core, url, referrer).await {
+                Ok(formats) => Outbound::MediaFormats { formats },
+                Err(e) => Outbound::Error { message: e },
+            }
+        }
         Inbound::DownloadTorrent { job } => match handle_download_torrent(core, job).await {
             Ok(id) => Outbound::Ack { id },
             Err(e) => Outbound::Error {
@@ -771,6 +777,46 @@ async fn handle_download_media(
         torrent: None,
     };
     core.add_download(input).await.map_err(|e| format!("{e}"))
+}
+
+/// Extension probe of a URL (typically an HLS/DASH manifest, or a
+/// Cloudflare-fronted direct-media URL the extension's own fetch 403'd
+/// on) via yt-dlp. `url` and `referrer` arrive over the pipe from the
+/// browser extension and are UNTRUSTED — both are validated as
+/// `http`/`https` URLs before either reaches a yt-dlp argument. Rejecting
+/// anything else here (rather than downstream in `ytdlp::probe_raw`)
+/// matters because both strings are passed to yt-dlp as bare CLI
+/// arguments: an absolute `http`/`https` URL can never start with `-`
+/// (the URL spec requires the scheme prefix), so requiring that scheme is
+/// what rules out a string yt-dlp's own arg parser could otherwise
+/// mistake for a flag, on top of ruling out non-network schemes like
+/// `file://` or `javascript:`.
+#[cfg(windows)]
+async fn handle_probe_media(
+    core: &Core,
+    url: String,
+    referrer: Option<String>,
+) -> Result<Vec<unduhin_core::wire::MediaFormat>, String> {
+    validate_http_url(&url).map_err(|e| format!("invalid url: {e}"))?;
+    if let Some(r) = referrer.as_deref() {
+        validate_http_url(r).map_err(|e| format!("invalid referrer: {e}"))?;
+    }
+    core.probe_media_formats(&url, referrer.as_deref())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Parse `raw` as an absolute URL and require an `http`/`https` scheme.
+/// Shared validation for [`handle_probe_media`]'s two untrusted-input
+/// fields (`url` and `referrer`) — both get the same treatment since both
+/// end up as yt-dlp CLI arguments.
+#[cfg(windows)]
+fn validate_http_url(raw: &str) -> Result<url::Url, String> {
+    let parsed = url::Url::parse(raw).map_err(|e| e.to_string())?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err(format!("unsupported scheme {:?}, expected http/https", parsed.scheme()));
+    }
+    Ok(parsed)
 }
 
 /// Extension torrent hand-off. The untrusted [`wire::TorrentJob`] (magnet URI
@@ -947,6 +993,99 @@ mod tests {
         let h = headers_from_media(&stream);
         assert_eq!(h[0], ("Cookie".into(), "s=1".into()));
         assert_eq!(h[1], ("Referer".into(), "https://x/watch".into()));
+    }
+
+    #[test]
+    fn validate_http_url_accepts_http_and_https() {
+        assert!(validate_http_url("https://cdn.example.com/master.m3u8").is_ok());
+        assert!(validate_http_url("http://cdn.example.com/master.m3u8").is_ok());
+    }
+
+    #[test]
+    fn validate_http_url_rejects_non_http_schemes() {
+        // `url` and `referrer` are untrusted browser input passed straight
+        // to yt-dlp as CLI arguments — anything other than http/https must
+        // be rejected before it gets there.
+        for bad in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "ftp://example.com/x",
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+        ] {
+            assert!(
+                validate_http_url(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_http_url_rejects_unparseable_input() {
+        // Includes the arg-injection shape a hostile extension build (or
+        // a compromised native-messaging peer) could send: a bare string
+        // starting with `-` isn't even a URL, and it must never reach
+        // `Command::arg` unvalidated regardless of *why* it's rejected.
+        for bad in ["", "not a url", "-–impersonate", "   "] {
+            assert!(
+                validate_http_url(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    /// Drives the real `dispatch -> handle_probe_media -> validate_http_url`
+    /// path (not just the unit-level `validate_http_url` above) to confirm
+    /// a hostile `url`/`referrer` never reaches `Core::probe_media_formats`
+    /// — it comes back as an `Outbound::Error`, not a panic or a yt-dlp
+    /// spawn attempt.
+    #[tokio::test]
+    async fn dispatch_probe_media_rejects_non_http_url() {
+        use unduhin_core::wire::{Inbound, Outbound};
+
+        let dir = tempfile::tempdir().unwrap();
+        let core = Core::open(dir.path().join("pipe-probe-media.db"))
+            .await
+            .unwrap();
+
+        match dispatch(
+            &core,
+            Inbound::ProbeMedia {
+                url: "file:///etc/passwd".into(),
+                referrer: None,
+            },
+        )
+        .await
+        {
+            Outbound::Error { message } => {
+                assert!(message.contains("invalid url"), "got: {message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_probe_media_rejects_non_http_referrer() {
+        use unduhin_core::wire::{Inbound, Outbound};
+
+        let dir = tempfile::tempdir().unwrap();
+        let core = Core::open(dir.path().join("pipe-probe-media-referrer.db"))
+            .await
+            .unwrap();
+
+        match dispatch(
+            &core,
+            Inbound::ProbeMedia {
+                url: "https://cdn.example.com/master.m3u8".into(),
+                referrer: Some("javascript:alert(1)".into()),
+            },
+        )
+        .await
+        {
+            Outbound::Error { message } => {
+                assert!(message.contains("invalid referrer"), "got: {message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
     }
 
     /// The `DownloadTorrent` dispatch arm is Windows-only and was once missing —

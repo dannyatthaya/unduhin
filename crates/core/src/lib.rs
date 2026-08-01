@@ -627,13 +627,28 @@ impl Core {
 
     // Media (yt-dlp / ffmpeg)
 
-    /// Probe a URL with yt-dlp and return its format catalogue, or a
-    /// typed [`ytdlp::YtdlpError`] when the URL isn't supported, yt-dlp
-    /// isn't installed, or the probe times out.
-    pub async fn probe_media_url(
+    /// Resolve the configured yt-dlp binary, the configured probe timeout,
+    /// and the user's browser-impersonation toggle. Shared by
+    /// [`probe_media_url`] and [`probe_media_formats`] so the two entry
+    /// points (`ProbeResult` for the desktop UI, `MediaFormat` for the
+    /// extension pipe) don't duplicate the binary-resolution /
+    /// settings-lookup boilerplate.
+    ///
+    /// The impersonation lookup mirrors `queue.rs`'s `YtdlpJob`
+    /// construction (identical key, identical `true` default when the row
+    /// is absent) — `download()` and the probe paths must honor the same
+    /// user-facing toggle the same way. This was previously missing here
+    /// entirely: `probe_raw` inferred impersonation from referrer presence
+    /// alone, which meant a user who explicitly disabled impersonation in
+    /// Settings → Media still got impersonated probes. Read explicitly and
+    /// passed down instead — see `ytdlp::mod`'s internal
+    /// `wants_impersonation_probe`.
+    ///
+    /// [`probe_media_url`]: Core::probe_media_url
+    /// [`probe_media_formats`]: Core::probe_media_formats
+    async fn resolve_ytdlp_for_probe(
         &self,
-        url: &str,
-    ) -> std::result::Result<ytdlp::ProbeResult, ytdlp::YtdlpError> {
+    ) -> std::result::Result<(PathBuf, std::time::Duration, bool), ytdlp::YtdlpError> {
         let binary = tooling::resolve_path(tooling::Tool::YtDlp, &self.inner.pool)
             .await
             .ok_or(ytdlp::YtdlpError::NotInstalled)?;
@@ -646,7 +661,55 @@ impl Core {
         .flatten()
         .and_then(|v| v.as_u64())
         .unwrap_or(3000);
-        ytdlp::probe(url, &binary, std::time::Duration::from_millis(timeout_ms)).await
+        let impersonate =
+            settings::get(&self.inner.pool, settings::settings_keys::YTDLP_IMPERSONATE)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+        Ok((
+            binary,
+            std::time::Duration::from_millis(timeout_ms),
+            impersonate,
+        ))
+    }
+
+    /// Probe a URL with yt-dlp and return its format catalogue, or a
+    /// typed [`ytdlp::YtdlpError`] when the URL isn't supported, yt-dlp
+    /// isn't installed, or the probe times out.
+    ///
+    /// `referrer` is forwarded to yt-dlp's `--referer` when `Some`. The
+    /// Tauri command that's the sole caller today always passes `None` —
+    /// the paste-a-URL dialog has no browser referrer to source one from.
+    /// Impersonation is read from the `ytdlp_impersonate` setting (see
+    /// [`resolve_ytdlp_for_probe`]) and requires both that setting AND a
+    /// referrer to actually be attempted — see [`ytdlp::probe`].
+    ///
+    /// [`resolve_ytdlp_for_probe`]: Core::resolve_ytdlp_for_probe
+    pub async fn probe_media_url(
+        &self,
+        url: &str,
+        referrer: Option<&str>,
+    ) -> std::result::Result<ytdlp::ProbeResult, ytdlp::YtdlpError> {
+        let (binary, timeout, impersonate) = self.resolve_ytdlp_for_probe().await?;
+        ytdlp::probe(url, &binary, timeout, referrer, impersonate).await
+    }
+
+    /// Same resolution/timeout/impersonation plumbing as
+    /// [`probe_media_url`], but returns the extension-facing
+    /// [`wire::MediaFormat`] list via [`ytdlp::probe_media_formats`]
+    /// instead of the internal [`ytdlp::ProbeResult`]. The sole caller is
+    /// the pipe server's `Inbound::ProbeMedia` handler — this
+    /// intentionally never goes through a Tauri command (see
+    /// [`wire::MediaFormat`]'s doc comment).
+    pub async fn probe_media_formats(
+        &self,
+        url: &str,
+        referrer: Option<&str>,
+    ) -> std::result::Result<Vec<wire::MediaFormat>, ytdlp::YtdlpError> {
+        let (binary, timeout, impersonate) = self.resolve_ytdlp_for_probe().await?;
+        ytdlp::probe_media_formats(url, &binary, timeout, referrer, impersonate).await
     }
 
     /// Report whether `tool` is installed and at what version.

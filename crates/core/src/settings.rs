@@ -37,16 +37,25 @@ pub mod settings_keys {
     pub const YTDLP_PROBE_TIMEOUT_MS: &str = "ytdlp_probe_timeout_ms";
     pub const YTDLP_CONSENT_ACCEPTED_AT: &str = "ytdlp_consent_accepted_at";
 
-    /// When `true`, yt-dlp downloads are launched with
-    /// `--extractor-args "generic:impersonate"`, which makes the *generic*
-    /// extractor mimic a real browser's TLS/HTTP fingerprint via curl_cffi.
-    /// This is what defeats Cloudflare's anti-bot challenge (HTTP 403) on
-    /// browser-captured HLS/DASH manifests and pasted stream URLs — header
-    /// forwarding alone can't, because the block is on the TLS handshake,
-    /// not the headers. The arg only affects the generic extractor, so
-    /// site-specific extractors (YouTube, etc.) are unchanged. Default
-    /// `true`; degrades to a warning (not a failure) if the bundled yt-dlp
-    /// lacks impersonation targets.
+    /// When `true`, yt-dlp downloads are launched with the GLOBAL
+    /// `--impersonate` flag (not `--extractor-args "generic:impersonate"`,
+    /// which only covers the generic extractor's own webpage fetch — the
+    /// m3u8 manifest and segment requests that follow still went out
+    /// unimpersonated and got 403'd). The global flag makes every request
+    /// yt-dlp makes mimic a real browser's TLS/HTTP fingerprint via
+    /// curl_cffi, which is what defeats Cloudflare's anti-bot challenge
+    /// (HTTP 403) on browser-captured HLS/DASH manifests and pasted stream
+    /// URLs — header forwarding alone can't, because the block is on the
+    /// TLS handshake, not the headers.
+    ///
+    /// Default `true`, but `ytdlp::download()` only ever passes the flag
+    /// after `ytdlp::impersonation_available()` confirms the configured
+    /// binary (`YTDLP_BINARY_PATH`, itself user-settable) actually has an
+    /// impersonation target. Unlike the extractor-args form, the global
+    /// flag is NOT a safe no-op when unsupported — yt-dlp raises before any
+    /// download starts if passed on a build without the optional
+    /// `curl_cffi` backend, so this setting alone must never be trusted to
+    /// gate the flag.
     pub const YTDLP_IMPERSONATE: &str = "ytdlp_impersonate";
 
     // Installer + auto-updates + About page.

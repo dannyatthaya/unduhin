@@ -9,6 +9,8 @@ export type MediaKind = "hls" | "dash";
 
 export type MediaStream = { kind: MediaKind, manifestUrl: string, pageUrl: string | null, tabId: number | null, suggestedFilename: string | null, referrer: string | null, userAgent: string | null, cookieHeader: string | null, requestHeaders: Array<RequestHeader>, };
 
+export type MediaFormat = { url: string, height: number | null, resolution: string | null, bandwidth: number | null, };
+
 export type DownloadJob = { 
 /**
  * URL after the browser followed redirects.
@@ -95,7 +97,7 @@ export type ExtensionSettings = { enabled: boolean, nativeHostName: string, minS
 
 export type SettingsPatch = { enabled: boolean | null, nativeHostName: string | null, minSizeMb: number | null, extensionAllowlist: Array<string> | null, extensionBlocklist: Array<string> | null, blockedHosts: Array<HostRule> | null, alwaysInterceptHosts: Array<HostRule> | null, detectHls: boolean | null, detectDash: boolean | null, verboseLogging: boolean | null, mode: HandoffMode | null, installContextMenu: boolean | null, hideShelf: boolean | null, forwardCookies: boolean | null, fileTypes: Array<string> | null, };
 
-export type Inbound = { "type": "ping" } | { "type": "download", job: DownloadJob, } | { "type": "downloadMedia", stream: MediaStream, } | { "type": "downloadTorrent", job: TorrentJob, } | { "type": "status" } | { "type": "getSettings" } | { "type": "setSettings", patch: SettingsPatch, } | { "type": "askHandoff", 
+export type Inbound = { "type": "ping" } | { "type": "download", job: DownloadJob, } | { "type": "downloadMedia", stream: MediaStream, } | { "type": "probeMedia", url: string, referrer: string | null, } | { "type": "downloadTorrent", job: TorrentJob, } | { "type": "status" } | { "type": "getSettings" } | { "type": "setSettings", patch: SettingsPatch, } | { "type": "askHandoff", 
 /**
  * Extension-generated correlation token. Echoed back on the
  * matching `HandoffDecision`. UUID-ish in practice; opaque to
@@ -103,7 +105,7 @@ export type Inbound = { "type": "ping" } | { "type": "download", job: DownloadJo
  */
 id: string, job: DownloadJob, } | { "type": "ruleMetrics", metrics: Array<RuleMetric>, };
 
-export type Outbound = { "type": "pong" } | { "type": "ack", id: number, } | { "type": "status", downloads: Array<StatusEntry>, } | { "type": "error", message: string, } | { "type": "settings", full: ExtensionSettings, } | { "type": "settingsChanged", full: ExtensionSettings, } | { "type": "handoffDecision", id: string, decision: HandoffDecision, } | { "type": "extensionUpdated", version: string, };
+export type Outbound = { "type": "pong" } | { "type": "ack", id: number, } | { "type": "status", downloads: Array<StatusEntry>, } | { "type": "error", message: string, } | { "type": "settings", full: ExtensionSettings, } | { "type": "settingsChanged", full: ExtensionSettings, } | { "type": "handoffDecision", id: string, decision: HandoffDecision, } | { "type": "extensionUpdated", version: string, } | { "type": "mediaFormats", formats: Array<MediaFormat>, };
 
 export const HOST_NAME = "com.unduhin.host" as const;
 export const ALLOWED_DEV_EXTENSION_ID = "blbgjagjodpiiclpecohlfhebgddkejn" as const;

@@ -9,6 +9,8 @@
 
 use serde::Deserialize;
 
+use crate::wire::MediaFormat;
+
 use super::{Format, ProbeResult};
 
 #[derive(Debug, Deserialize, Default)]
@@ -47,6 +49,14 @@ pub(super) struct RawFormat {
     pub format_id: Option<String>,
     #[serde(default)]
     pub ext: Option<String>,
+    /// The actual fetchable media URL for this format (segment/manifest
+    /// URL for HLS/DASH, direct file URL otherwise). Deliberately never
+    /// surfaced on the public [`Format`] type — only consumed by
+    /// [`RawInfo::into_media_formats`] for the extension-facing
+    /// `Outbound::MediaFormats` reply, which is a distinct wire path from
+    /// `ProbeResult`/`Format` (see [`MediaFormat`]'s doc comment).
+    #[serde(default)]
+    pub url: Option<String>,
     #[serde(default)]
     pub width: Option<u32>,
     #[serde(default)]
@@ -112,21 +122,22 @@ impl RawInfo {
             recommended_audio_only,
         }
     }
+
+    /// Lift into the browser-extension-facing [`MediaFormat`] list used by
+    /// `Outbound::MediaFormats`. A separate mapping from [`into_probe`]
+    /// (not an extra field bolted onto [`ProbeResult`]/[`Format`]) — see
+    /// [`MediaFormat`]'s doc comment for why the two shapes are kept
+    /// deliberately apart.
+    ///
+    /// [`into_probe`]: RawInfo::into_probe
+    pub(super) fn into_media_formats(self) -> Vec<MediaFormat> {
+        media_formats_from_raw(&self.formats)
+    }
 }
 
 impl Format {
     pub(super) fn from_raw(raw: RawFormat) -> Self {
-        let resolution = raw
-            .resolution
-            .clone()
-            .or_else(|| match (raw.width, raw.height) {
-                (Some(w), Some(h)) => Some(format!("{w}x{h}")),
-                (None, Some(h)) => Some(format!("{h}p")),
-                _ => match raw.vcodec.as_deref() {
-                    Some("none") | None if raw.acodec.is_some() => Some("audio only".to_string()),
-                    _ => None,
-                },
-            });
+        let resolution = derive_resolution(&raw);
         Self {
             format_id: raw.format_id.unwrap_or_default(),
             ext: raw.ext.unwrap_or_default(),
@@ -139,6 +150,71 @@ impl Format {
             note: raw.format_note,
         }
     }
+}
+
+/// Shared by [`Format::from_raw`] and [`media_formats_from_raw`] so the
+/// resolution-string derivation (explicit `resolution` field, else
+/// `width`x`height`, else `{height}p`, else "audio only" for an
+/// audio-only format with neither) lives in exactly one place.
+fn derive_resolution(raw: &RawFormat) -> Option<String> {
+    raw.resolution
+        .clone()
+        .or_else(|| match (raw.width, raw.height) {
+            (Some(w), Some(h)) => Some(format!("{w}x{h}")),
+            (None, Some(h)) => Some(format!("{h}p")),
+            _ => match raw.vcodec.as_deref() {
+                Some("none") | None if raw.acodec.is_some() => Some("audio only".to_string()),
+                _ => None,
+            },
+        })
+}
+
+/// Filter/dedupe/sort raw yt-dlp formats into the [`MediaFormat`] list the
+/// extension's discovery popup renders — mirroring the extension's own
+/// manifest-sniffed ordering (height descending, then bandwidth
+/// descending) so a URL discovered via this in-app probe and one
+/// discovered by the extension's own HLS/DASH sniffer present identically.
+///
+/// - Formats with no `url` are dropped — yt-dlp's `--dump-single-json`
+///   can emit entries (storyboard/thumbnail tracks, some subtitle-only
+///   rows) that aren't independently fetchable as media.
+/// - Audio-only formats (`vcodec == "none"`) are dropped — this reply
+///   feeds the extension's "download this video" picker, not a
+///   standalone audio-extraction surface.
+/// - Duplicate URLs are deduped, keeping the first-seen entry (yt-dlp's
+///   own array ordering).
+fn media_formats_from_raw(formats: &[RawFormat]) -> Vec<MediaFormat> {
+    let mut seen_urls = std::collections::HashSet::new();
+    let mut out: Vec<MediaFormat> = formats
+        .iter()
+        .filter(|f| f.vcodec.as_deref() != Some("none"))
+        .filter_map(|f| {
+            let url = f.url.clone()?;
+            if !seen_urls.insert(url.clone()) {
+                return None;
+            }
+            Some(MediaFormat {
+                url,
+                height: f.height,
+                resolution: derive_resolution(f),
+                // yt-dlp's `tbr` is total bitrate in kbps; `bandwidth`
+                // mirrors the bits/sec unit of an HLS manifest's
+                // `EXT-X-STREAM-INF:BANDWIDTH` attribute, which is what
+                // the extension's own sniffed formats carry — keeping the
+                // unit consistent is what makes the descending sort below
+                // actually comparable across the two discovery paths.
+                bandwidth: f.tbr.map(|kbps| (kbps.max(0.0) * 1000.0).round() as u64),
+            })
+        })
+        .collect();
+
+    out.sort_by(|a, b| {
+        b.height
+            .unwrap_or(0)
+            .cmp(&a.height.unwrap_or(0))
+            .then(b.bandwidth.unwrap_or(0).cmp(&a.bandwidth.unwrap_or(0)))
+    });
+    out
 }
 
 fn is_video_only(f: &RawFormat) -> bool {
@@ -332,5 +408,108 @@ mod tests {
         assert_eq!(probe.extractor, "tiktok");
         assert!(probe.formats.is_empty());
         assert!(probe.recommended_video_audio.is_none());
+    }
+
+    // --- into_media_formats / media_formats_from_raw -------------------
+
+    #[test]
+    fn media_formats_drops_entries_with_no_url() {
+        let json = r#"{
+            "extractor": "generic",
+            "title": "t",
+            "formats": [
+                {"format_id": "no-url", "vcodec": "avc1", "acodec": "aac", "height": 720},
+                {"format_id": "has-url", "vcodec": "avc1", "acodec": "aac", "height": 480,
+                 "url": "https://cdn.example.com/480.m3u8"}
+            ]
+        }"#;
+        let raw: RawInfo = serde_json::from_str(json).unwrap();
+        let formats = raw.into_media_formats();
+        assert_eq!(formats.len(), 1);
+        assert_eq!(formats[0].url, "https://cdn.example.com/480.m3u8");
+    }
+
+    #[test]
+    fn media_formats_drops_audio_only() {
+        let json = r#"{
+            "extractor": "generic",
+            "title": "t",
+            "formats": [
+                {"format_id": "video", "vcodec": "avc1", "acodec": "aac", "height": 720,
+                 "url": "https://cdn.example.com/720.m3u8"},
+                {"format_id": "audio", "vcodec": "none", "acodec": "aac",
+                 "url": "https://cdn.example.com/audio.m3u8"}
+            ]
+        }"#;
+        let raw: RawInfo = serde_json::from_str(json).unwrap();
+        let formats = raw.into_media_formats();
+        assert_eq!(formats.len(), 1);
+        assert_eq!(formats[0].url, "https://cdn.example.com/720.m3u8");
+    }
+
+    #[test]
+    fn media_formats_dedupes_by_url_keeping_first_seen() {
+        let json = r#"{
+            "extractor": "generic",
+            "title": "t",
+            "formats": [
+                {"format_id": "first", "vcodec": "avc1", "acodec": "aac", "height": 1080,
+                 "url": "https://cdn.example.com/same.m3u8"},
+                {"format_id": "second", "vcodec": "avc1", "acodec": "aac", "height": 2160,
+                 "url": "https://cdn.example.com/same.m3u8"}
+            ]
+        }"#;
+        let raw: RawInfo = serde_json::from_str(json).unwrap();
+        let formats = raw.into_media_formats();
+        assert_eq!(formats.len(), 1);
+        // First-seen (1080p) wins, not the later 2160p duplicate.
+        assert_eq!(formats[0].height, Some(1080));
+    }
+
+    #[test]
+    fn media_formats_sorts_by_height_then_bandwidth_descending() {
+        let json = r#"{
+            "extractor": "generic",
+            "title": "t",
+            "formats": [
+                {"format_id": "low", "vcodec": "avc1", "acodec": "aac", "height": 360, "tbr": 500.0,
+                 "url": "https://cdn.example.com/360.m3u8"},
+                {"format_id": "high-bitrate", "vcodec": "avc1", "acodec": "aac", "height": 1080,
+                 "tbr": 6000.0, "url": "https://cdn.example.com/1080-high.m3u8"},
+                {"format_id": "low-bitrate", "vcodec": "avc1", "acodec": "aac", "height": 1080,
+                 "tbr": 3000.0, "url": "https://cdn.example.com/1080-low.m3u8"}
+            ]
+        }"#;
+        let raw: RawInfo = serde_json::from_str(json).unwrap();
+        let formats = raw.into_media_formats();
+        let urls: Vec<&str> = formats.iter().map(|f| f.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            vec![
+                "https://cdn.example.com/1080-high.m3u8",
+                "https://cdn.example.com/1080-low.m3u8",
+                "https://cdn.example.com/360.m3u8",
+            ]
+        );
+        // tbr (kbps) is converted to bandwidth (bits/sec): 6000 kbps -> 6_000_000.
+        assert_eq!(formats[0].bandwidth, Some(6_000_000));
+    }
+
+    #[test]
+    fn media_formats_no_label_field_and_matches_resolution_derivation() {
+        // Resolution derivation reuses the same helper `Format::from_raw`
+        // uses, so a format with no explicit `resolution` string still
+        // gets a sensible one here.
+        let json = r#"{
+            "extractor": "generic",
+            "title": "t",
+            "formats": [
+                {"format_id": "v", "vcodec": "avc1", "acodec": "aac", "width": 1280, "height": 720,
+                 "url": "https://cdn.example.com/720.m3u8"}
+            ]
+        }"#;
+        let raw: RawInfo = serde_json::from_str(json).unwrap();
+        let formats = raw.into_media_formats();
+        assert_eq!(formats[0].resolution.as_deref(), Some("1280x720"));
     }
 }

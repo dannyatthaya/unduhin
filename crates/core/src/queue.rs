@@ -90,7 +90,9 @@ impl TorrentEngineCell {
 /// override it at `run` time. Session JSON + fastresume live in the managed
 /// `<app_data>/torrents` dir (design §3.D), distinct from content so resume
 /// state survives content moves.
-async fn build_torrent_config(pool: &SqlitePool) -> Result<torrent::TorrentConfig, engine::EngineError> {
+async fn build_torrent_config(
+    pool: &SqlitePool,
+) -> Result<torrent::TorrentConfig, engine::EngineError> {
     // Session-default content dir: `torrent_download_dir`, else the global
     // default, else the user's Downloads folder (never the CWD — that is
     // `C:\WINDOWS\system32` when the app autostarts with Windows). This is
@@ -749,10 +751,8 @@ async fn run_worker(
                                     });
                                 }
                                 if category_changed {
-                                    let _ = pump_events.send(CoreEvent::CategoryChanged {
-                                        id,
-                                        category_id,
-                                    });
+                                    let _ = pump_events
+                                        .send(CoreEvent::CategoryChanged { id, category_id });
                                 }
                             }
                             Ok(None) => {}
@@ -1595,7 +1595,10 @@ mod tests {
             "movie.mp4",
             Some("text/html; charset=utf-8"),
         ));
-        assert!(r.is_some(), "HTML body for a non-HTML target must be rejected");
+        assert!(
+            r.is_some(),
+            "HTML body for a non-HTML target must be rejected"
+        );
         assert!(r.unwrap().contains("HTML"));
     }
 

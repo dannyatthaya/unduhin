@@ -448,10 +448,12 @@ fn parse_sha256sums(body: &str, asset_name: &str) -> Option<String> {
 /// Lowercase-hex encode a byte slice (digest output).
 fn to_hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
-    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
-        let _ = write!(s, "{b:02x}");
-        s
-    })
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
 }
 
 /// Search a zip archive for the first entry whose path ends with
@@ -548,7 +550,10 @@ mod tests {
     #[test]
     fn parse_digest_accepts_sha256_only() {
         let hex = "a".repeat(64);
-        assert_eq!(parse_digest(&format!("sha256:{hex}")).as_deref(), Some(hex.as_str()));
+        assert_eq!(
+            parse_digest(&format!("sha256:{hex}")).as_deref(),
+            Some(hex.as_str())
+        );
         assert_eq!(parse_digest(&format!("SHA256:{hex}")), None); // case-sensitive prefix
         assert_eq!(parse_digest("sha512:deadbeef"), None);
         assert_eq!(parse_digest("sha256:tooshort"), None);

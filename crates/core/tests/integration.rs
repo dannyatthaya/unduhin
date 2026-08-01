@@ -120,8 +120,7 @@ async fn handle(
         }
         // 200 OK with an HTML interstitial where a file was expected.
         "/landing" => {
-            let html =
-                b"<!doctype html><html><body>click to download</body></html>".to_vec();
+            let html = b"<!doctype html><html><body>click to download</body></html>".to_vec();
             return Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header(CONTENT_TYPE, "text/html; charset=utf-8")
@@ -1007,7 +1006,10 @@ async fn extension_torrent_job_lands_a_torrent_row() -> Result<()> {
     };
     let dup_input = unduhin_core::torrent_handoff::add_download_from_torrent_job(dup_job, None)?;
     let dup_id = core.add_download(dup_input).await?;
-    assert_eq!(dup_id, id, "duplicate magnet add should return the existing row");
+    assert_eq!(
+        dup_id, id,
+        "duplicate magnet add should return the existing row"
+    );
 
     core.shutdown().await?;
     Ok(())

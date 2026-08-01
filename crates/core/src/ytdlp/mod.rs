@@ -1,11 +1,15 @@
 //! Thin async wrapper around the `yt-dlp` external binary.
 //!
-//! Two entry points:
+//! Three entry points:
 //!
 //! - [`probe`] — invokes `yt-dlp --dump-single-json` against a URL,
 //!   waits for the JSON, and lifts it into a [`ProbeResult`]. Short
 //!   default timeout (3 s) so a pasted direct-file URL isn't slowed
 //!   down on its way to the engine path.
+//! - [`probe_media_formats`] — same subprocess call as `probe` (shares
+//!   its internals via `probe_raw`), but lifts the result into the
+//!   browser extension-facing [`crate::wire::MediaFormat`] list instead.
+//!   Internal-only / pipe-only: never exposed as a Tauri command.
 //! - [`download`] — invokes `yt-dlp` with `--progress-template` and
 //!   streams parsed [`progress::Tick`] events onto the supplied engine
 //!   broadcast channel, so a yt-dlp download is indistinguishable from
@@ -19,9 +23,11 @@
 //! subprocess wiring is exercised manually and through integration
 //! tests that ship a stub yt-dlp binary.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, SystemTime};
 
 use engine::{CancellationToken, ProgressEvent};
 use serde::{Deserialize, Serialize};
@@ -134,13 +140,16 @@ pub struct YtdlpJob {
     /// `global_speed_limit_bps` at spawn time (yt-dlp is a subprocess, so this
     /// is fixed for the run — unlike the HTTP engine's live token bucket).
     pub limit_rate_bps: Option<u64>,
-    /// When `true`, pass `--extractor-args "generic:impersonate"` so the
-    /// generic extractor mimics a real browser's TLS/HTTP fingerprint
-    /// (curl_cffi). Defeats Cloudflare's anti-bot 403 on browser-captured
-    /// HLS/DASH and pasted stream URLs — a TLS-handshake block that header
-    /// forwarding cannot fix. Scoped to the generic extractor, so
-    /// site-specific extractors are unaffected. Read from the
-    /// `ytdlp_impersonate` setting at spawn time.
+    /// When `true` AND [`impersonation_available`] confirms the binary has
+    /// at least one impersonation target, `download()` passes the GLOBAL
+    /// `--impersonate` flag so every request yt-dlp makes — including the
+    /// m3u8 manifest and segment fetches that follow the initial page
+    /// load, not just the generic extractor's own webpage fetch — mimics a
+    /// real browser's TLS/HTTP fingerprint (curl_cffi). That's what
+    /// defeats Cloudflare's anti-bot 403 on browser-captured HLS/DASH and
+    /// pasted stream URLs; header forwarding alone can't, because the
+    /// block is on the TLS handshake. Read from the `ytdlp_impersonate`
+    /// setting at spawn time.
     pub impersonate: bool,
 }
 
@@ -172,31 +181,82 @@ pub enum YtdlpError {
     Io(#[from] std::io::Error),
 }
 
-/// Run `yt-dlp --dump-single-json` against `url`. Returns a [`ProbeResult`]
-/// when the URL is recognized, or a typed error variant otherwise.
+/// Whether `probe_raw` should even attempt the (async, subprocess-spawning)
+/// impersonation-availability check. Pure/sync so it's unit-testable
+/// without a real yt-dlp binary — the actual availability check still has
+/// to happen separately since it requires spawning a process.
+///
+/// Gated on the user's `ytdlp_impersonate` setting alone, deliberately
+/// matching `download()`, which gates on the identical setting via
+/// `job.impersonate` (see `queue.rs`'s `YtdlpJob` construction). Probe and
+/// download must agree: a user who turned the setting off gets an
+/// unimpersonated probe, full stop, and one who left it on gets the same
+/// treatment at probe time that the subsequent download will use.
+///
+/// Notably NOT gated on referrer presence. An earlier version required a
+/// referrer too, on the reasoning that impersonation without one still
+/// 403s a Cloudflare-fronted host. That's true of *that* host, but it made
+/// the flag unreachable for the app's own paste-a-URL flow, which has no
+/// referring page — so pasting a link from a host gated on TLS
+/// fingerprint alone (no Referer check) failed at the probe step even
+/// though the download that followed would have impersonated fine.
+/// Referer forwarding and impersonation are independent defences; apply
+/// each whenever it's available rather than making one contingent on the
+/// other.
+fn wants_impersonation_probe(impersonate: bool) -> bool {
+    impersonate
+}
+
+/// Spawn `yt-dlp --dump-single-json` against `url` and return the parsed
+/// (but not yet lifted) payload. Shared by [`probe`] (→ [`ProbeResult`])
+/// and [`probe_media_formats`] (→ [`crate::wire::MediaFormat`]) so the
+/// subprocess wiring — timeout, referrer/impersonation gating — isn't
+/// duplicated between the two public entry points.
+///
+/// `impersonate` is the caller-resolved value of the user's
+/// `ytdlp_impersonate` setting — see [`wants_impersonation_probe`] for why
+/// it's a required, explicit input rather than something this function
+/// infers from `referrer`.
 ///
 /// `timeout_duration` caps the whole probe (subprocess spawn + stdout
 /// drain). Default callers should pass a few seconds — the user is
 /// waiting on the formats dialog when this is called.
-pub async fn probe(
+async fn probe_raw(
     url: &str,
     binary_path: &Path,
     timeout_duration: Duration,
-) -> Result<ProbeResult, YtdlpError> {
+    referrer: Option<&str>,
+    impersonate: bool,
+) -> Result<wire::RawInfo, YtdlpError> {
     if !binary_exists(binary_path).await {
         return Err(YtdlpError::NotInstalled);
     }
 
     let url_string = url.to_string();
+    let referrer_string = referrer.map(|r| r.to_string());
     let binary = binary_path.to_path_buf();
     let task = async move {
+        // The availability probe is itself a subprocess spawn, so skip it
+        // entirely when the setting already says no.
+        let should_impersonate = if wants_impersonation_probe(impersonate) {
+            impersonation_available(&binary).await
+        } else {
+            false
+        };
+
         let mut cmd = Command::new(&binary);
         cmd.arg("--dump-single-json")
             .arg("--no-warnings")
             .arg("--no-playlist")
             .arg("--no-call-home")
-            .arg("--skip-download")
-            .arg(&url_string)
+            .arg("--skip-download");
+        if let Some(referrer) = referrer_string.as_deref() {
+            cmd.arg("--referer").arg(referrer);
+        }
+        for arg in impersonate_args(should_impersonate) {
+            cmd.arg(arg);
+        }
+        cmd.arg(&url_string)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -213,24 +273,77 @@ pub async fn probe(
         }
         let raw: wire::RawInfo =
             serde_json::from_slice(&output.stdout).map_err(|e| YtdlpError::Parse(e.to_string()))?;
-        let probe = raw.into_probe(&url_string);
-        // yt-dlp's generic extractor matches almost any HTTP(S) URL and
-        // returns metadata scraped from OG/HTML tags, so an ordinary web
-        // page comes back as a "successful" probe with no downloadable
-        // formats. Treat that as not-media (`Unsupported`) so callers fall
-        // back to a plain HTTP download instead of opening the media/format
-        // dialog for every pasted link. A real media site always reports at
-        // least one format, so this never suppresses genuine matches.
-        if probe.extractor == "generic" && probe.formats.is_empty() {
-            return Err(YtdlpError::Unsupported);
-        }
-        Ok(probe)
+        Ok(raw)
     };
 
     match timeout(timeout_duration, task).await {
         Ok(result) => result,
         Err(_) => Err(YtdlpError::Timeout(timeout_duration)),
     }
+}
+
+/// Run `yt-dlp --dump-single-json` against `url`. Returns a [`ProbeResult`]
+/// when the URL is recognized, or a typed error variant otherwise.
+///
+/// `referrer` is `None` for every existing caller today (pasted-URL probe
+/// has no browser context to source one from). `impersonate` should be
+/// the caller's resolved `ytdlp_impersonate` setting — see
+/// [`wants_impersonation_probe`] for why it's required explicitly rather
+/// than inferred from `referrer`.
+pub async fn probe(
+    url: &str,
+    binary_path: &Path,
+    timeout_duration: Duration,
+    referrer: Option<&str>,
+    impersonate: bool,
+) -> Result<ProbeResult, YtdlpError> {
+    let raw = probe_raw(url, binary_path, timeout_duration, referrer, impersonate).await?;
+    let probe = raw.into_probe(url);
+    // yt-dlp's generic extractor matches almost any HTTP(S) URL and
+    // returns metadata scraped from OG/HTML tags, so an ordinary web
+    // page comes back as a "successful" probe with no downloadable
+    // formats. Treat that as not-media (`Unsupported`) so callers fall
+    // back to a plain HTTP download instead of opening the media/format
+    // dialog for every pasted link. A real media site always reports at
+    // least one format, so this never suppresses genuine matches.
+    if probe.extractor == "generic" && probe.formats.is_empty() {
+        return Err(YtdlpError::Unsupported);
+    }
+    Ok(probe)
+}
+
+/// Probe `url` the same way [`probe`] does, but return the browser
+/// extension-facing [`crate::wire::MediaFormat`] list instead of the
+/// internal [`ProbeResult`]/[`Format`] shape. A separate entry point
+/// rather than an extra field on `ProbeResult` — see [`crate::wire::MediaFormat`]'s
+/// doc comment for why the two shapes are kept apart (internal-only
+/// mapping: no Tauri command, no CDN URL reaching the desktop frontend).
+///
+/// Used by the pipe server's `Inbound::ProbeMedia` handler so a user
+/// pasting a Cloudflare-fronted stream URL into the *extension* gets the
+/// same 403 fix Phase 1 gave the desktop download path.
+///
+/// Unlike [`probe`], this does NOT apply the "generic extractor + no
+/// formats ⇒ `Unsupported`" fallback: a yt-dlp exit that's genuinely a
+/// failure (unsupported URL, timeout, process error, …) still propagates
+/// as an `Err` here exactly like it does from `probe`, but a *successful*
+/// probe with an empty (or entirely audio-only / URL-less, post-filter)
+/// format list just yields `Ok(vec![])` — there's no `ProbeResult` for
+/// callers to fall back to inspecting here, so there's nothing to gain by
+/// forcing that case into a typed error instead of an empty list.
+///
+/// `impersonate` should be the caller's resolved `ytdlp_impersonate`
+/// setting — see [`wants_impersonation_probe`] for why it's required
+/// explicitly rather than inferred from `referrer`.
+pub async fn probe_media_formats(
+    url: &str,
+    binary_path: &Path,
+    timeout_duration: Duration,
+    referrer: Option<&str>,
+    impersonate: bool,
+) -> Result<Vec<crate::wire::MediaFormat>, YtdlpError> {
+    let raw = probe_raw(url, binary_path, timeout_duration, referrer, impersonate).await?;
+    Ok(raw.into_media_formats())
 }
 
 /// Spawn yt-dlp to actually fetch a previously-probed URL. Progress is
@@ -302,15 +415,33 @@ pub async fn download(
     if let Some(bps) = job.limit_rate_bps.filter(|b| *b > 0) {
         cmd.arg("--limit-rate").arg(bps.to_string());
     }
-    // Browser impersonation. With no explicit target yt-dlp auto-selects an
-    // available impersonation client (curl_cffi) for the generic extractor,
-    // matching a real browser's TLS/HTTP fingerprint so Cloudflare's anti-bot
-    // challenge stops returning 403. Scoped to `generic:` — site-specific
-    // extractors keep their own request logic. If the bundled yt-dlp has no
-    // impersonation support it logs a warning and continues unimpersonated,
-    // so leaving this on is safe.
-    if job.impersonate {
-        cmd.arg("--extractor-args").arg("generic:impersonate");
+    // Browser impersonation via the GLOBAL `--impersonate` flag — NOT
+    // `--extractor-args "generic:impersonate"`, which only impersonates the
+    // generic extractor's own webpage fetch. The m3u8 manifest and segment
+    // requests that follow still went out on yt-dlp's normal networking
+    // stack and got 403'd by Cloudflare's bot management; verified A/B
+    // against a real Cloudflare-fronted URL with identical `--referer`.
+    //
+    // Unlike the extractor-args form, the global flag is NOT a safe no-op
+    // when the binary lacks impersonation support: yt-dlp raises
+    // `YoutubeDLError` inside `YoutubeDL.__init__` — before any download
+    // starts — when `--impersonate` is passed but no `curl_cffi`-backed
+    // request handler is registered (verified against yt-dlp source: the
+    // `impersonate` param import into `YoutubeDL.__init__` calls
+    // `_impersonate_target_available`, which is `False` when no
+    // `ImpersonateRequestHandler` exists, and that raises immediately).
+    // `impersonation_available()` runs `--list-impersonate-targets` first
+    // and only this branch passes the flag — required because
+    // `ytdlp_binary_path` (settings.rs) is user-settable, so the bundled
+    // build having curl_cffi is no guarantee for every run.
+    //
+    // No explicit target (`--impersonate ""`) — auto-selects among
+    // whatever's available rather than hardcoding a client/version that
+    // ages out; verified this parses correctly as two separate args (the
+    // empty string doesn't get swallowed as a value for a later flag).
+    let should_impersonate = job.impersonate && impersonation_available(&job.binary_path).await;
+    for arg in impersonate_args(should_impersonate) {
+        cmd.arg(arg);
     }
     // Route the captured User-Agent and Referer through yt-dlp's dedicated
     // flags rather than `--add-header`. `--add-header User-Agent:…` is
@@ -559,6 +690,236 @@ async fn binary_exists(path: &Path) -> bool {
     tokio::fs::metadata(path).await.is_ok()
 }
 
+/// Cache key for [`impersonation_available`]: the binary path plus a
+/// coarse content fingerprint (mtime + size), not the path alone.
+///
+/// `ytdlp_binary_path` ([`crate::settings::settings_keys::YTDLP_BINARY_PATH`])
+/// is user-settable, so keying by path alone was already required to
+/// avoid conflating two different configured binaries. But the path is
+/// also NOT stable content: `Core::install_tool` performs an in-place
+/// yt-dlp update by overwriting the same fixed `managed_dir()` path (see
+/// `tooling.rs`'s `install` / `resolve_path`), so a user who updates
+/// yt-dlp from Settings → Media keeps the exact same `PathBuf` the cache
+/// is keyed by. Without the fingerprint, a build cached as "no targets"
+/// before an update would silently stay cached as "no targets" for the
+/// rest of the process even after updating to a build that has them —
+/// reintroducing the 403s this phase exists to fix, now with no error to
+/// debug. Including mtime+size means an updated binary naturally misses
+/// the cache and gets re-probed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ImpersonateCacheKey {
+    path: PathBuf,
+    modified: SystemTime,
+    len: u64,
+}
+
+/// Per-binary-fingerprint cache for [`impersonation_available`]. See
+/// [`ImpersonateCacheKey`] for why the key is more than just the path.
+static IMPERSONATE_CACHE: OnceLock<Mutex<HashMap<ImpersonateCacheKey, bool>>> = OnceLock::new();
+
+/// The cache's `Mutex`, recovering from poisoning instead of propagating
+/// the panic. A panic elsewhere while this lock happened to be held
+/// should not permanently wedge every future download's impersonation
+/// check — degrading to "treat the cache as empty and re-probe" is a far
+/// smaller blast radius than a poisoned lock taking down the download
+/// path for the rest of the process.
+fn impersonate_cache() -> &'static Mutex<HashMap<ImpersonateCacheKey, bool>> {
+    IMPERSONATE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// How long [`impersonation_available`] waits for
+/// `--list-impersonate-targets` before giving up. This is a fast, purely
+/// local metadata query (no network), so a couple of seconds is generous
+/// — but it still needs *some* bound: `download()` awaits this on the hot
+/// path for the first download against a given binary, and a hung yt-dlp
+/// process (corrupt/partial binary, antivirus real-time-scanning the exe,
+/// a network filesystem stall) would otherwise wedge the queue worker
+/// with no error surfaced. Mirrors the same defensive shape as
+/// [`probe`]'s subprocess timeout, just with a fixed constant instead of
+/// a caller-supplied duration — this call has no user-facing "how long
+/// should this wait" knob to plumb through.
+const IMPERSONATE_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Whether `binary_path` has at least one available browser-impersonation
+/// target, i.e. was built with the optional `curl_cffi` backend.
+///
+/// This gates whether `download()` may pass the global `--impersonate`
+/// flag. That flag is NOT a safe no-op when unsupported: passing it on a
+/// build with no impersonation-capable request handler makes yt-dlp raise
+/// `YoutubeDLError` inside `YoutubeDL.__init__`, before any download
+/// attempt — a hard failure, not a warning (verified against yt-dlp
+/// source: `_impersonate_target_available` returns `False` when no
+/// `ImpersonateRequestHandler` is registered, and `__init__` raises on
+/// that). Only `--extractor-args generic:impersonate` degrades gracefully
+/// to a warning; the global flag does not, which is exactly why this
+/// module stopped using the extractor-args form.
+///
+/// Result is cached for the process lifetime, keyed by path + content
+/// fingerprint — see [`ImpersonateCacheKey`]. Reading the file's metadata
+/// to build the key doubles as the "binary exists" check: a missing file
+/// returns `false` immediately without ever spawning a process.
+pub async fn impersonation_available(binary_path: &Path) -> bool {
+    let Ok(meta) = tokio::fs::metadata(binary_path).await else {
+        return false;
+    };
+    let key = ImpersonateCacheKey {
+        path: binary_path.to_path_buf(),
+        modified: meta.modified().unwrap_or(std::time::UNIX_EPOCH),
+        len: meta.len(),
+    };
+
+    let cache = impersonate_cache();
+    if let Some(cached) = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&key)
+    {
+        return *cached;
+    }
+
+    let available = probe_impersonation_targets(binary_path, IMPERSONATE_PROBE_TIMEOUT).await;
+
+    cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key, available);
+    available
+}
+
+/// Run `yt-dlp --list-impersonate-targets` and report whether it lists at
+/// least one genuinely available target. Never propagates an error — a
+/// missing binary, non-zero exit, timeout, or unparseable output all mean
+/// "no impersonation", which is the safe default (see
+/// [`impersonation_available`] for why passing `--impersonate` without
+/// confirming this first is unsafe).
+///
+/// `timeout_duration` is a parameter (rather than always reading
+/// [`IMPERSONATE_PROBE_TIMEOUT`] directly) so tests can exercise the
+/// timeout path with a short duration instead of waiting out the real
+/// production value.
+async fn probe_impersonation_targets(binary_path: &Path, timeout_duration: Duration) -> bool {
+    if !binary_exists(binary_path).await {
+        return false;
+    }
+    let mut cmd = Command::new(binary_path);
+    cmd.arg("--list-impersonate-targets")
+        .arg("--no-warnings")
+        .arg("--no-update")
+        // If the timeout below fires, the `cmd.output()` future is
+        // dropped mid-await; `kill_on_drop` is what turns that drop into
+        // an actual process kill instead of leaving a hung yt-dlp running
+        // in the background.
+        .kill_on_drop(true)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(target_os = "windows")]
+    {
+        cmd.creation_flags(0x0800_0000);
+    }
+    let output = match timeout(timeout_duration, cmd.output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(_)) | Err(_) => return false,
+    };
+    if !output.status.success() {
+        return false;
+    }
+    parse_impersonate_targets(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Parse `yt-dlp --list-impersonate-targets` stdout. Returns `true` iff at
+/// least one row represents a genuinely available target.
+///
+/// Real output (yt-dlp 2026.03.17) looks like:
+///
+/// ```text
+/// [info] Available impersonate targets
+/// Client        OS           Source
+/// ------------------------------------
+/// Chrome-136    Macos-15     curl_cffi
+/// Safari-17.2   Ios-17.2     curl_cffi
+/// ```
+///
+/// Critically, yt-dlp *always* renders the full table, even when
+/// curl_cffi is entirely missing: it still lists a row for every
+/// well-known client (Chrome, Safari, Firefox, Edge, Tor), tagging each
+/// unavailable one with `(unavailable)` in the Source column instead of
+/// omitting the row. So a naive "any data row present" check would report
+/// `true` on a build with zero real impersonation support — exactly the
+/// build [`impersonation_available`] exists to detect. Only rows WITHOUT
+/// `(unavailable)` count.
+fn parse_impersonate_targets(stdout: &str) -> bool {
+    let lines: Vec<String> = stdout
+        .lines()
+        .map(|line| strip_ansi(line).trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect();
+
+    // Require the table's own header/separator shape before trusting any
+    // row as data. This is what rejects a Python traceback or an
+    // unrelated error message: such text has no "Client ... Source"
+    // header immediately followed by a dashed separator, so it never
+    // reaches the row-counting step below. Anchoring on structure (not
+    // just "no '(unavailable)' substring") is what keeps garbage/error
+    // output from being misread as an available target.
+    let Some(header_idx) = lines
+        .iter()
+        .position(|line| line.starts_with("Client") && line.contains("Source"))
+    else {
+        return false;
+    };
+    let Some(separator) = lines.get(header_idx + 1) else {
+        return false;
+    };
+    if separator.is_empty() || !separator.chars().all(|c| c == '-') {
+        return false;
+    }
+
+    lines[header_idx + 2..]
+        .iter()
+        .any(|line| !line.contains("(unavailable)"))
+}
+
+/// Strip ANSI SGR escape sequences (`\x1b[...m`). yt-dlp only emits color
+/// when stdout is a TTY, and ours is always a piped `Stdio`, so this is a
+/// no-op in practice — kept defensive rather than load-bearing, since
+/// nothing here should crash if that assumption ever changes.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for c2 in chars.by_ref() {
+                if c2.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Pure decision for the `--impersonate` args `download()` should append,
+/// given that impersonation should be used — i.e. the job requested it
+/// AND [`impersonation_available`] confirmed a target exists. Split out
+/// from the surrounding `Command`-building so this decision is
+/// unit-testable without spawning a real yt-dlp process.
+///
+/// No explicit target (`--impersonate` followed by an empty-string arg,
+/// equivalent to `--impersonate=""`) so yt-dlp auto-selects among
+/// whatever's available rather than hardcoding a client/version that ages
+/// out of the bundled curl_cffi's supported list.
+fn impersonate_args(should_impersonate: bool) -> Vec<String> {
+    if should_impersonate {
+        vec!["--impersonate".to_string(), String::new()]
+    } else {
+        Vec::new()
+    }
+}
+
 fn emit(tx: Option<&broadcast::Sender<ProgressEvent>>, ev: ProgressEvent) {
     if let Some(tx) = tx {
         let _ = tx.send(ev);
@@ -775,5 +1136,345 @@ mod tests {
         tokio::fs::write(&part, b"x").await.unwrap();
         let resolved = resolve_final_path_fallback(&queued).await;
         assert!(resolved.is_none(), "expected None, got {resolved:?}");
+    }
+
+    // --- impersonation gating -----------------------------------------
+
+    #[test]
+    fn impersonate_args_present_when_should_impersonate() {
+        let args = impersonate_args(true);
+        assert_eq!(args, vec!["--impersonate".to_string(), String::new()]);
+        // The old per-extractor form must never come back — it's what
+        // silently left manifest/segment requests unimpersonated.
+        assert!(!args.iter().any(|a| a.contains("generic:impersonate")));
+    }
+
+    #[test]
+    fn impersonate_args_absent_when_not_should_impersonate() {
+        // Covers both "available but toggle off" and "toggle on but
+        // unavailable" — both collapse to `should_impersonate = false`
+        // before reaching this function, which is the point of gating in
+        // `download()` rather than here.
+        assert!(impersonate_args(false).is_empty());
+    }
+
+    /// Real `--list-impersonate-targets` output captured from the bundled
+    /// yt-dlp.exe (2026.03.17) via
+    /// `yt-dlp --list-impersonate-targets --no-warnings --no-update`.
+    const POPULATED_TARGETS_OUTPUT: &str = "\
+[info] Available impersonate targets
+Client        OS           Source
+------------------------------------
+Chrome-133    Macos-15     curl_cffi
+Chrome-136    Macos-15     curl_cffi
+Safari-17.2   Ios-17.2     curl_cffi
+Edge-99       Windows-10   curl_cffi
+";
+
+    #[test]
+    fn parse_impersonate_targets_true_for_populated_table() {
+        assert!(parse_impersonate_targets(POPULATED_TARGETS_OUTPUT));
+    }
+
+    #[test]
+    fn parse_impersonate_targets_false_for_empty_output() {
+        assert!(!parse_impersonate_targets(""));
+        assert!(!parse_impersonate_targets("\n\n  \n"));
+    }
+
+    #[test]
+    fn parse_impersonate_targets_false_when_every_row_is_unavailable() {
+        // yt-dlp always renders the full known-clients table, even with
+        // zero curl_cffi support — missing targets get a row tagged
+        // `(unavailable)` in the Source column rather than being omitted.
+        // This is the exact shape a build with no impersonation backend
+        // produces (traced through yt-dlp's `__init__.py`
+        // `list_impersonate_targets` handling: `known_targets` are
+        // inserted with `f'{known_handler} (unavailable)'` whenever no
+        // matching entry exists in `available_targets`). A naive
+        // "any data row present" check would wrongly report available
+        // here.
+        let output = "\
+[info] Available impersonate targets
+Client    OS    Source
+------------------------------------
+Chrome    -     curl_cffi (unavailable)
+Safari    -     curl_cffi (unavailable)
+Firefox   -     curl_cffi>=0.10 (unavailable)
+Edge      -     curl_cffi (unavailable)
+Tor       -     curl_cffi>=0.11 (unavailable)
+";
+        assert!(!parse_impersonate_targets(output));
+    }
+
+    #[test]
+    fn parse_impersonate_targets_false_for_garbage_or_error_output() {
+        assert!(!parse_impersonate_targets(
+            "Traceback (most recent call last):\n  File ...\n"
+        ));
+        assert!(!parse_impersonate_targets(
+            "ERROR: something unrelated failed\n"
+        ));
+        // Header + separator with no data rows at all.
+        assert!(!parse_impersonate_targets(
+            "[info] Available impersonate targets\nClient    OS    Source\n------\n"
+        ));
+    }
+
+    #[tokio::test]
+    async fn impersonation_available_returns_false_for_missing_binary() {
+        // No real subprocess involved — `binary_exists` short-circuits
+        // before any spawn, so this doubles as the "missing binary never
+        // crashes" case.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist.exe");
+        assert!(!impersonation_available(&missing).await);
+    }
+
+    // `Command::new` can spawn a `.cmd` script directly on Windows (no
+    // `cmd /c` wrapper needed — verified manually), which is what lets
+    // these two tests fake a yt-dlp binary's behavior without needing a
+    // real yt-dlp install. Gated to Windows since that mechanism is
+    // platform-specific and every caller of this module already runs on
+    // Windows in practice.
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn probe_impersonation_targets_times_out_instead_of_hanging() {
+        // Simulates a hung yt-dlp process — corrupt/partial binary,
+        // antivirus real-time-scanning the exe, a network filesystem
+        // stall — any of which would otherwise block `download()`'s
+        // first call for a given binary path forever. The script spins
+        // forever via `goto` rather than shelling out to a sleep/ping
+        // command: a real hung yt-dlp.exe is a single process, and a
+        // `goto`-loop keeps this test that way too — no child process
+        // means nothing can outlive `kill_on_drop`'s `TerminateProcess`
+        // call on the direct child. (An earlier version of this test used
+        // `ping -n 30`, which cmd.exe runs as a child process; Windows
+        // doesn't cascade-kill children, so the orphaned `ping.exe`
+        // wouldn't stop, and it inherits a duplicate handle to our piped
+        // stdout — that inherited handle alone was enough to stall tokio
+        // runtime shutdown for the pipe read to actually observe EOF,
+        // making the *test* hang for the ping's full duration even though
+        // the probe itself returned in ~200ms. Not a production bug, just
+        // a bad test double.)
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("hangs.cmd");
+        tokio::fs::write(&script, "@echo off\r\n:loop\r\ngoto loop\r\n")
+            .await
+            .unwrap();
+
+        let start = std::time::Instant::now();
+        let available = probe_impersonation_targets(&script, Duration::from_millis(200)).await;
+        assert!(!available);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "expected the 200ms timeout to fire well before the script's infinite loop, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn impersonation_available_reprobes_after_binary_is_updated_in_place() {
+        // `Core::install_tool` updates yt-dlp by overwriting the SAME
+        // fixed `managed_dir()` path (see `tooling.rs`'s `install` /
+        // `resolve_path`), so a path-only cache key would keep serving a
+        // stale verdict across an in-app update. Simulate exactly that:
+        // probe a "no targets" fake binary at `path` (caches `false`),
+        // then overwrite the SAME path in place with a "has targets" fake
+        // binary and probe again.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fake-yt-dlp.cmd");
+
+        tokio::fs::write(&path, "@echo off\r\necho no impersonate targets\r\n")
+            .await
+            .unwrap();
+        assert!(
+            !impersonation_available(&path).await,
+            "old build should report unavailable"
+        );
+
+        // The sleep plus a deliberately different content length means
+        // the mtime+size fingerprint changes regardless of the
+        // filesystem's mtime resolution.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::fs::write(
+            &path,
+            "@echo off\r\n\
+             echo [info] Available impersonate targets\r\n\
+             echo Client        OS           Source\r\n\
+             echo ------------------------------------\r\n\
+             echo Chrome-136    Macos-15     curl_cffi\r\n",
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            impersonation_available(&path).await,
+            "updated build must be re-probed, not served the stale cached `false`"
+        );
+    }
+
+    // --- probe() / probe_media_formats() impersonation gating ----------
+
+    #[test]
+    fn wants_impersonation_probe_follows_the_setting_alone() {
+        // Regression case one: setting off must be `false` even when a
+        // referrer is present — an early version inferred impersonation
+        // from referrer presence alone and silently overrode the setting.
+        assert!(!wants_impersonation_probe(false));
+        // Regression case two: setting on must be `true` with no referrer
+        // in play — a later version required a referrer too, which made
+        // the flag unreachable for the app's referrer-less paste-a-URL
+        // flow. This now matches `download()`, which gates on the setting
+        // alone via `job.impersonate`.
+        assert!(wants_impersonation_probe(true));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn probe_media_formats_omits_impersonate_flag_when_setting_is_off_even_with_referrer() {
+        // End-to-end regression test (not just the pure decision function
+        // above): drives the real `probe_media_formats` -> `probe_raw`
+        // path against a fake yt-dlp binary that records its own argv,
+        // with a referrer present but `impersonate: false`. Before the
+        // fix, referrer presence alone was enough to trigger the
+        // availability probe and append `--impersonate` — silently
+        // overriding a user who turned the setting off.
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake-yt-dlp.cmd");
+        let captured = dir.path().join("captured_args.txt");
+        tokio::fs::write(
+            &script,
+            format!(
+                "@echo off\r\n\
+                 echo %* > \"{}\"\r\n\
+                 echo {{\"extractor\":\"generic\",\"title\":\"t\",\"formats\":[]}}\r\n",
+                captured.display()
+            ),
+        )
+        .await
+        .unwrap();
+
+        let formats = probe_media_formats(
+            "https://cdn.example.com/master.m3u8",
+            &script,
+            Duration::from_secs(5),
+            Some("https://example.com/watch"), // referrer IS present
+            false,                             // ytdlp_impersonate setting is OFF
+        )
+        .await
+        .unwrap();
+        assert!(formats.is_empty());
+
+        let args = tokio::fs::read_to_string(&captured).await.unwrap();
+        assert!(
+            !args.contains("--impersonate"),
+            "impersonate=false must suppress the flag even with a referrer present, got args: {args}"
+        );
+        // Referer forwarding is independent of impersonation and must
+        // still happen.
+        assert!(args.contains("--referer"), "got args: {args}");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn probe_media_formats_includes_impersonate_flag_when_setting_on_and_referrer_present() {
+        // Positive counterpart to the test above, against the same fake
+        // binary shape — confirms the fix doesn't just always suppress
+        // the flag, it correctly re-enables it when both factors hold.
+        // The fake binary also answers `--list-impersonate-targets` with
+        // a populated table so `impersonation_available` reports true.
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake-yt-dlp.cmd");
+        let captured = dir.path().join("captured_args.txt");
+        tokio::fs::write(
+            &script,
+            format!(
+                "@echo off\r\n\
+                 echo %1 | findstr /C:\"--list-impersonate-targets\" >NUL\r\n\
+                 if %ERRORLEVEL% EQU 0 (\r\n\
+                 echo [info] Available impersonate targets\r\n\
+                 echo Client        OS           Source\r\n\
+                 echo ------------------------------------\r\n\
+                 echo Chrome-136    Macos-15     curl_cffi\r\n\
+                 ) else (\r\n\
+                 echo %* > \"{}\"\r\n\
+                 echo {{\"extractor\":\"generic\",\"title\":\"t\",\"formats\":[]}}\r\n\
+                 )\r\n",
+                captured.display()
+            ),
+        )
+        .await
+        .unwrap();
+
+        let formats = probe_media_formats(
+            "https://cdn.example.com/master.m3u8",
+            &script,
+            Duration::from_secs(5),
+            Some("https://example.com/watch"),
+            true, // ytdlp_impersonate setting is ON
+        )
+        .await
+        .unwrap();
+        assert!(formats.is_empty());
+
+        let args = tokio::fs::read_to_string(&captured).await.unwrap();
+        assert!(args.contains("--impersonate"), "got args: {args}");
+        assert!(args.contains("--referer"), "got args: {args}");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn probe_media_formats_impersonates_with_no_referrer_when_setting_is_on() {
+        // The app's own paste-a-URL flow has no referring page, so it
+        // probes with `referrer: None`. An earlier version additionally
+        // required a referrer before impersonating, which made the flag
+        // unreachable here — pasting a link from a host gated on TLS
+        // fingerprint alone failed at the probe step even though the
+        // download that followed would have impersonated fine.
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake-yt-dlp.cmd");
+        let captured = dir.path().join("captured_args.txt");
+        tokio::fs::write(
+            &script,
+            format!(
+                "@echo off\r\n\
+                 echo %1 | findstr /C:\"--list-impersonate-targets\" >NUL\r\n\
+                 if %ERRORLEVEL% EQU 0 (\r\n\
+                 echo [info] Available impersonate targets\r\n\
+                 echo Client        OS           Source\r\n\
+                 echo ------------------------------------\r\n\
+                 echo Chrome-136    Macos-15     curl_cffi\r\n\
+                 ) else (\r\n\
+                 echo %* > \"{}\"\r\n\
+                 echo {{\"extractor\":\"generic\",\"title\":\"t\",\"formats\":[]}}\r\n\
+                 )\r\n",
+                captured.display()
+            ),
+        )
+        .await
+        .unwrap();
+
+        let formats = probe_media_formats(
+            "https://cdn.example.com/master.m3u8",
+            &script,
+            Duration::from_secs(5),
+            None, // no referring page — the paste-a-URL case
+            true, // ytdlp_impersonate setting is ON
+        )
+        .await
+        .unwrap();
+        assert!(formats.is_empty());
+
+        let args = tokio::fs::read_to_string(&captured).await.unwrap();
+        assert!(
+            args.contains("--impersonate"),
+            "setting on must impersonate even with no referrer, got args: {args}"
+        );
+        assert!(
+            !args.contains("--referer"),
+            "no referrer supplied, so none must be forwarded, got args: {args}"
+        );
     }
 }
