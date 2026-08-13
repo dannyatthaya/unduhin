@@ -204,6 +204,8 @@ pub fn run() {
             commands::install_tool,
             commands::record_update_check,
             commands::get_logs_dir,
+            commands::get_temporary_data_size,
+            commands::clear_temporary_data,
             commands::confirm_quit_response,
             commands::quit_app,
             commands::list_schedules,

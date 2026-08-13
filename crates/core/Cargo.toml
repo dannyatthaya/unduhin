@@ -45,10 +45,14 @@ ts-rs-export = ["dep:ts-rs"]
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # DPAPI (CryptProtectData / CryptUnprotectData) for encrypting captured
-# browser headers at rest. Match the version the Tauri shell already pins.
+# browser headers at rest, plus job objects for killing the whole yt-dlp
+# process tree (see `ytdlp::ProcessTreeGuard`). Match the version the
+# Tauri shell already pins.
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security_Cryptography",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
 ] }
 
 [dev-dependencies]

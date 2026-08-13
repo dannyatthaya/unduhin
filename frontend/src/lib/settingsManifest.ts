@@ -99,6 +99,15 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
     keywords: ["i18n", "translation", "locale"],
     route: SECTION_ROUTES.general,
   },
+  {
+    section: "general",
+    id: "general/clear-temp-data",
+    label: "Temporary data",
+    description:
+      "Delete leftover partial files from downloads that no longer exist.",
+    keywords: ["temp", "cache", "cleanup", "scratch", "part", "disk space"],
+    route: SECTION_ROUTES.general,
+  },
 
   // -- Categories ----------------------------------------------------------
   {

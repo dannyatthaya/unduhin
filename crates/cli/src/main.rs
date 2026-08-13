@@ -578,6 +578,10 @@ fn spawn_progress_bar(mut rx: broadcast::Receiver<ProgressEvent>) -> tokio::task
                 // drives HTTP downloads only and never receives these; ignore
                 // them so the match stays exhaustive.
                 Ok(ProgressEvent::SwarmProgress { .. } | ProgressEvent::FileProgress { .. }) => {}
+                // yt-dlp-only (design §3.C). The CLI drives HTTP downloads
+                // only and never receives it; ignore so the match stays
+                // exhaustive.
+                Ok(ProgressEvent::PostProcessing) => {}
                 Ok(ProgressEvent::FilenameLearned { hint }) => {
                     // The CLI is given an explicit output path, so the learned
                     // name doesn't rename anything here; surface it on the bar.

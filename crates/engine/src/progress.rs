@@ -69,6 +69,23 @@ pub enum ProgressEvent {
         speed_bps: f64,
         eta: Option<Duration>,
     },
+    /// The transfer's bytes are all on disk and a post-processing step
+    /// (an ffmpeg mux / remux / fixup) has started. Fires at most once per
+    /// run, and only from the yt-dlp path.
+    ///
+    /// **Charter exception (design §5 Q9)** — same rationale as
+    /// [`ProgressEvent::SwarmProgress`]: `core`'s single progress pump is
+    /// shared by every backend, so the yt-dlp driver reports through this
+    /// vocabulary rather than a second event path. The HTTP and torrent
+    /// paths never emit it.
+    ///
+    /// This exists because the pump used to *infer* post-processing from a
+    /// drop in the byte counter, which misfires on any fragmented (HLS /
+    /// DASH) transfer whose counter legitimately regresses — a fragment
+    /// retry or a resumed run was enough to strand a still-downloading row
+    /// on "Merging audio + video…". yt-dlp tells us directly via its
+    /// `postprocess:` progress template; take it at its word.
+    PostProcessing,
     /// Final success — `bytes` is the total written.
     Completed { bytes: u64 },
     /// Final failure. Stringified because broadcast requires `Clone`.

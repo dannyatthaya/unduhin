@@ -234,14 +234,31 @@ const errorLine = computed(() => {
   return `${props.download.error}`;
 });
 
+/** Statuses that a pause can stop. `muxing` is included deliberately —
+ *  see `Core::pause`: without it a row that reaches the merge phase has
+ *  no way out but deletion. */
+const PAUSABLE = ["active", "queued", "muxing"] as const;
+
+const isPausable = computed(() =>
+  (PAUSABLE as readonly string[]).includes(props.download.status),
+);
+
 async function togglePauseResume() {
-  if (props.download.status === "active" || props.download.status === "queued") {
-    await store.pause(props.download.id);
-  } else if (
-    props.download.status === "paused" ||
-    props.download.status === "failed"
-  ) {
-    await store.resume(props.download.id);
+  const status = props.download.status;
+  // The backend rejects an out-of-order transition with
+  // `InvalidTransition`. That used to reject silently — an unhandled
+  // promise rejection and a button that visibly did nothing.
+  try {
+    if ((PAUSABLE as readonly string[]).includes(status)) {
+      await store.pause(props.download.id);
+    } else if (status === "paused" || status === "failed") {
+      await store.resume(props.download.id);
+    }
+  } catch (e: unknown) {
+    toast.push(
+      (e as { message?: string })?.message ?? t("downloads.actionFailed"),
+      "error",
+    );
   }
 }
 
@@ -340,10 +357,13 @@ const menuItems = computed(() => {
       break;
     case "active":
     case "queued":
-      items.push({ label: t("downloads.menuPause"), onSelect: () => store.pause(props.download.id) });
+    // Pause is offered mid-merge too. It kills the ffmpeg doing the
+    // merge and resume re-runs it from the intermediates yt-dlp still
+    // has — worth it, because Remove was previously the only way out of
+    // a row that got stuck on `muxing`.
+    case "muxing":
+      items.push({ label: t("downloads.menuPause"), onSelect: () => void togglePauseResume() });
       break;
-    // `muxing` has no specific action — you can't pause mid-merge, and there's
-    // no cancel; the Remove item appended below is the only way to stop it.
     case "paused":
       items.push({ label: t("downloads.menuResume"), onSelect: () => store.resume(props.download.id) });
       break;
@@ -472,18 +492,14 @@ const menuItems = computed(() => {
             <Folder class="h-4 w-4" />
           </Button>
         </template>
-        <template
-          v-else-if="
-            download.status !== 'cancelled' && download.status !== 'muxing'
-          "
-        >
+        <template v-else-if="download.status !== 'cancelled'">
           <Button
             size="icon"
             variant="ghost"
-            :title="download.status === 'paused' || download.status === 'queued' ? t('downloads.rowResume') : t('downloads.rowPause')"
+            :title="isPausable ? t('downloads.rowPause') : t('downloads.rowResume')"
             @click="togglePauseResume"
           >
-            <Pause v-if="download.status === 'active'" class="h-4 w-4" />
+            <Pause v-if="isPausable" class="h-4 w-4" />
             <Play v-else class="h-4 w-4" />
           </Button>
         </template>

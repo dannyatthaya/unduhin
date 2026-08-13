@@ -160,6 +160,23 @@ pub fn get_logs_dir() -> Option<String> {
     unduhin_core::logging::logs_dir().map(|p| p.to_string_lossy().into_owned())
 }
 
+/// Bytes sitting in yt-dlp scratch directories that no download still
+/// owns. Drives the "you'll free about this much" figure on the
+/// Settings → General → *Clear temporary data* row.
+#[tauri::command]
+pub async fn get_temporary_data_size(core: State<'_, Core>) -> CommandResult<u64> {
+    Ok(core.temporary_data_size().await?)
+}
+
+/// Delete orphaned yt-dlp scratch directories. Scratch belonging to a
+/// download that still exists is kept — a paused row resumes from it.
+#[tauri::command]
+pub async fn clear_temporary_data(
+    core: State<'_, Core>,
+) -> CommandResult<unduhin_core::TemporaryDataCleanup> {
+    Ok(core.clear_temporary_data().await?)
+}
+
 #[derive(Debug, Serialize)]
 pub struct DiskInfo {
     pub drive: String,
@@ -434,7 +451,11 @@ pub async fn pause_all(core: State<'_, Core>) -> CommandResult<u32> {
     let rows = core.list_downloads(DownloadFilter::default()).await?;
     let mut n = 0u32;
     for r in rows {
-        if matches!(r.status, Status::Queued | Status::Active) && core.pause(r.id).await.is_ok() {
+        // Mirrors `Core::pause`'s allowed source states — `Muxing`
+        // included, so "Pause all" genuinely pauses everything running.
+        if matches!(r.status, Status::Queued | Status::Active | Status::Muxing)
+            && core.pause(r.id).await.is_ok()
+        {
             n += 1;
         }
     }

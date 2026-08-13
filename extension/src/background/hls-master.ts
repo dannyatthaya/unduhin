@@ -26,31 +26,38 @@ const FETCH_TIMEOUT_MS = 2_500;
 // in-page tier was given, so the inner fetch's own timeout fires and
 // returns null cleanly first, in the common case.
 const EXEC_IPC_OVERHEAD_MS = 1_000;
-// A failed fetch (both in-page and SW) is cached briefly too — otherwise
-// every popup open re-injects a script into the tab for a manifest that
-// just 403'd. Much shorter than CACHE_TTL_MS so a transient failure (page
-// not ready yet, blip in the CDN) still retries soon. A `null` from the app
-// probe (couldn't answer) uses the same short TTL — only an actual answer
-// (including an empty array — "answered, no variants") earns the long one.
-const NEGATIVE_CACHE_TTL_MS = 5_000;
+// A failed fetch (both in-page and SW) is cached too — otherwise every
+// popup open re-injects a script into the tab for a manifest that just
+// 403'd. Shorter than CACHE_TTL_MS so a transient failure (page not ready
+// yet, blip in the CDN) still retries. A `null` from the app probe
+// (couldn't answer) uses the same TTL — only an actual answer (including
+// an empty array — "answered, no variants") earns the long one.
+//
+// This was 5s back when resolution ran on the popup's render path, chosen
+// so a transient failure retried almost immediately. It no longer needs to
+// be that eager: retries now happen in the background (see
+// `resolveVariantsForTab` in the service worker) where they cost the user
+// nothing, while a TTL that short guaranteed a full re-pay of the whole
+// tier chain on nearly every popup open.
+const NEGATIVE_CACHE_TTL_MS = 30_000;
 // A media playlist can be megabytes of segment lines; fetching it is
 // already sunk once we're here, but parsing it for nothing is not. Master
 // playlists are small (a handful of lines per rendition) even with many
 // qualities, so anything past this is almost certainly a media playlist.
 const MAX_MANIFEST_LENGTH_CHARS = 256_000;
 // Wall-clock ceiling for one `loadVariants` call, covering ALL tiers
-// combined. `buildSnapshot` in the service worker awaits every sniffed
-// manifest's `loadVariants` via `Promise.all` before the popup renders
-// anything, so an unbounded chain directly stalls the UI. Set equal to the
-// worst case the two cheap fetch tiers could already take on their own
-// (in-page's FETCH_TIMEOUT_MS + EXEC_IPC_OVERHEAD_MS, plus SW's
-// FETCH_TIMEOUT_MS) — the wait users already tolerate today, before the app
-// probe existed. If both fetch tiers time out (the pathological case —
-// everything's hanging), the budget is exhausted and the probe is skipped
-// entirely rather than adding a yt-dlp subprocess spawn on top of an
-// already-maxed-out wait. In the far more common failure mode — a fast
-// 403 rather than a hang — the fetch tiers return in well under their
-// caps, leaving real budget for the probe to actually help.
+// combined. Nothing user-facing awaits this any more (the popup renders
+// from `peekVariants` and gets a broadcast when resolution lands), but a
+// bound is still what stops a wedged tab from pinning a `loadVariants`
+// call — and its cache slot — open forever.
+//
+// It splits into two halves. The two cheap fetch tiers race, so their
+// worst case is the slower one alone: FETCH_TIMEOUT_MS +
+// EXEC_IPC_OVERHEAD_MS (the in-page tier). Whatever's left —
+// FETCH_TIMEOUT_MS — is the probe's slice. Before the tiers raced, the
+// pathological "everything is hanging" case burned the entire budget on
+// the fetches and starved the probe to zero; now the probe always gets a
+// real slice to work with.
 const TOTAL_BUDGET_MS = FETCH_TIMEOUT_MS + EXEC_IPC_OVERHEAD_MS + FETCH_TIMEOUT_MS;
 
 interface CacheEntry {
@@ -59,6 +66,15 @@ interface CacheEntry {
 }
 
 const cache = new Map<string, CacheEntry>();
+
+// Calls that have started but not yet cached a result, keyed by manifest
+// URL. Without this, two overlapping `loadVariants` for the same manifest
+// both miss the cache and both run the whole tier chain — including the
+// subprocess-spawning app probe. That overlap is routine now: the sniffer
+// warms the cache the moment a manifest is seen (`onStreamDetected` in the
+// service worker) and the popup's background resolve can start while that
+// warm-up is still in flight.
+const inFlight = new Map<string, Promise<readonly MediaVariant[]>>();
 
 /**
  * Last-resort variant source, injected by the caller rather than imported —
@@ -139,13 +155,15 @@ export function parseMasterPlaylist(text: string, baseUrl: string): MediaVariant
 
 /**
  * Fetch `manifestUrl` and, if it's a master playlist, return its qualities.
- * Resolution order — cheapest first — is: in-page fetch, then a direct
- * service-worker fetch, then (if `probeViaApp` is supplied) the native-app
- * probe as a last resort. Each tier only runs if the ones before it
- * couldn't answer, and the whole call is bounded by {@link TOTAL_BUDGET_MS}
- * — see the tier budgeting in {@link fetchManifest} and {@link fetchAppProbe}.
- * `probeViaApp` omitted behaves exactly as the two-tier fetch chain did
- * before it existed.
+ * The two cheap fetch tiers — in-page and a direct service-worker fetch —
+ * race, and only if neither produced a body does the expensive native-app
+ * probe run (when `probeViaApp` is supplied). The whole call is bounded by
+ * {@link TOTAL_BUDGET_MS} — see the tier budgeting in {@link fetchManifest}
+ * and {@link fetchAppProbe}. `probeViaApp` omitted behaves exactly as the
+ * two-tier fetch chain did before it existed.
+ *
+ * Concurrent calls for the same URL share one run; use {@link peekVariants}
+ * for a non-blocking read of what's already resolved.
  *
  * Returns an empty array for media playlists, an app probe that answered
  * "no variants", or (once every available tier has failed/timed out) as
@@ -158,11 +176,43 @@ export async function loadVariants(
   tabId: number | null,
   probeViaApp?: ProbeViaApp,
 ): Promise<readonly MediaVariant[]> {
-  const now = Date.now();
-  const hit = cache.get(manifestUrl);
-  if (hit && hit.expiresAt > now) return hit.variants;
+  const cached = peekVariants(manifestUrl);
+  if (cached) return cached;
 
-  const deadline = now + TOTAL_BUDGET_MS;
+  const existing = inFlight.get(manifestUrl);
+  if (existing) return existing;
+
+  // `finally` runs before the derived promise settles, so the entry is
+  // always gone by the time any awaiter observes the result — a later
+  // call either hits the now-populated cache or starts a fresh run.
+  const run = resolveVariants(manifestUrl, tabId, probeViaApp).finally(() => {
+    inFlight.delete(manifestUrl);
+  });
+  inFlight.set(manifestUrl, run);
+  return run;
+}
+
+/**
+ * The cached variants for `manifestUrl`, or `undefined` when nothing has
+ * been resolved (or the entry has expired). Pure cache read — never
+ * fetches, never spawns a probe, never awaits.
+ *
+ * `undefined` ("not resolved yet") is deliberately distinct from `[]`
+ * ("resolved: not a master playlist"): the popup's fast path renders the
+ * former as a plain row that may still regroup into quality rows, and the
+ * latter as a plain row that is final.
+ */
+export function peekVariants(manifestUrl: string): readonly MediaVariant[] | undefined {
+  const hit = cache.get(manifestUrl);
+  return hit && hit.expiresAt > Date.now() ? hit.variants : undefined;
+}
+
+async function resolveVariants(
+  manifestUrl: string,
+  tabId: number | null,
+  probeViaApp?: ProbeViaApp,
+): Promise<readonly MediaVariant[]> {
+  const deadline = Date.now() + TOTAL_BUDGET_MS;
 
   const text = await fetchManifest(manifestUrl, tabId, deadline);
   if (text != null) {
@@ -207,27 +257,54 @@ export async function loadVariants(
  * back to a direct SW fetch when there's no tab or the in-page fetch fails
  * (same-origin manifests, or a page that navigated away).
  *
- * Each tier is capped at `FETCH_TIMEOUT_MS`, further clamped to whatever's
- * left of `deadline` — a tier started with little budget left gets a short
- * leash rather than its usual full allowance, and a tier gets skipped
- * outright once the deadline has already passed.
+ * The two tiers run *concurrently* and the first body wins. They used to
+ * run in sequence, which meant a hanging in-page tier cost its full leash
+ * before the SW tier even started — and the two together could eat the
+ * whole `deadline`, leaving the app probe nothing. Racing costs one extra
+ * (usually 403) request per cache miss and preserves the tier preference
+ * for free: on the hotlink-protected CDNs this ordering exists for, the SW
+ * tier resolves `null`, so it can never beat a real in-page body.
+ *
+ * Both tiers are capped at `FETCH_TIMEOUT_MS`, clamped to whatever's left
+ * of `deadline` — started with little budget left they get a short leash
+ * rather than the full allowance, and are skipped outright once the
+ * deadline has already passed.
  */
 async function fetchManifest(
   url: string,
   tabId: number | null,
   deadline: number,
 ): Promise<string | null> {
-  if (tabId != null) {
-    const budget = Math.min(FETCH_TIMEOUT_MS, deadline - Date.now());
-    if (budget > 0) {
-      const inPage = await fetchInPage(tabId, url, budget);
-      if (inPage != null) return inPage;
-    }
-  }
-
   const budget = Math.min(FETCH_TIMEOUT_MS, deadline - Date.now());
   if (budget <= 0) return null;
-  return fetchInServiceWorker(url, budget);
+
+  const tiers: Promise<string | null>[] = [fetchInServiceWorker(url, budget)];
+  if (tabId != null) tiers.unshift(fetchInPage(tabId, url, budget));
+  return raceForBody(tiers);
+}
+
+/**
+ * Resolve to the first tier that produces a body, or `null` once every
+ * tier has come up empty. Neither tier rejects (both swallow their own
+ * errors), but a rejection is folded into `null` rather than escaping to
+ * the caller.
+ */
+function raceForBody(tiers: readonly Promise<string | null>[]): Promise<string | null> {
+  if (tiers.length === 0) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    let pending = tiers.length;
+    const settle = (body: string | null): void => {
+      if (body != null) {
+        resolve(body);
+        return;
+      }
+      pending -= 1;
+      if (pending === 0) resolve(null);
+    };
+    for (const tier of tiers) {
+      tier.then(settle, () => settle(null));
+    }
+  });
 }
 
 async function fetchInPage(tabId: number, url: string, budgetMs: number): Promise<string | null> {

@@ -29,6 +29,17 @@ const BADGE_COLOR = "#2563eb"; // matches the brand blue used in `frontend/src/s
 export interface MediaSnifferDeps {
   readonly headerCache: HeaderCache;
   readonly settings: SettingsReader;
+  /**
+   * Called once per newly-detected stream — never for a re-fetch of a
+   * manifest already on the tab's list. Lets the service worker start
+   * resolving a master playlist's qualities while the page is still
+   * loading, so the popup has them cached before it's ever opened.
+   *
+   * Synchronous and must not throw: this runs inside a `webRequest`
+   * listener, so anything expensive belongs behind a fire-and-forget
+   * promise rather than in the callback body.
+   */
+  readonly onStreamDetected?: (stream: MediaStream) => void;
 }
 
 export interface MediaSniffer {
@@ -71,6 +82,13 @@ export function installMediaSniffer(deps: MediaSnifferDeps): MediaSniffer {
     byTab.set(details.tabId, list);
     setBadge(details.tabId, list.length);
     log.debug("media-sniffer:", kind, details.url);
+    // Last, and guarded: a throwing consumer must not cost us the badge
+    // update or the stream we just recorded.
+    try {
+      deps.onStreamDetected?.(stream);
+    } catch (err) {
+      log.warn("onStreamDetected threw", err);
+    }
   };
 
   const onTabRemoved = (tabId: number): void => {

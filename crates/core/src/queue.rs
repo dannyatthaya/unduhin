@@ -170,6 +170,20 @@ async fn build_torrent_config(
 /// Period of the manager's reconciliation loop when nothing pokes it.
 const TICK_PERIOD: Duration = Duration::from_millis(500);
 
+/// How far yt-dlp's byte counter may fall between two ticks before the
+/// pump reads it as "moved on to the next stream" rather than jitter.
+const STREAM_BOUNDARY_SLACK: u64 = 1024;
+
+/// How many consecutive reconcile ticks a worker may stay in the active
+/// map after being cancelled before the manager complains.
+///
+/// A cancelled worker is *supposed* to exit within a tick or two; a
+/// yt-dlp cancel now has a bounded drain, so lingering past this means
+/// something is genuinely stuck. Logging it turns what used to be a
+/// silent zombie (still downloading, no longer reachable) into a
+/// diagnosable one.
+const CANCEL_LINGER_TICKS: u32 = 20;
+
 /// How long the active worker set must stay empty (after having been
 /// non-empty) before `CoreEvent::QueueEmptied` fires. A brief gap between
 /// two downloads — `fill_capacity` clearing one row and claiming the next
@@ -270,6 +284,10 @@ struct ActiveHandle {
     /// downloads (yt-dlp paths leave this `None` since they don't honor
     /// live re-segmentation).
     control: Option<mpsc::Sender<Control>>,
+    /// Reconcile ticks observed since this worker was first told to stop.
+    /// `0` means "not cancelled". Purely diagnostic — see
+    /// [`CANCEL_LINGER_TICKS`].
+    cancel_ticks: u32,
 }
 
 impl QueueManager {
@@ -367,18 +385,36 @@ impl QueueManager {
     }
 
     /// Cancel any active worker whose DB row has moved out of `active`.
+    ///
+    /// The handle deliberately stays in the map until the worker actually
+    /// exits and [`Self::reap_completed`] removes it. That is what keeps a
+    /// stopping worker *reachable*: `fill_capacity` skips ids that are
+    /// still present, so a quick pause→resume can't spawn a second yt-dlp
+    /// against the same output path while the first is still winding down.
     async fn reconcile_active(&self) -> crate::error::Result<()> {
         let db_active = download::active_ids(&self.pool).await?;
-        let active = self.active.lock().await;
+        let mut active = self.active.lock().await;
         let to_cancel: Vec<DownloadId> = active
             .keys()
             .copied()
             .filter(|id| !db_active.contains(id))
             .collect();
         for id in to_cancel {
-            if let Some(h) = active.get(&id) {
+            let Some(h) = active.get_mut(&id) else {
+                continue;
+            };
+            if h.cancel_ticks == 0 {
                 tracing::debug!(id, "queue: cancelling worker (db status changed)");
                 h.cancel.cancel();
+            }
+            h.cancel_ticks = h.cancel_ticks.saturating_add(1);
+            if h.cancel_ticks == CANCEL_LINGER_TICKS {
+                tracing::warn!(
+                    id,
+                    ticks = h.cancel_ticks,
+                    "queue: worker still running long after cancel; the row stays blocked \
+                     from being re-claimed until it exits"
+                );
             }
         }
         Ok(())
@@ -421,6 +457,22 @@ impl QueueManager {
                 break;
             }
             let id = record.id;
+            // A worker already owns this id. Leave the row `queued` and
+            // pick it up on a later tick, once the old worker has exited
+            // and `reap_completed` has dropped its handle.
+            //
+            // Without this guard, `active.insert` below silently replaced
+            // the previous `ActiveHandle` — which drops its `JoinHandle`
+            // (detaching the task) and the last clone of its
+            // `CancellationToken` (making it permanently uncancellable).
+            // The old yt-dlp kept downloading to the same output path
+            // forever, invisible to pause, delete, and shutdown alike.
+            // A pause immediately followed by a resume was enough to hit
+            // it, because `reconcile_active` cancels without waiting.
+            if active.contains_key(&id) {
+                tracing::debug!(id, "queue: skipping claim; a worker is still winding down");
+                continue;
+            }
             let (runnable, was_start_at_gated) = {
                 let cache = self.schedules.read().await;
                 let runnable = cache.is_runnable(id, now, active.is_empty());
@@ -471,14 +523,25 @@ impl QueueManager {
                 self.torrent_engine.clone(),
                 self.rate_limiter.clone(),
             );
-            active.insert(
+            // Guarded by the `contains_key` check at the top of the loop —
+            // an occupied slot here would mean a second worker for one
+            // download, so shout rather than clobber.
+            if let Some(previous) = active.insert(
                 id,
                 ActiveHandle {
                     cancel,
                     join,
                     control: control_tx,
+                    cancel_ticks: 0,
                 },
-            );
+            ) {
+                tracing::error!(
+                    id,
+                    "queue: replaced a live worker handle; the previous worker is now \
+                     detached and uncancellable"
+                );
+                previous.cancel.cancel();
+            }
         }
         drop(active);
 
@@ -597,13 +660,24 @@ async fn run_worker(
     // this flag so the two never cross-wire.
     let pump_url = url.clone();
     let pump_is_torrent = record.kind == DownloadKind::Torrent;
+    // Only yt-dlp reports per-stream byte counters that restart at 0.
+    let pump_is_media = record.kind == DownloadKind::Media;
     let pump = tokio::spawn(async move {
         // yt-dlp downloads multi-stream formats (video + audio) one
-        // stream at a time. Each stream's progress restarts from byte 0,
-        // which would otherwise look like the bar snapping back to 0 %.
-        // We detect the regression and flip the row to `Muxing` so the
-        // UI can show a distinct state instead of confusing the user.
+        // stream at a time, and each stream's progress restarts from
+        // byte 0. `stream_base` accumulates the completed streams so the
+        // bar keeps climbing instead of snapping back.
+        //
+        // This used to double as the `Muxing` trigger: a byte-counter
+        // regression was read as "yt-dlp moved on to the merge". That
+        // inference is wrong for anything fragmented — a retried HLS
+        // fragment or a resumed run regresses the counter mid-download —
+        // and it stranded still-downloading rows on "Merging audio +
+        // video…", a state with no pause button. The two concerns are now
+        // separate: this offset keeps the bar honest, and `Muxing` comes
+        // from yt-dlp's own `postprocess:` hook via `PostProcessing`.
         let mut last_downloaded: u64 = 0;
+        let mut stream_base: u64 = 0;
         let mut muxing_emitted = false;
         // Raw per-tick speed samples, downsampled and persisted to the
         // `speed_samples` column once the stream ends so the detail-pane
@@ -629,35 +703,19 @@ async fn run_worker(
                     speed_bps,
                     eta,
                 }) => {
-                    // Phase transition: a meaningful drop in the byte
-                    // counter means yt-dlp moved to a new stream. We
-                    // only fire this once per run; subsequent stream
-                    // boundaries are still treated as `Muxing`. This is a
-                    // yt-dlp-only signal: torrent byte counts from librqbit
-                    // aren't monotonic (piece verification, the metadata →
-                    // content transition), so a torrent must NEVER be flipped
-                    // to `Muxing` here — it would show "Merging audio + video…"
-                    // and hide real progress (design §3.C: Muxing is yt-dlp-only).
-                    if !muxing_emitted
-                        && !pump_is_torrent
-                        && downloaded + 1024 < last_downloaded
-                        && download::transition_status(
-                            &pump_pool,
-                            id,
-                            &[Status::Active],
-                            Status::Muxing,
-                        )
-                        .await
-                        .is_ok()
-                    {
-                        let _ = pump_events.send(CoreEvent::StatusChanged {
-                            id,
-                            from: Status::Active,
-                            to: Status::Muxing,
-                        });
-                        muxing_emitted = true;
+                    // A meaningful drop in yt-dlp's byte counter means it
+                    // finished one stream and started the next; carry the
+                    // completed bytes forward so the bar doesn't snap back
+                    // to 0 %. Media-only: librqbit's torrent counts aren't
+                    // monotonic either (piece verification, the metadata →
+                    // content transition) but they're already absolute, so
+                    // offsetting them would inflate the row.
+                    if pump_is_media && downloaded + STREAM_BOUNDARY_SLACK < last_downloaded {
+                        stream_base = stream_base.saturating_add(last_downloaded);
                     }
                     last_downloaded = downloaded;
+                    let downloaded = downloaded.saturating_add(stream_base);
+                    let total = total.map(|t| t.saturating_add(stream_base));
 
                     // Re-read the sidecar lazily — engine writes it on
                     // every tick, so a stale read here just means slightly
@@ -684,6 +742,33 @@ async fn run_worker(
                         eta,
                     });
                     speed_samples.push(speed_bps.max(0.0) as u32);
+                }
+                Ok(ProgressEvent::PostProcessing) => {
+                    // yt-dlp reached the ffmpeg merge / remux / fixup step:
+                    // the bytes are on disk and the progress bar has
+                    // nothing left to report, so the row shows a distinct
+                    // "Merging audio + video…" state.
+                    //
+                    // Only yt-dlp emits this (design §3.C: Muxing is
+                    // yt-dlp-only), and only once per run — yt-dlp ticks
+                    // this hook for every post-processor it runs.
+                    if !muxing_emitted
+                        && download::transition_status(
+                            &pump_pool,
+                            id,
+                            &[Status::Active],
+                            Status::Muxing,
+                        )
+                        .await
+                        .is_ok()
+                    {
+                        let _ = pump_events.send(CoreEvent::StatusChanged {
+                            id,
+                            from: Status::Active,
+                            to: Status::Muxing,
+                        });
+                        muxing_emitted = true;
+                    }
                 }
                 Ok(ProgressEvent::Completed { bytes }) => {
                     tracing::info!(id, bytes, "queue: pump received Completed");
@@ -1208,10 +1293,16 @@ async fn run_ytdlp(
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
 
+    // Scratch lives outside the download folder (`%TEMP%\Unduhin\<id>`),
+    // keyed by download id so `--continue` finds the same `.part` after a
+    // pause/resume or an app restart.
+    let temp_dir = ytdlp::scratch_dir_for(&output_dir, record.id);
+
     let job = YtdlpJob {
         url: info.original_url.clone(),
         format_selector: info.format_selector.clone(),
         output_dir,
+        temp_dir: temp_dir.clone(),
         output_template,
         binary_path: binary,
         ffmpeg_path: ffmpeg,
@@ -1228,6 +1319,15 @@ async fn run_ytdlp(
 
     match ytdlp::download(job, cancel.clone(), Some(tx)).await {
         Ok(outcome) => {
+            // yt-dlp leaves the (now-empty) scratch dir behind after it
+            // moves the finished file to `home:`. Only on success —
+            // a cancel must leave the `.part`/`.ytdl` in place so a
+            // resume can `--continue` from them.
+            if let Err(e) = tokio::fs::remove_dir_all(&temp_dir).await {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::debug!(id = record.id, error = %e, "yt-dlp: scratch dir cleanup failed");
+                }
+            }
             // The DB row was inserted with a title-only stem (no
             // extension), a NULL total_bytes, and an "Other" category.
             // yt-dlp now knows the truth: extension after `%(ext)s`
@@ -1565,6 +1665,129 @@ mod tests {
         // Monotonic input stays monotonic after bucket-averaging.
         assert!(out.windows(2).all(|w| w[0] <= w[1]));
         assert!(*out.first().unwrap() < *out.last().unwrap());
+    }
+
+    /// An in-memory `QueueManager` with no workers. Enough to exercise
+    /// the claim loop, which only touches the pool and the active map.
+    async fn test_manager() -> QueueManager {
+        // `max_connections(1)` because each connection to
+        // `sqlite::memory:` would otherwise get its own empty database.
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("in-memory pool");
+        crate::db::migrate(&pool).await.expect("migrate");
+        let schedules = SchedulesCache::load(&pool).await.expect("schedules");
+        let (events, _rx) = broadcast::channel(64);
+        QueueManager {
+            pool,
+            events,
+            active: Arc::new(Mutex::new(HashMap::new())),
+            shutdown: CancellationToken::new(),
+            drain: Mutex::new(DrainTracker::default()),
+            schedules: Arc::new(RwLock::new(schedules)),
+            torrent_engine: Arc::new(TorrentEngineCell::new()),
+            rate_limiter: engine::TokenBucket::new(0),
+        }
+    }
+
+    /// Insert a bare `queued` row and return its id.
+    async fn insert_queued_row(pool: &SqlitePool) -> DownloadId {
+        sqlx::query(
+            "INSERT INTO downloads (url, filename, output_path, status, priority, segments, \
+             created_at) VALUES (?, ?, ?, 'queued', 0, 1, ?)",
+        )
+        .bind("https://example.com/x.bin")
+        .bind("x.bin")
+        .bind("C:/tmp/x.bin")
+        .bind(Utc::now().to_rfc3339())
+        .execute(pool)
+        .await
+        .expect("insert");
+        sqlx::query_scalar("SELECT id FROM downloads ORDER BY id DESC LIMIT 1")
+            .fetch_one(pool)
+            .await
+            .expect("id")
+    }
+
+    #[tokio::test]
+    async fn fill_capacity_never_spawns_a_second_worker_for_one_download() {
+        // The bug this locks down: `fill_capacity` used to claim any
+        // `queued` row without checking the active map, and
+        // `active.insert` then *replaced* the live handle — dropping the
+        // previous `JoinHandle` (detaching the task) and the last clone of
+        // its `CancellationToken`. The old worker's yt-dlp kept
+        // downloading to the same path forever, unreachable by pause,
+        // delete, and shutdown alike. A pause immediately followed by a
+        // resume was enough to trigger it, because `reconcile_active`
+        // cancels without waiting for the worker to exit.
+        let manager = test_manager().await;
+        let id = insert_queued_row(&manager.pool).await;
+
+        // Stand in for a worker that was told to stop but hasn't exited.
+        let cancel = CancellationToken::new();
+        let stop = cancel.clone();
+        manager.active.lock().await.insert(
+            id,
+            ActiveHandle {
+                cancel,
+                join: tokio::spawn(async move { stop.cancelled().await }),
+                control: None,
+                cancel_ticks: 1,
+            },
+        );
+
+        manager.fill_capacity().await.expect("fill pass");
+
+        assert_eq!(
+            manager.active.lock().await.len(),
+            1,
+            "a second worker was spawned for a download that already has one"
+        );
+        // The row must stay `queued` so a later tick can claim it once the
+        // old worker is gone — claiming it now would strand it as `active`
+        // with nothing running.
+        let status: String = sqlx::query_scalar("SELECT status FROM downloads WHERE id = ?")
+            .bind(id)
+            .fetch_one(&manager.pool)
+            .await
+            .expect("status");
+        assert_eq!(status, "queued");
+
+        // And once the old worker really exits, the reap frees the slot.
+        let handle = manager.active.lock().await.remove(&id).expect("handle");
+        handle.cancel.cancel();
+        let _ = handle.join.await;
+    }
+
+    #[tokio::test]
+    async fn reconcile_keeps_the_handle_so_the_row_cannot_be_reclaimed() {
+        // Cancelling must not remove the handle: while it is in the map,
+        // `fill_capacity` skips the id, which is what serializes a
+        // pause→resume into one worker at a time.
+        let manager = test_manager().await;
+        let id = insert_queued_row(&manager.pool).await;
+        let cancel = CancellationToken::new();
+        let stop = cancel.clone();
+        manager.active.lock().await.insert(
+            id,
+            ActiveHandle {
+                cancel,
+                join: tokio::spawn(async move { stop.cancelled().await }),
+                control: None,
+                cancel_ticks: 0,
+            },
+        );
+
+        // The row is `queued`, so it is not in `active_ids` and the
+        // reconcile pass should cancel — but keep — the worker.
+        manager.reconcile_active().await.expect("reconcile");
+
+        let active = manager.active.lock().await;
+        let handle = active.get(&id).expect("handle must survive the cancel");
+        assert!(handle.cancel.is_cancelled());
+        assert_eq!(handle.cancel_ticks, 1);
     }
 
     fn summary(bytes: u64, output: &str, content_type: Option<&str>) -> engine::DownloadSummary {

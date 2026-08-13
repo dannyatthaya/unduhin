@@ -595,6 +595,17 @@ export const api = {
   getLogsDir: () => invoke<string | null>("get_logs_dir"),
 
   /**
+   * Bytes held by yt-dlp scratch directories that no download still owns.
+   * Scratch belonging to a live row is excluded — a paused download
+   * resumes from it — so this is exactly what `clearTemporaryData` frees.
+   */
+  getTemporaryDataSize: () => invoke<number>("get_temporary_data_size"),
+  clearTemporaryData: () =>
+    invoke<{ removedDirs: number; freedBytes: number }>(
+      "clear_temporary_data",
+    ),
+
+  /**
    * Resolve an outstanding `unduhin:confirm-quit` prompt with the user's
    * answer. Calling with a stale `request_id` (already answered or
    * timed-out) is a no-op on the Rust side.

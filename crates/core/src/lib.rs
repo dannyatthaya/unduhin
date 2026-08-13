@@ -73,7 +73,11 @@ pub struct Core {
 struct CoreInner {
     pool: SqlitePool,
     events: broadcast::Sender<CoreEvent>,
-    queue: Mutex<Option<QueueHandle>>,
+    /// `Arc` so callers can clone the handle out and **release the mutex
+    /// before awaiting on it**. `remove` awaits a worker's full exit; held
+    /// across that await, this lock also blocks `poke_queue`, `start`, and
+    /// `shutdown`, so one slow worker used to wedge the entire app.
+    queue: Mutex<Option<Arc<QueueHandle>>>,
     /// Shared with the queue manager so both layers see one cache. Reads
     /// dominate (queue tick + notifications gate); writes happen only on
     /// schedule CRUD, so an `RwLock` is the right shape.
@@ -213,7 +217,7 @@ impl Core {
             self.inner.rate_limiter.clone(),
         )
         .await;
-        *slot = Some(handle);
+        *slot = Some(Arc::new(handle));
         Ok(())
     }
 
@@ -278,9 +282,23 @@ impl Core {
         download::get(&self.inner.pool, id).await
     }
 
+    /// Stop a download.
+    ///
+    /// `Muxing` is an allowed source state. It reads oddly — pausing a
+    /// merge kills the ffmpeg doing it, and resuming re-runs the merge
+    /// from the intermediate streams yt-dlp still has on disk — but the
+    /// alternative is worse: with no user-facing cancel, a row that
+    /// reaches `Muxing` and stalls there has no way out except deleting
+    /// it. That was a live complaint back when the pump *inferred*
+    /// `Muxing` from a byte-counter dip and stranded still-downloading
+    /// HLS rows in it.
     pub async fn pause(&self, id: DownloadId) -> Result<()> {
-        self.change_status(id, &[Status::Queued, Status::Active], Status::Paused)
-            .await
+        self.change_status(
+            id,
+            &[Status::Queued, Status::Active, Status::Muxing],
+            Status::Paused,
+        )
+        .await
     }
 
     pub async fn resume(&self, id: DownloadId) -> Result<()> {
@@ -347,11 +365,13 @@ impl Core {
         // `open_for_segment` (which uses `create(true)`) — or yt-dlp's
         // `.part` finalization on its way out — can race the delete and
         // leave a 0-byte ghost file behind.
-        {
-            let slot = self.inner.queue.lock().await;
-            if let Some(q) = slot.as_ref() {
-                q.cancel_and_wait(id).await;
-            }
+        //
+        // Clone the handle and drop the guard first: this await is the
+        // longest one in `Core`, and holding the queue lock across it
+        // stalls every other queue operation behind a single worker.
+        let queue = self.inner.queue.lock().await.clone();
+        if let Some(q) = queue {
+            q.cancel_and_wait(id).await;
         }
         // For torrents, remove it from the live librqbit session so a later
         // re-add starts FRESH. Without this, librqbit keeps it managed in
@@ -797,6 +817,147 @@ impl Core {
         let _ = self.inner.events.send(CoreEvent::SchedulesChanged);
         self.poke_queue().await;
     }
+
+    /// Delete every yt-dlp scratch directory that no live download owns,
+    /// and report how many bytes that freed. Backs Settings → General →
+    /// "Clear temporary data".
+    ///
+    /// Directories belonging to rows that still exist are **kept**: they
+    /// hold the `.part` a paused or queued download resumes from via
+    /// `--continue`, and discarding them silently would restart a
+    /// multi-gigabyte transfer from zero. Only genuinely orphaned scratch
+    /// is removed, so the button is always safe to press.
+    pub async fn clear_temporary_data(&self) -> Result<TemporaryDataCleanup> {
+        Ok(sweep_scratch_dirs(&self.inner.pool).await)
+    }
+
+    /// Bytes currently sitting in orphaned scratch directories, so the
+    /// settings row can show what pressing the button would reclaim.
+    pub async fn temporary_data_size(&self) -> Result<u64> {
+        let live = live_download_ids(&self.inner.pool).await;
+        let mut total = 0u64;
+        for (_, path) in orphan_scratch_dirs(&live).await {
+            total = total.saturating_add(dir_size(&path).await);
+        }
+        Ok(total)
+    }
+}
+
+/// Result of [`Core::clear_temporary_data`].
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "ts-rs-export", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-rs-export",
+    ts(export, export_to = "TemporaryDataCleanup.ts")
+)]
+#[serde(rename_all = "camelCase")]
+pub struct TemporaryDataCleanup {
+    /// Scratch directories removed.
+    pub removed_dirs: u32,
+    /// Bytes reclaimed, measured before deleting.
+    pub freed_bytes: u64,
+}
+
+/// Delete every scratch directory under [`ytdlp::scratch_root`] whose id
+/// is absent from `pool`.
+///
+/// Deliberately **not** wired into startup. `%TEMP%\Unduhin` is shared by
+/// every `Core` on the machine, and "orphaned" is judged against whichever
+/// database happens to be open — so an automatic sweep from a `Core` on a
+/// throwaway database (every integration test opens one) would delete the
+/// running app's live scratch, silently discarding a multi-gigabyte
+/// partial download. Routine cleanup is exact instead: the worker removes
+/// its own directory on success, and `download::remove` removes the
+/// row's. This bulk pass is reserved for the explicit
+/// Settings → *Clear temporary data* action, where the caller is
+/// unambiguously the user's real app.
+async fn sweep_scratch_dirs(pool: &SqlitePool) -> TemporaryDataCleanup {
+    let live = live_download_ids(pool).await;
+    let mut cleanup = TemporaryDataCleanup::default();
+    for (id, path) in orphan_scratch_dirs(&live).await {
+        let size = dir_size(&path).await;
+        match tokio::fs::remove_dir_all(&path).await {
+            Ok(()) => {
+                cleanup.removed_dirs += 1;
+                cleanup.freed_bytes = cleanup.freed_bytes.saturating_add(size);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::debug!(id, error = %e, "could not remove scratch dir"),
+        }
+    }
+    cleanup
+}
+
+/// Ids of every row still in the database. A scratch directory named for
+/// an id outside this set has no owner left.
+///
+/// On a DB read error this returns `None`, and the callers treat that as
+/// "can't prove anything is orphaned" and skip the sweep entirely —
+/// deleting a live download's `.part` because a query hiccuped would be a
+/// far worse outcome than leaving temp files around.
+async fn live_download_ids(pool: &SqlitePool) -> Option<std::collections::HashSet<DownloadId>> {
+    match sqlx::query_scalar::<_, DownloadId>("SELECT id FROM downloads")
+        .fetch_all(pool)
+        .await
+    {
+        Ok(ids) => Some(ids.into_iter().collect()),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not list downloads for scratch sweep");
+            None
+        }
+    }
+}
+
+/// Enumerate `%TEMP%\Unduhin\*` directories whose name parses as a
+/// download id that is no longer in `live`.
+async fn orphan_scratch_dirs(
+    live: &Option<std::collections::HashSet<DownloadId>>,
+) -> Vec<(DownloadId, PathBuf)> {
+    let Some(live) = live else { return Vec::new() };
+    let root = ytdlp::scratch_root();
+    let Ok(mut entries) = tokio::fs::read_dir(&root).await else {
+        return Vec::new();
+    };
+    let mut orphans = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if !entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        // Anything not named for a download id isn't ours to delete.
+        let Some(id) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.parse::<DownloadId>().ok())
+        else {
+            continue;
+        };
+        if !live.contains(&id) {
+            orphans.push((id, path));
+        }
+    }
+    orphans
+}
+
+/// Recursive byte total for a directory. Best-effort: unreadable entries
+/// contribute zero rather than aborting the walk, since this only feeds a
+/// "you'll free about this much" figure.
+async fn dir_size(path: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+            continue;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            match entry.metadata().await {
+                Ok(m) if m.is_dir() => stack.push(entry.path()),
+                Ok(m) => total = total.saturating_add(m.len()),
+                Err(_) => {}
+            }
+        }
+    }
+    total
 }
 
 /// Conventional location for the user's Unduhin database when callers

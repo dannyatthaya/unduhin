@@ -4,6 +4,7 @@ import {
   isMasterPlaylist,
   loadVariants,
   parseMasterPlaylist,
+  peekVariants,
   type ProbeViaApp,
 } from "../src/background/hls-master";
 
@@ -107,6 +108,11 @@ function hangingAbortableFetch(): (
 // variants, matching what the native side hands back over the bridge.
 const PROBED_VARIANTS = parseMasterPlaylist(MASTER, BASE);
 
+// Comfortably past NEGATIVE_CACHE_TTL_MS (30s) but well short of
+// CACHE_TTL_MS (60s), so advancing by this tells the two TTLs apart: a
+// negative-cached entry has expired, a real answer has not.
+const PAST_NEGATIVE_TTL_MS = 35_000;
+
 describe("loadVariants", () => {
   let executeScript: ReturnType<typeof vi.fn>;
   let fetchSpy: ReturnType<typeof vi.fn>;
@@ -122,14 +128,17 @@ describe("loadVariants", () => {
     vi.useRealTimers();
   });
 
-  it("uses the in-page fetch when it succeeds, without touching the SW fetch", async () => {
+  it("uses the in-page body even though the SW tier races alongside it", async () => {
     const url = "https://example.com/loadv/success.m3u8";
     executeScript.mockResolvedValue([{ result: MASTER }]);
+    // The case the in-page tier exists for: a hotlink-protected CDN 403s
+    // the SW fetch. A `null` can never win the race, so the in-page body
+    // is still what comes back.
+    fetchSpy.mockResolvedValue(fakeResponse(false, ""));
 
     const variants = await loadVariants(url, TAB_ID);
 
     expect(variants.map((v) => v.label)).toEqual(["720p", "480p", "360p"]);
-    expect(fetchSpy).not.toHaveBeenCalled();
   });
 
   it("falls back to the SW fetch when the in-page fetch fails", async () => {
@@ -172,7 +181,7 @@ describe("loadVariants", () => {
     expect(fetchSpy).toHaveBeenCalledTimes(1);
   });
 
-  it("negative-caches a full failure briefly, then retries after the short TTL", async () => {
+  it("negative-caches a full failure, then retries after the short TTL", async () => {
     vi.useFakeTimers();
     const url = "https://example.com/loadv/negative-cache.m3u8";
     executeScript.mockResolvedValue([{ result: null }]);
@@ -184,7 +193,7 @@ describe("loadVariants", () => {
     expect(executeScript).toHaveBeenCalledTimes(1);
     expect(fetchSpy).toHaveBeenCalledTimes(1);
 
-    await vi.advanceTimersByTimeAsync(6_000); // past the negative TTL.
+    await vi.advanceTimersByTimeAsync(PAST_NEGATIVE_TTL_MS);
     await loadVariants(url, TAB_ID);
 
     expect(executeScript).toHaveBeenCalledTimes(2);
@@ -205,10 +214,10 @@ describe("loadVariants", () => {
     const variants = await loadVariants(url, TAB_ID);
     expect(variants).toEqual([]);
 
-    // Past the negative TTL but still well within the success TTL — a
-    // second call must still hit the cache, proving the oversized result
-    // was cached with the long TTL, not the short negative one.
-    await vi.advanceTimersByTimeAsync(6_000);
+    // Past the negative TTL but still within the success TTL — a second
+    // call must still hit the cache, proving the oversized result was
+    // cached with the long TTL, not the short negative one.
+    await vi.advanceTimersByTimeAsync(PAST_NEGATIVE_TTL_MS);
     await loadVariants(url, TAB_ID);
 
     expect(executeScript).toHaveBeenCalledTimes(1);
@@ -269,7 +278,7 @@ describe("loadVariants", () => {
     await loadVariants(url, TAB_ID, probeViaApp); // within the negative TTL — must not re-probe.
     expect(probeViaApp).toHaveBeenCalledTimes(1);
 
-    await vi.advanceTimersByTimeAsync(6_000); // past the negative TTL.
+    await vi.advanceTimersByTimeAsync(PAST_NEGATIVE_TTL_MS);
     await loadVariants(url, TAB_ID, probeViaApp);
 
     expect(probeViaApp).toHaveBeenCalledTimes(2); // retried — null wasn't cached as success.
@@ -288,28 +297,102 @@ describe("loadVariants", () => {
     // Past the negative TTL but still within the success TTL — a second
     // call must still hit the cache, proving the empty array was a real
     // answer cached with the long TTL, not a failure with the short one.
-    await vi.advanceTimersByTimeAsync(6_000);
+    await vi.advanceTimersByTimeAsync(PAST_NEGATIVE_TTL_MS);
     await loadVariants(url, TAB_ID, probeViaApp);
 
     expect(probeViaApp).toHaveBeenCalledTimes(1);
   });
 
-  it("skips the app probe once the total time budget is exhausted", async () => {
+  it("still has budget for the app probe when both fetch tiers hang", async () => {
     vi.useFakeTimers();
-    const url = "https://example.com/loadv/budget-exhausted.m3u8";
-    // Both fetch tiers hang until their own internal timeout fires —
-    // together they consume the entire TOTAL_BUDGET_MS (in-page's budget
-    // + EXEC_IPC_OVERHEAD_MS, then the SW tier's own budget), leaving
-    // nothing for the probe.
+    const url = "https://example.com/loadv/both-hang.m3u8";
+    // Both fetch tiers hang until their own internal timeout fires. They
+    // race, so the pair costs the slower one alone (the in-page tier's
+    // budget + EXEC_IPC_OVERHEAD_MS) rather than the two in sequence —
+    // which is what leaves a real slice of TOTAL_BUDGET_MS for the probe.
+    // Run sequentially, this same case exhausted the budget and skipped
+    // the probe entirely.
     executeScript.mockReturnValue(new Promise(() => {}));
     fetchSpy.mockImplementation(hangingAbortableFetch());
-    const probeViaApp: ProbeViaApp = vi.fn();
+    const probeViaApp: ProbeViaApp = vi.fn().mockResolvedValue(PROBED_VARIANTS);
 
     const pending = loadVariants(url, TAB_ID, probeViaApp);
     await vi.advanceTimersByTimeAsync(15_000);
     const variants = await pending;
 
-    expect(variants).toEqual([]);
-    expect(probeViaApp).not.toHaveBeenCalled();
+    expect(probeViaApp).toHaveBeenCalledTimes(1);
+    expect(variants).toEqual(PROBED_VARIANTS);
+  });
+
+  it("shares one run between concurrent calls for the same manifest", async () => {
+    const url = "https://example.com/loadv/in-flight.m3u8";
+    executeScript.mockResolvedValue([{ result: null }]);
+    fetchSpy.mockResolvedValue(fakeResponse(false, ""));
+    const probeViaApp: ProbeViaApp = vi.fn().mockResolvedValue(PROBED_VARIANTS);
+
+    const [a, b] = await Promise.all([
+      loadVariants(url, TAB_ID, probeViaApp),
+      loadVariants(url, TAB_ID, probeViaApp),
+    ]);
+
+    expect(a).toEqual(PROBED_VARIANTS);
+    expect(b).toBe(a);
+    // The whole tier chain ran once — most importantly the probe, which
+    // spawns a subprocess on the native side.
+    expect(executeScript).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(probeViaApp).toHaveBeenCalledTimes(1);
+  });
+
+  it("resolves from the SW fetch without waiting out a hanging in-page tier", async () => {
+    vi.useFakeTimers();
+    const url = "https://example.com/loadv/race-sw-wins.m3u8";
+    executeScript.mockReturnValue(new Promise(() => {}));
+    fetchSpy.mockResolvedValue(fakeResponse(true, MASTER));
+
+    const pending = loadVariants(url, TAB_ID);
+    // Nowhere near the in-page tier's outer guard (its budget plus
+    // EXEC_IPC_OVERHEAD_MS): the race is settled by the SW body alone.
+    await vi.advanceTimersByTimeAsync(10);
+    const variants = await pending;
+
+    expect(variants.map((v) => v.label)).toEqual(["720p", "480p", "360p"]);
+  });
+});
+
+describe("peekVariants", () => {
+  beforeEach(() => {
+    installFakeChrome();
+    vi.stubGlobal("fetch", vi.fn());
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("returns undefined for a manifest nothing has resolved yet", () => {
+    expect(peekVariants("https://example.com/peek/unknown.m3u8")).toBeUndefined();
+  });
+
+  it("returns the cached variants once they have resolved", async () => {
+    const url = "https://example.com/peek/resolved.m3u8";
+    const { executeScript } = installFakeChrome();
+    executeScript.mockResolvedValue([{ result: MASTER }]);
+
+    expect(peekVariants(url)).toBeUndefined();
+    const loaded = await loadVariants(url, TAB_ID);
+
+    expect(peekVariants(url)).toBe(loaded);
+  });
+
+  it("distinguishes an unresolved manifest from one resolved as a plain playlist", async () => {
+    const url = "https://example.com/peek/media-playlist.m3u8";
+    const { executeScript } = installFakeChrome();
+    executeScript.mockResolvedValue([{ result: MEDIA }]);
+
+    await loadVariants(url, TAB_ID);
+
+    // `[]` — a real answer ("not a master") — not `undefined`.
+    expect(peekVariants(url)).toEqual([]);
   });
 });

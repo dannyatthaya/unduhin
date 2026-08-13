@@ -44,6 +44,27 @@ export interface BridgeStatusMessage {
 }
 
 /**
+ * Media-list broadcast emitted by the service worker once it has finished
+ * resolving a tab's HLS master playlists into quality rows.
+ *
+ * The snapshot reply is deliberately synchronous — it renders whatever
+ * variants are already cached and never waits on the network — so the
+ * qualities for a cold manifest arrive here instead, and the popup swaps
+ * the plain rows for grouped quality rows when they do. Sent the same way
+ * as `BridgeStatusMessage`, and just as fire-and-forget: with no popup
+ * open there is no receiver and the send simply fails.
+ *
+ * `tabId` is the tab the streams belong to. Receivers MUST check it
+ * against the tab they're displaying — resolution for a background tab
+ * finishing is not a reason to repaint the visible list.
+ */
+export interface MediaStreamsMessage {
+  readonly kind: "media-streams";
+  readonly tabId: number;
+  readonly streams: readonly PopupMediaStream[];
+}
+
+/**
  * Popup → service worker request, served by `service-worker.ts`. The popup
  * sends it on open to pull a single coherent snapshot of everything it
  * needs to render; subsequent changes arrive via `BridgeStatusMessage`.

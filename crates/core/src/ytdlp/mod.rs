@@ -36,8 +36,11 @@ use tokio::process::Command;
 use tokio::sync::broadcast;
 use tokio::time::timeout;
 
+mod process_tree;
 pub mod progress;
 mod wire;
+
+use process_tree::ProcessTreeGuard;
 
 /// Outcome of probing a URL with yt-dlp's metadata extractors.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,9 +122,22 @@ pub struct DownloadOutcome {
 pub struct YtdlpJob {
     pub url: String,
     pub format_selector: String,
+    /// Where the finished file lands. Passed as `--paths home:`, never
+    /// baked into `--output` — see [`download`] for why that distinction
+    /// is load-bearing.
     pub output_dir: PathBuf,
-    /// yt-dlp `--output` template, e.g. `"%(title)s.%(ext)s"`. Resolved
-    /// relative to `output_dir`.
+    /// Scratch directory for yt-dlp's `.part`, `.ytdl`, and per-fragment
+    /// files, passed as `--paths temp:`. Must be on the same volume as
+    /// `output_dir` (see [`crate::ytdlp::scratch_dir_for`]) — yt-dlp's
+    /// final temp→home step is a `shutil.move`, an instant rename within a
+    /// volume but a full byte copy across one.
+    ///
+    /// Keyed per download and *not* cleaned up on cancel: a paused
+    /// download resumes out of exactly this directory via `--continue`.
+    pub temp_dir: PathBuf,
+    /// yt-dlp `--output` template, e.g. `"%(title)s.%(ext)s"`. Must stay
+    /// **relative** — yt-dlp ignores `--paths` entirely when the output
+    /// template carries an absolute path.
     pub output_template: String,
     pub binary_path: PathBuf,
     /// Passed to yt-dlp via `--ffmpeg-location`; required when
@@ -218,9 +234,11 @@ fn wants_impersonation_probe(impersonate: bool) -> bool {
 /// it's a required, explicit input rather than something this function
 /// infers from `referrer`.
 ///
-/// `timeout_duration` caps the whole probe (subprocess spawn + stdout
-/// drain). Default callers should pass a few seconds — the user is
-/// waiting on the formats dialog when this is called.
+/// `timeout_duration` caps the probe subprocess (spawn + stdout drain).
+/// Default callers should pass a few seconds — the user is waiting on the
+/// formats dialog when this is called. The impersonation-availability
+/// check that precedes it is bounded separately by
+/// [`IMPERSONATE_PROBE_TIMEOUT`] and does not draw on this budget.
 async fn probe_raw(
     url: &str,
     binary_path: &Path,
@@ -232,18 +250,28 @@ async fn probe_raw(
         return Err(YtdlpError::NotInstalled);
     }
 
+    // The availability probe is itself a subprocess spawn, so skip it
+    // entirely when the setting already says no.
+    //
+    // Resolved *outside* `timeout_duration`, which covers the probe
+    // itself. It used to run inside, and since it carries its own
+    // `IMPERSONATE_PROBE_TIMEOUT` (3s) — the same order as the default
+    // `ytdlp_probe_timeout_ms` — the first probe against a given binary
+    // could spend the caller's entire budget on
+    // `--list-impersonate-targets` and then time out having never probed
+    // anything at all. The result is cached per binary fingerprint, so
+    // this is a first-call-per-binary cost either way; what changed is
+    // that it no longer eats the probe's own allowance.
+    let should_impersonate = if wants_impersonation_probe(impersonate) {
+        impersonation_available(binary_path).await
+    } else {
+        false
+    };
+
     let url_string = url.to_string();
     let referrer_string = referrer.map(|r| r.to_string());
     let binary = binary_path.to_path_buf();
     let task = async move {
-        // The availability probe is itself a subprocess spawn, so skip it
-        // entirely when the setting already says no.
-        let should_impersonate = if wants_impersonation_probe(impersonate) {
-            impersonation_available(&binary).await
-        } else {
-            false
-        };
-
         let mut cmd = Command::new(&binary);
         cmd.arg("--dump-single-json")
             .arg("--no-warnings")
@@ -257,6 +285,12 @@ async fn probe_raw(
             cmd.arg(arg);
         }
         cmd.arg(&url_string)
+            // When the timeout below fires, this future is dropped
+            // mid-await; `kill_on_drop` is what turns that drop into an
+            // actual process kill rather than leaving a yt-dlp running in
+            // the background, still doing network I/O for an answer
+            // nobody will read.
+            .kill_on_drop(true)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -365,8 +399,7 @@ pub async fn download(
     }
 
     tokio::fs::create_dir_all(&job.output_dir).await?;
-
-    let output_arg = job.output_dir.join(&job.output_template);
+    tokio::fs::create_dir_all(&job.temp_dir).await?;
 
     let mut cmd = Command::new(&job.binary_path);
     cmd.arg("--no-warnings")
@@ -393,20 +426,61 @@ pub async fn download(
         // extension still varies — `after_move:` keeps the DB in sync.
         .arg("--merge-output-format")
         .arg("mp4")
-        // `total_bytes` is null for DASH/HLS sources (YouTube, most live-derived
-        // streams) — those expose `total_bytes_estimate` instead. Without the
-        // fallback the progress bar stays at 0% until the Completed event lands
-        // because every tick reports an unknown total. yt-dlp's
-        // `field,alt_field` syntax picks the first non-null value.
+        // Six pipe-delimited fields, parsed by `progress::parse_line`.
+        //
+        // `total_bytes` is null for DASH/HLS sources (YouTube, most
+        // live-derived streams) — those expose `total_bytes_estimate`
+        // instead, so yt-dlp's `field,alt_field` syntax picks whichever is
+        // non-null. **Both alternatives need the `progress.` prefix**: the
+        // template's root namespace holds only `info` and `progress`, so a
+        // bare `total_bytes_estimate` resolves against the root, finds
+        // nothing, and silently yields `NA` forever. That typo is why the
+        // bar sat empty for the entire run on every extension-captured HLS
+        // stream — the intended fallback was never actually reachable.
+        //
+        // `fragment_index` / `fragment_count` are the second line of
+        // defence: a live-derived manifest reports neither byte total, but
+        // fragment counts still let `Tick::effective_total` estimate one.
         .arg("--progress-template")
-        .arg("%(progress.downloaded_bytes)s|%(progress.total_bytes,total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s")
+        .arg(
+            "%(progress.downloaded_bytes)s\
+             |%(progress.total_bytes,progress.total_bytes_estimate)s\
+             |%(progress.speed)s\
+             |%(progress.eta)s\
+             |%(progress.fragment_index)s\
+             |%(progress.fragment_count)s",
+        )
+        // Post-processing (the ffmpeg merge / remux / fixup) has its own
+        // progress-hook namespace. Subscribing to it is how we know the
+        // row genuinely reached the merge phase.
+        //
+        // The pump used to *infer* this from a drop in the byte counter,
+        // which is wrong for anything fragmented: a retried fragment or a
+        // resumed run regresses the counter mid-download, stranding a
+        // still-downloading HLS row on "Merging audio + video…" — a state
+        // that (before this change) also had no pause button.
+        .arg("--progress-template")
+        .arg(format!("postprocess:{POSTPROCESS_TAG}%(progress.status)s"))
         // Tag-prefix the printed path so we can recognize the line in
         // stdout without colliding with progress ticks or banners. yt-dlp
         // expands the literal prefix before the placeholder.
         .arg("--print")
         .arg("after_move:unduhin-final-path:%(filepath)s")
+        // Scratch (`.part`, `.ytdl`, `.part-Frag<N>.part`) goes to
+        // `temp:`, the finished file to `home:`. Previously everything
+        // landed in the user's download folder, where the churn of
+        // per-fragment temp files looked like the app was malfunctioning.
+        //
+        // **`--output` must stay relative.** yt-dlp ignores `--paths`
+        // outright when the output template contains an absolute path, so
+        // moving the directory into `--paths home:` and the bare
+        // `<stem>.%(ext)s` into `--output` is a single indivisible change.
+        .arg("--paths")
+        .arg(format!("home:{}", job.output_dir.display()))
+        .arg("--paths")
+        .arg(format!("temp:{}", job.temp_dir.display()))
         .arg("--output")
-        .arg(&output_arg);
+        .arg(&job.output_template);
     if let Some(ffmpeg) = job.ffmpeg_path.as_deref() {
         cmd.arg("--ffmpeg-location").arg(ffmpeg);
     }
@@ -483,6 +557,12 @@ pub async fn download(
         // harmless on non-frozen yt-dlp builds (it's a Python-stdlib env
         // var, not a yt-dlp setting).
         .env("PYTHONUNBUFFERED", "1")
+        // Backstop for the paths this function can't reach: if the future
+        // is dropped rather than cancelled cooperatively, tokio kills the
+        // child. `ProcessTreeGuard`'s own `Drop` widens that to the whole
+        // tree. `download()` was the only one of this module's three spawn
+        // sites missing this.
+        .kill_on_drop(true)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -498,6 +578,12 @@ pub async fn download(
     );
 
     let mut child = cmd.spawn()?;
+    // Adopt the tree *before* touching the pipes. yt-dlp.exe is a
+    // PyInstaller one-file build whose bootloader runs the real downloader
+    // as its own child, and yt-dlp spawns ffmpeg on top of that — killing
+    // only the PID we spawned leaves a live downloader writing to the
+    // output path. See `process_tree` for the full story.
+    let tree = ProcessTreeGuard::adopt(&child);
     let stdout = child.stdout.take().ok_or_else(|| YtdlpError::Process {
         code: -1,
         message: "stdout missing".into(),
@@ -508,10 +594,30 @@ pub async fn download(
     })?;
 
     // Drain stderr concurrently — yt-dlp can block on a full pipe.
+    //
+    // This is also where post-processing is detected. yt-dlp writes
+    // `postprocess:` progress ticks to **stderr**, not stdout (verified
+    // against the real binary: a `--remux-video` run put the download
+    // ticks and the `after_move:` line on stdout and all four
+    // `started`/`finished` post-processor ticks on stderr). Watching for
+    // the tag on stdout looks right and silently never fires.
+    //
+    // Every line still accumulates into the buffer `classify_exit` reads
+    // — the tag lines are inert there.
+    let pp_tx = progress_tx.clone();
     let stderr_task = tokio::spawn(async move {
         let mut reader = BufReader::new(stderr).lines();
         let mut buf = String::new();
+        // yt-dlp ticks this hook for every post-processor it runs, and
+        // twice each (`started`, `finished`); the row only enters
+        // `Muxing` once.
+        let mut postprocess_emitted = false;
         while let Ok(Some(line)) = reader.next_line().await {
+            if !postprocess_emitted && is_postprocess_line(&line) {
+                tracing::debug!("ytdlp: post-processing started");
+                emit(pp_tx.as_ref(), ProgressEvent::PostProcessing);
+                postprocess_emitted = true;
+            }
             buf.push_str(&line);
             buf.push('\n');
         }
@@ -527,9 +633,32 @@ pub async fn download(
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
+                // Kill the tree first, then the direct child as a fallback
+                // for the (logged) case where the job object couldn't be
+                // created. Order matters: until every descendant is gone
+                // they hold inherited duplicates of our stdout/stderr write
+                // handles, and the drain below never sees EOF.
+                tree.terminate();
                 let _ = child.start_kill();
-                let _ = child.wait().await;
-                let _ = stderr_task.await;
+                // Bounded on purpose. `Core::remove` awaits this worker
+                // synchronously before it deletes anything on disk, so an
+                // unbounded wait here is an unkillable UI hang — which is
+                // precisely how "I deleted the row and nothing happened"
+                // used to present. If something escaped the job object,
+                // give up on the drain and let `kill_on_drop` and the
+                // guard's `Drop` finish the job.
+                if timeout(CANCEL_DRAIN_TIMEOUT, async {
+                    let _ = child.wait().await;
+                    let _ = stderr_task.await;
+                })
+                .await
+                .is_err()
+                {
+                    tracing::warn!(
+                        timeout = ?CANCEL_DRAIN_TIMEOUT,
+                        "ytdlp: child did not drain after cancel; abandoning pipes"
+                    );
+                }
                 return Err(YtdlpError::Process {
                     code: -1,
                     message: "cancelled".into(),
@@ -544,26 +673,29 @@ pub async fn download(
                     continue;
                 }
                 let Some(tick) = progress::parse_line(&line) else { continue };
+                let total = tick.effective_total();
                 tracing::debug!(
                     downloaded = tick.downloaded,
-                    total = ?tick.total,
+                    total = ?total,
                     speed = ?tick.speed_bps,
                     eta = ?tick.eta,
+                    fragment = ?tick.fragment_index,
+                    fragments = ?tick.fragment_count,
                     "ytdlp: tick"
                 );
                 if !started_emitted {
                     emit(progress_tx.as_ref(), ProgressEvent::Started {
-                        total: tick.total,
+                        total,
                         segments: 1,
                         resumed_bytes: 0,
                     });
                     started_emitted = true;
                 }
                 last_downloaded = tick.downloaded;
-                if tick.total.is_some() { last_total = tick.total; }
+                if total.is_some() { last_total = total; }
                 emit(progress_tx.as_ref(), ProgressEvent::Tick {
                     downloaded: tick.downloaded,
-                    total: tick.total.or(last_total),
+                    total: total.or(last_total),
                     speed_bps: tick.speed_bps.unwrap_or(0.0),
                     eta: tick.eta,
                 });
@@ -602,6 +734,88 @@ pub async fn download(
         Ok(DownloadOutcome { bytes, final_path })
     } else {
         Err(classify_exit(stderr_buf.as_bytes(), status.code()))
+    }
+}
+
+/// Literal prefix on the `postprocess:` progress template, so the line is
+/// recognizable in stdout without colliding with download ticks, banners,
+/// or the `after_move:` path line.
+const POSTPROCESS_TAG: &str = "unduhin-postprocess:";
+
+/// How long the cancel path waits for the child to exit and the stderr
+/// pipe to reach EOF before giving up and returning anyway.
+///
+/// A cancel is always someone waiting — `Core::remove` blocks on this
+/// worker before it touches the disk, and the queue can't reclaim the row
+/// until it exits. A stuck drain here used to surface as a dead Delete
+/// button, so the drain gets a budget rather than a promise.
+const CANCEL_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Whether `line` is one of yt-dlp's post-processing progress ticks.
+fn is_postprocess_line(line: &str) -> bool {
+    line.trim_start().starts_with(POSTPROCESS_TAG)
+}
+
+/// Per-download scratch directory for yt-dlp's `--paths temp:`.
+///
+/// Prefers `%TEMP%\Unduhin\<id>` so the churn of `.part` / `.ytdl` /
+/// `.part-Frag<N>.part` files never appears in the user's download folder.
+///
+/// Falls back to a dot-directory inside `output_dir` when the two are on
+/// different volumes. yt-dlp finishes by `shutil.move`-ing temp → home,
+/// which is an atomic rename within a volume but a full byte copy across
+/// one — and a category folder may well live on another drive, where that
+/// would mean re-copying multi-gigabyte videos at the end of every
+/// download.
+pub fn scratch_dir_for(output_dir: &Path, id: i64) -> PathBuf {
+    let base = scratch_root();
+    if same_volume(&base, output_dir) {
+        base.join(id.to_string())
+    } else {
+        output_dir.join(SCRATCH_DIR_NAME).join(id.to_string())
+    }
+}
+
+/// Name of the fallback scratch directory created inside the download
+/// folder when `%TEMP%` is on a different volume.
+const SCRATCH_DIR_NAME: &str = ".unduhin-tmp";
+
+/// Root of the shared scratch area: `%TEMP%\Unduhin` (or the platform
+/// equivalent). Every per-download directory lives directly under it and
+/// is named for its download id, so the startup sweep
+/// ([`crate::Core::open`]) and the Settings → "Clear temporary data"
+/// action can enumerate and prune it.
+pub fn scratch_root() -> PathBuf {
+    std::env::temp_dir().join("Unduhin")
+}
+
+/// Whether two paths live on the same volume.
+///
+/// Windows-shaped: compares the path prefix (`C:`, `\\server\share`),
+/// which is what decides rename-vs-copy for `shutil.move`. Non-Windows
+/// has no cheap sync equivalent (`st_dev` needs both paths to exist), and
+/// the yt-dlp path is Windows-only in practice, so other targets take the
+/// optimistic answer and use the temp dir.
+fn same_volume(a: &Path, b: &Path) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use std::path::Component;
+        let prefix = |p: &Path| match p.components().next() {
+            Some(Component::Prefix(pre)) => Some(pre.as_os_str().to_ascii_lowercase()),
+            _ => None,
+        };
+        match (prefix(a), prefix(b)) {
+            (Some(x), Some(y)) => x == y,
+            // A relative or prefix-less path (only really reachable from
+            // tests) can't be reasoned about — don't risk a cross-volume
+            // copy on a guess.
+            _ => false,
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (a, b);
+        true
     }
 }
 
@@ -1476,5 +1690,326 @@ Tor       -     curl_cffi>=0.11 (unavailable)
             !args.contains("--referer"),
             "no referrer supplied, so none must be forwarded, got args: {args}"
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn probe_media_formats_keeps_its_full_timeout_when_the_impersonation_check_is_slow() {
+        // The impersonation-availability check used to run *inside*
+        // `timeout_duration`. Because it is itself a subprocess spawn with
+        // its own 3s cap — the same order as the default
+        // `ytdlp_probe_timeout_ms` — the first probe against a given
+        // binary could spend the caller's entire budget on
+        // `--list-impersonate-targets` and then fail with `Timeout`,
+        // having never probed the URL at all. That is exactly the call
+        // the user waits on when the popup asks for a stream's qualities.
+        //
+        // Here the availability check takes ~2s while the probe itself is
+        // given only 1s. Hoisted out, the probe still gets its full
+        // second and succeeds.
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake-yt-dlp.cmd");
+        let captured = dir.path().join("captured_args.txt");
+        tokio::fs::write(
+            &script,
+            format!(
+                "@echo off\r\n\
+                 echo %1 | findstr /C:\"--list-impersonate-targets\" >NUL\r\n\
+                 if %ERRORLEVEL% EQU 0 (\r\n\
+                 ping -n 3 127.0.0.1 >NUL\r\n\
+                 echo [info] Available impersonate targets\r\n\
+                 echo Client        OS           Source\r\n\
+                 echo ------------------------------------\r\n\
+                 echo Chrome-136    Macos-15     curl_cffi\r\n\
+                 ) else (\r\n\
+                 echo %* > \"{}\"\r\n\
+                 echo {{\"extractor\":\"generic\",\"title\":\"t\",\"formats\":[]}}\r\n\
+                 )\r\n",
+                captured.display()
+            ),
+        )
+        .await
+        .unwrap();
+
+        let probe_timeout = Duration::from_secs(1);
+        let started = std::time::Instant::now();
+        let formats = probe_media_formats(
+            "https://cdn.example.com/master.m3u8",
+            &script,
+            probe_timeout,
+            Some("https://example.com/watch"),
+            true, // impersonate ON, so the slow availability check runs
+        )
+        .await
+        .expect("the slow availability check must not consume the probe's own budget");
+        assert!(formats.is_empty());
+
+        // Proves the check really did run (and really was slow) rather
+        // than the test passing because it was skipped outright.
+        assert!(
+            started.elapsed() > probe_timeout,
+            "the whole call should have outlasted the probe's timeout, taking the \
+             availability check's ~2s on top; took {:?}",
+            started.elapsed()
+        );
+
+        let args = tokio::fs::read_to_string(&captured).await.unwrap();
+        assert!(args.contains("--impersonate"), "got args: {args}");
+    }
+
+    /// A `YtdlpJob` pointed at `script`, writing into `dir`, with every
+    /// optional knob off. Keeps the download tests below focused on the
+    /// one thing each is actually about.
+    #[cfg(target_os = "windows")]
+    fn download_job(script: &Path, dir: &Path) -> YtdlpJob {
+        YtdlpJob {
+            url: "https://cdn.example.com/media.m3u8".into(),
+            format_selector: "best".into(),
+            output_dir: dir.join("out"),
+            temp_dir: dir.join("scratch"),
+            output_template: "Some Video.%(ext)s".into(),
+            binary_path: script.to_path_buf(),
+            ffmpeg_path: None,
+            user_agent: None,
+            extra_headers: Vec::new(),
+            limit_rate_bps: None,
+            impersonate: false,
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn download_routes_scratch_through_paths_and_keeps_output_relative() {
+        // yt-dlp ignores `--paths` outright when the output template
+        // carries an absolute path, so "scratch goes to temp:" and
+        // "`--output` is relative" are one invariant, not two. Assert both
+        // together — an absolute `--output` sneaking back in would put
+        // `.part` / `.ytdl` / `.part-Frag<N>.part` right back in the
+        // user's download folder with no other visible symptom.
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake-yt-dlp.cmd");
+        let captured = dir.path().join("captured_args.txt");
+        tokio::fs::write(
+            &script,
+            format!("@echo off\r\necho %* > \"{}\"\r\n", captured.display()),
+        )
+        .await
+        .unwrap();
+
+        let job = download_job(&script, dir.path());
+        let (home, temp) = (job.output_dir.clone(), job.temp_dir.clone());
+        // The fake binary exits 0 having downloaded nothing, so the call
+        // succeeds with a zero-byte outcome; the argv is the assertion.
+        let _ = download(job, CancellationToken::new(), None).await;
+
+        // Windows re-quotes any argument containing a space or a colon,
+        // so the captured line reads `--paths "home:C:\…"`.
+        let args = tokio::fs::read_to_string(&captured).await.unwrap();
+        assert!(
+            args.contains(&format!("--paths \"home:{}\"", home.display())),
+            "got args: {args}"
+        );
+        assert!(
+            args.contains(&format!("--paths \"temp:{}\"", temp.display())),
+            "got args: {args}"
+        );
+        assert!(
+            args.contains("--output \"Some Video.%(ext)s\""),
+            "the output template must stay relative or --paths is ignored; got args: {args}"
+        );
+        assert!(
+            !args.contains(&format!("--output \"{}", home.display())),
+            "an absolute --output silently disables --paths; got args: {args}"
+        );
+        // Both directories are created up front — yt-dlp will not make
+        // the temp dir itself.
+        assert!(tokio::fs::metadata(&temp).await.is_ok());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn download_progress_template_prefixes_every_alternate_field() {
+        // `%(progress.total_bytes,total_bytes_estimate)s` looks right and
+        // is silently dead: alternates resolve from the template root,
+        // whose only keys are `info` and `progress`, so the bare second
+        // name never matches and the field is `NA` forever. HLS has no
+        // `total_bytes`, so the bar sat empty for the whole download.
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake-yt-dlp.cmd");
+        let captured = dir.path().join("captured_args.txt");
+        tokio::fs::write(
+            &script,
+            format!("@echo off\r\necho %* > \"{}\"\r\n", captured.display()),
+        )
+        .await
+        .unwrap();
+
+        let _ = download(
+            download_job(&script, dir.path()),
+            CancellationToken::new(),
+            None,
+        )
+        .await;
+
+        let args = tokio::fs::read_to_string(&captured).await.unwrap();
+        assert!(
+            args.contains("%(progress.total_bytes,progress.total_bytes_estimate)s"),
+            "got args: {args}"
+        );
+        assert!(
+            args.contains("%(progress.fragment_index)s"),
+            "fragment counts are the fallback when neither byte total exists; got args: {args}"
+        );
+        assert!(
+            args.contains(&format!("postprocess:{POSTPROCESS_TAG}")),
+            "got args: {args}"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn post_processing_is_detected_on_stderr_not_stdout() {
+        // yt-dlp writes `postprocess:` ticks to **stderr** while download
+        // ticks and the `after_move:` line go to stdout. Verified against
+        // the real binary with `--remux-video mkv`: stdout carried only
+        // the two progress lines and the final path, stderr carried all
+        // four `started`/`finished` post-processor ticks.
+        //
+        // The whole `Muxing` state now hangs off this one signal, and
+        // watching the wrong stream fails silently — the row would just
+        // never leave `Active`. Hence a test that puts the tag exactly
+        // where the real binary puts it.
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake-yt-dlp.cmd");
+        tokio::fs::write(
+            &script,
+            // `^|` — a bare `|` in a .cmd is a pipe operator, not text.
+            "@echo off\r\n\
+             echo 1024^|2048^|NA^|NA^|NA^|NA\r\n\
+             echo unduhin-postprocess:started 1>&2\r\n\
+             echo unduhin-postprocess:finished 1>&2\r\n",
+        )
+        .await
+        .unwrap();
+
+        let (tx, mut rx) = broadcast::channel(16);
+        download(
+            download_job(&script, dir.path()),
+            CancellationToken::new(),
+            Some(tx),
+        )
+        .await
+        .expect("fake binary exits 0");
+
+        let mut saw_postprocessing = 0usize;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, ProgressEvent::PostProcessing) {
+                saw_postprocessing += 1;
+            }
+        }
+        assert_eq!(
+            saw_postprocessing, 1,
+            "expected exactly one PostProcessing event — yt-dlp ticks the \
+             hook per post-processor and twice each, but the row enters \
+             Muxing once"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn cancel_kills_grandchildren_and_returns_promptly() {
+        // The real failure this guards: `yt-dlp.exe` is a PyInstaller
+        // one-file build whose bootloader runs the actual downloader as
+        // its own child, and yt-dlp spawns ffmpeg on top of that.
+        // `TerminateProcess` on the PID we spawned does not cascade, so
+        // the downloader survived a pause and kept writing — and because
+        // it inherited our stdout/stderr write handles, the drain never
+        // saw EOF and `download()` never returned, which is what made
+        // Delete look dead in the UI.
+        //
+        // `start /b ping` reproduces both halves: a grandchild that
+        // outlives its parent and holds the inherited pipe. With the job
+        // object in place the whole tree dies and the call returns fast.
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake-yt-dlp.cmd");
+        let marker = dir.path().join("grandchild-alive.txt");
+        // The grandchild outlives the .cmd (`start /b` doesn't wait) and
+        // keeps writing the marker for a minute unless it is killed.
+        tokio::fs::write(
+            &script,
+            format!(
+                "@echo off\r\n\
+                 start /b cmd /c \"for /l %%i in (1,1,600) do (echo %%i> \"{}\" & ping -n 2 127.0.0.1 >NUL)\"\r\n\
+                 ping -n 60 127.0.0.1 >NUL\r\n",
+                marker.display()
+            ),
+        )
+        .await
+        .unwrap();
+
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(download(
+            download_job(&script, dir.path()),
+            cancel.clone(),
+            None,
+        ));
+        // Give the script time to spawn its grandchild before cancelling.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            tokio::fs::metadata(&marker).await.is_ok(),
+            "the fake binary never spawned its grandchild, so this test would pass vacuously"
+        );
+
+        let started = std::time::Instant::now();
+        cancel.cancel();
+        let result = timeout(Duration::from_secs(15), handle)
+            .await
+            .expect("download() must return after a cancel, not hang on the pipe drain")
+            .unwrap();
+        assert!(
+            matches!(result, Err(YtdlpError::Process { message, .. }) if message == "cancelled")
+        );
+        assert!(
+            started.elapsed() < CANCEL_DRAIN_TIMEOUT,
+            "cancel should be prompt, not ride out the drain budget; took {:?}",
+            started.elapsed()
+        );
+
+        // The grandchild must be gone: if it were still looping it would
+        // keep touching the marker.
+        let before = tokio::fs::metadata(&marker)
+            .await
+            .unwrap()
+            .modified()
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let after = tokio::fs::metadata(&marker)
+            .await
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(
+            before, after,
+            "the grandchild survived the cancel and is still writing"
+        );
+    }
+
+    #[test]
+    fn scratch_dir_is_per_download_and_under_the_shared_root() {
+        let root = scratch_root();
+        // Same volume as %TEMP% (it *is* %TEMP%), so the temp root wins.
+        let dir = scratch_dir_for(&root.join("downloads"), 42);
+        assert_eq!(dir, root.join("42"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn scratch_dir_falls_back_in_place_across_volumes() {
+        // yt-dlp finishes by moving temp → home. Across volumes that is a
+        // byte copy, so an 8 GB download would be written twice; keep the
+        // scratch next to the output instead.
+        let output = Path::new(r"Z:\Media\Clips");
+        let dir = scratch_dir_for(output, 7);
+        assert_eq!(dir, output.join(SCRATCH_DIR_NAME).join("7"));
     }
 }

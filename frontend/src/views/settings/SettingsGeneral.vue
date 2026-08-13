@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, onMounted, ref } from "vue";
 import { useI18n } from "vue-i18n";
 
 import SettingsSection from "@/components/settings/SettingsSection.vue";
@@ -10,18 +10,68 @@ import SliderField from "@/components/settings/controls/SliderField.vue";
 import SpeedLimitField from "@/components/settings/controls/SpeedLimitField.vue";
 import ThemeTriToggle from "@/components/settings/controls/ThemeTriToggle.vue";
 import ToggleSwitch from "@/components/settings/controls/ToggleSwitch.vue";
+import Button from "@/components/ui/Button.vue";
 import Select from "@/components/ui/Select.vue";
 
 import { useGeneralSettings } from "@/composables/useGeneralSettings";
 import { useSettingsFilter } from "@/composables/useSettingsFilter";
 import { useLocale } from "@/composables/useLocale";
+import { useToast } from "@/composables/useToast";
+import { formatBytes } from "@/lib/format";
+import { api } from "@/types/tauri-bindings";
 import type { LocaleSetting } from "@/i18n";
 
 const { t } = useI18n();
 const settings = useGeneralSettings();
 const filter = useSettingsFilter();
 const locale = useLocale();
+const toast = useToast();
 const isHidden = (id: string) => filter.isHidden(id);
+
+/** Reclaimable scratch, in bytes. `null` until the first read lands. */
+const tempBytes = ref<number | null>(null);
+const clearingTemp = ref(false);
+
+async function refreshTempSize() {
+  try {
+    tempBytes.value = await api.getTemporaryDataSize();
+  } catch {
+    // Purely informational; a failed size read shouldn't nag the user.
+    tempBytes.value = null;
+  }
+}
+
+onMounted(refreshTempSize);
+
+const tempDescription = computed(() => {
+  if (tempBytes.value === null) return t("settings.clearTempDataDesc");
+  return t("settings.clearTempDataDescWithSize", {
+    size: formatBytes(tempBytes.value),
+  });
+});
+
+async function onClearTemporaryData() {
+  clearingTemp.value = true;
+  try {
+    const result = await api.clearTemporaryData();
+    toast.push(
+      result.removedDirs === 0
+        ? t("settings.clearTempDataEmpty")
+        : t("settings.clearTempDataDone", {
+            size: formatBytes(result.freedBytes),
+          }),
+      "success",
+    );
+    await refreshTempSize();
+  } catch (e: unknown) {
+    toast.push(
+      (e as { message?: string })?.message ?? t("settings.clearTempDataFailed"),
+      "error",
+    );
+  } finally {
+    clearingTemp.value = false;
+  }
+}
 
 const languageOptions = computed(() => [
   { value: "system", label: t("settings.languageSystem") },
@@ -167,6 +217,30 @@ function onLanguage(value: string) {
             {{ t("settings.languageRestartHint") }}
           </p>
         </div>
+      </SettingRow>
+    </SettingCard>
+
+    <SettingCard
+      :title="t('settings.cardStorage')"
+      :description="t('settings.cardStorageDesc')"
+    >
+      <SettingRow
+        id="general/clear-temp-data"
+        :label="t('settings.clearTempData')"
+        :description="tempDescription"
+        :hidden="isHidden('general/clear-temp-data')"
+      >
+        <Button
+          variant="secondary"
+          :disabled="clearingTemp || tempBytes === 0"
+          @click="onClearTemporaryData"
+        >
+          {{
+            clearingTemp
+              ? t("settings.clearTempDataBusy")
+              : t("settings.clearTempDataAction")
+          }}
+        </Button>
       </SettingRow>
     </SettingCard>
 

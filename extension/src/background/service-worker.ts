@@ -15,6 +15,8 @@ import type {
   ExtensionSettings,
   Inbound,
   MediaStream,
+  MediaStreamsMessage,
+  MediaVariant,
   Outbound,
   PopupDownloadMediaResponse,
   PopupMediaStream,
@@ -33,8 +35,9 @@ import { createNativeBridge } from "./native-bridge.js";
 import type { NativeBridge } from "./native-bridge.js";
 import { installDownloadInterceptor } from "./download-interceptor.js";
 import { installMediaSniffer } from "./media-sniffer.js";
-import { labelFor, loadVariants } from "./hls-master.js";
+import { labelFor, loadVariants, peekVariants } from "./hls-master.js";
 import type { ProbeViaApp } from "./hls-master.js";
+import { assembleStreams, sameStreams } from "./stream-view.js";
 import { installContextMenu } from "./context-menu.js";
 import { mergeStatus, readRecentJobs, recordAck } from "./recent-jobs.js";
 import { pruneTo, snapshotForWire } from "./rule-metrics.js";
@@ -208,7 +211,27 @@ const bridge: NativeBridge = {
   shutdown: () => rawBridge.shutdown(),
 };
 
-const mediaSniffer = installMediaSniffer({ headerCache, settings });
+const mediaSniffer = installMediaSniffer({
+  headerCache,
+  settings,
+  // Resolve a master playlist's qualities the moment the manifest is
+  // seen, rather than when the popup asks for them. Playback fetches its
+  // manifests over the course of page load, so the work lands well before
+  // the user reaches for the toolbar icon and is spread out instead of
+  // arriving as one burst — which matters because the native probe tier
+  // is dispatched strictly serially on the app side.
+  //
+  // Fire-and-forget: `loadVariants` caches its own failures and never
+  // rejects in practice, and there is no UI waiting on this.
+  onStreamDetected: (stream) => {
+    if (stream.kind !== "hls") return;
+    void loadVariants(
+      stream.manifestUrl,
+      stream.tabId,
+      makeAppProber(stream.pageUrl),
+    ).catch((err) => log.debug("variant warm-up failed:", err));
+  },
+});
 
 installDownloadInterceptor({ headerCache, bridge, settings });
 installContextMenu({ headerCache, bridge, settings });
@@ -291,44 +314,29 @@ function makeAppProber(referrer: string | null): ProbeViaApp {
   };
 }
 
+/**
+ * The popup's on-open snapshot. Deliberately does no network work: media
+ * rows are built from what the sniffer already has plus whatever variants
+ * are already cached, so the list paints on the popup's first frame.
+ *
+ * Master playlists that haven't been resolved yet render as plain rows and
+ * are upgraded to quality rows by the `media-streams` broadcast that
+ * {@link resolveVariantsForTab} sends when resolution lands. In practice
+ * the cache is usually already warm — the sniffer kicks resolution off the
+ * moment it sees a manifest — and this reply is final.
+ *
+ * `readRecentJobs` is still awaited: it's a `chrome.storage.session` read,
+ * not a network call.
+ */
 async function buildSnapshot(
   tabIdOverride: number | undefined,
 ): Promise<PopupSnapshotResponse> {
   const tabId = tabIdOverride ?? (await activeTabId());
-  const sniffed = tabId == null ? [] : mediaSniffer.getStreamsForTab(tabId);
+  const streams = assembleCachedStreams(tabId);
 
-  // Resolve HLS master playlists into their selectable qualities. Each
-  // tier is bounded + cached inside `loadVariants`; a non-master (or a
-  // failed lookup) yields no variants and renders as a plain row.
-  const parsed = await Promise.all(
-    sniffed.map(async (s) => ({
-      s,
-      variants:
-        s.kind === "hls"
-          ? await loadVariants(s.manifestUrl, tabId, makeAppProber(s.pageUrl))
-          : [],
-    })),
-  );
-
-  // A master's renditions are themselves media playlists the sniffer often
-  // also caught (e.g. the one hls.js auto-selected). Collect every master's
-  // variant URLs so we can drop those twin rows — the master's quality rows
-  // already cover them.
-  const variantUrls = new Set<string>();
-  for (const p of parsed) {
-    for (const v of p.variants) variantUrls.add(v.url);
-  }
-
-  const streams: PopupMediaStream[] = parsed
-    .filter((p) => !(p.variants.length === 0 && variantUrls.has(p.s.manifestUrl)))
-    .map((p) => ({
-      kind: p.s.kind,
-      manifestUrl: p.s.manifestUrl,
-      pageUrl: p.s.pageUrl,
-      tabId: Number(p.s.tabId ?? tabId),
-      suggestedFilename: p.s.suggestedFilename,
-      ...(p.variants.length > 0 ? { variants: p.variants } : {}),
-    }));
+  // Resolve anything still cold behind the reply. Not awaited — that's
+  // the entire point.
+  if (tabId != null) void resolveVariantsForTab(tabId, streams);
 
   const recentJobs = await readRecentJobs();
   return {
@@ -336,6 +344,67 @@ async function buildSnapshot(
     streams,
     recentJobs,
   };
+}
+
+/** Media rows for `tabId` from cache alone — no fetch, no probe, no await. */
+function assembleCachedStreams(tabId: number | null): PopupMediaStream[] {
+  const sniffed = tabId == null ? [] : mediaSniffer.getStreamsForTab(tabId);
+  return assembleStreams(sniffed, tabId, (url) => peekVariants(url) ?? []);
+}
+
+/**
+ * Resolve every HLS master playlist on `tabId` and broadcast the finished
+ * list, so a popup that rendered plain rows can regroup them into quality
+ * rows.
+ *
+ * Broadcast once, after everything settles, rather than per stream: each
+ * message rebuilds the whole list in the popup, and several in a row read
+ * as flicker. Skipped entirely when the result matches `alreadySent` —
+ * the common warm-cache case, where the snapshot was already correct.
+ */
+async function resolveVariantsForTab(
+  tabId: number,
+  alreadySent: readonly PopupMediaStream[],
+): Promise<void> {
+  const sniffed = mediaSniffer.getStreamsForTab(tabId);
+  const hls = sniffed.filter((s) => s.kind === "hls");
+  if (hls.every((s) => peekVariants(s.manifestUrl) != null)) return;
+
+  const resolved = new Map<string, readonly MediaVariant[]>();
+  await Promise.all(
+    hls.map(async (s) => {
+      // Each tier is bounded and cached inside `loadVariants`; a non-master
+      // (or a failed lookup) yields no variants and renders as a plain row.
+      const variants = await loadVariants(
+        s.manifestUrl,
+        tabId,
+        makeAppProber(s.pageUrl),
+      ).catch((err) => {
+        log.debug("loadVariants failed:", err);
+        return [] as readonly MediaVariant[];
+      });
+      resolved.set(s.manifestUrl, variants);
+    }),
+  );
+
+  // Re-read the sniffed list: playback may have surfaced more manifests
+  // while we were resolving, and the tab may have navigated away.
+  const streams = assembleStreams(
+    mediaSniffer.getStreamsForTab(tabId),
+    tabId,
+    (url) => resolved.get(url) ?? peekVariants(url) ?? [],
+  );
+  if (sameStreams(streams, alreadySent)) return;
+
+  const msg: MediaStreamsMessage = { kind: "media-streams", tabId, streams };
+  // `sendMessage` rejects when no popup is listening — the normal case
+  // once the user has closed it — and can throw synchronously during
+  // browser shutdown.
+  try {
+    chrome.runtime.sendMessage(msg).catch(() => {});
+  } catch {
+    /* Chrome is going away; nothing to deliver to. */
+  }
 }
 
 async function handleDownloadMedia(

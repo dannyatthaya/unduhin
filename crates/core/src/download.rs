@@ -898,6 +898,23 @@ pub(crate) async fn remove(
     }
 
     let mut outcome = RemoveOutcome::default();
+    // yt-dlp scratch goes regardless of `delete_data`. It is not "the
+    // download" in any sense the user recognises — it's a `.part`, a
+    // fragment index, and a pile of `.part-Frag<N>.part` files that only
+    // this row could ever have resumed. Keeping the row's *finished* file
+    // while discarding its scratch is the only coherent reading of
+    // "remove from list", and the alternative is silent, invisible
+    // accumulation in `%TEMP%`.
+    if record.kind == DownloadKind::Media {
+        if let Some(dir) = record.output_path.parent() {
+            let scratch = crate::ytdlp::scratch_dir_for(dir, id);
+            if let Err(e) = tokio::fs::remove_dir_all(&scratch).await {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::debug!(id, error = %e, "remove: scratch cleanup failed");
+                }
+            }
+        }
+    }
     if delete_data {
         // Multi-file torrents create a *content folder* (the row's
         // `output_path` is the content root), so they need a recursive

@@ -1,9 +1,13 @@
 // Popup entry. Lifecycle:
 //
 //   1. On open, message the SW for a snapshot (bridge status, streams for
-//      the active tab, recent jobs).
-//   2. Subscribe to `bridge-status` broadcasts so the header dot updates
-//      live without polling.
+//      the active tab, recent jobs). The snapshot never waits on the
+//      network, so the list paints on the first frame.
+//   2. Subscribe — before that round-trip, so nothing is missed — to
+//      `bridge-status` broadcasts so the header dot updates live without
+//      polling, and to `media-streams` so a stream whose qualities
+//      weren't cached yet regroups into quality rows once the SW has
+//      resolved them.
 //   3. Listen for `chrome.storage.session.onChanged` on the recent-jobs
 //      key so newly-completed downloads animate in even while the popup
 //      is open.
@@ -20,6 +24,7 @@
 import type {
   BridgeStatus,
   BridgeStatusMessage,
+  MediaStreamsMessage,
   PopupDownloadMediaRequest,
   PopupDownloadMediaResponse,
   PopupMediaStream,
@@ -50,6 +55,9 @@ const els = {
 
 let currentTabId: number | null = null;
 let toastTimer: ReturnType<typeof setTimeout> | null = null;
+/** Set once a `media-streams` broadcast has painted the media list, so the
+ *  initial snapshot can't overwrite it with an older view. */
+let hasLiveStreams = false;
 
 void boot();
 
@@ -62,11 +70,19 @@ async function boot(): Promise<void> {
     void refreshStatus();
   });
   currentTabId = await activeTabId();
+  // Subscribe *before* the snapshot round-trip: the SW starts resolving
+  // qualities as soon as it has served the snapshot, and a `media-streams`
+  // broadcast that lands while we're still awaiting would otherwise be
+  // dropped with no second chance. `currentTabId` is already set, so the
+  // tab guard in the handler is valid from the first message.
+  installLiveSubscriptions();
   const snapshot = await requestSnapshot(currentTabId);
   renderBridgeStatus(snapshot.bridgeStatus);
-  renderMedia(snapshot.streams);
+  // Unless a broadcast beat the reply here — resolution can finish inside
+  // the round-trip when the cache was already warm — in which case the
+  // snapshot is the older of the two and must not paint over it.
+  if (!hasLiveStreams) renderMedia(snapshot.streams);
   renderRecent(snapshot.recentJobs);
-  installLiveSubscriptions();
   // Kick a status refresh on open so any pre-existing recent-job rows
   // reflect the latest host-side state, not a stale snapshot.
   void refreshStatus({ silent: true });
@@ -77,6 +93,14 @@ function installLiveSubscriptions(): void {
     if (!msg || typeof msg !== "object") return;
     if ("kind" in msg && msg.kind === "bridge-status") {
       renderBridgeStatus((msg as BridgeStatusMessage).status);
+    }
+    if ("kind" in msg && msg.kind === "media-streams") {
+      const update = msg as MediaStreamsMessage;
+      // Resolution finishing for some other tab is not a reason to
+      // repaint what the user is looking at.
+      if (update.tabId !== currentTabId) return;
+      hasLiveStreams = true;
+      renderMedia(update.streams);
     }
   });
   chrome.storage.onChanged.addListener((changes, area) => {
