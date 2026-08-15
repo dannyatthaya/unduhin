@@ -1,0 +1,10 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Unduhin Dev",
+  "identifier": "com.unduhin.app.dev",
+  "plugins": {
+    "updater": {
+      "active": false
+    }
+  }
+}

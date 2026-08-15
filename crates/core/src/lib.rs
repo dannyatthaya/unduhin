@@ -41,8 +41,8 @@ pub mod ytdlp;
 pub use category::{Category, CategoryId, NewCategory};
 pub use download::{
     count_by_source, last_by_source, AddDownload, CategorySelector, DownloadFilter, DownloadId,
-    DownloadKind, DownloadRecord, DownloadSource, Status, SwarmStats, TorrentFile, TorrentMeta,
-    TorrentSource, ALL_STATUSES,
+    DownloadKind, DownloadRecord, DownloadSource, ErrorKind, RefreshOutcome, Status, SwarmStats,
+    TorrentFile, TorrentMeta, TorrentSource, ALL_STATUSES,
 };
 pub use error::{CoreError, Result};
 pub use event::CoreEvent;
@@ -338,6 +338,153 @@ impl Core {
             });
         }
         Ok(())
+    }
+
+    /// Point a stopped download at a new URL, with new captured headers.
+    ///
+    /// The recovery path for an expired link. A row that failed with
+    /// [`ErrorKind::ExpiredAuth`] cannot be fixed by [`Core::retry`] — retry
+    /// re-queues the same dead URL with the same stale cookies and fails
+    /// identically. This replaces both, and keeps the bytes already on disk
+    /// whenever the replacement URL serves the same body.
+    ///
+    /// Scoped to [`DownloadKind::Http`]. Media rows re-resolve their URL on
+    /// every attempt through `MediaInfo.original_url`, and torrents have no
+    /// URL to refresh.
+    ///
+    /// `url` is untrusted — in the extension flow it comes straight from the
+    /// browser — so it is parsed and scheme-checked before it reaches a
+    /// request.
+    ///
+    /// Returns [`RefreshOutcome::SourceChanged`] **without changing anything**
+    /// when the new URL serves a different body than the partial file was built
+    /// from. Call again with `force_restart` to discard the partial and start
+    /// over.
+    pub async fn refresh_source(
+        &self,
+        id: DownloadId,
+        url: &str,
+        headers: Option<Vec<(String, String)>>,
+        force_restart: bool,
+    ) -> Result<RefreshOutcome> {
+        let record = download::get(&self.inner.pool, id).await?;
+
+        if record.kind != download::DownloadKind::Http {
+            return Err(CoreError::InvalidArgument(format!(
+                "only direct HTTP downloads can have their link refreshed (this row is {})",
+                record.kind
+            )));
+        }
+        // Refreshing a running row would swap the URL under a live worker.
+        if !matches!(record.status, Status::Failed | Status::Paused) {
+            return Err(CoreError::InvalidTransition {
+                id,
+                from: record.status.to_string(),
+                to: "refreshed".to_string(),
+            });
+        }
+
+        let parsed: url::Url = url
+            .parse()
+            .map_err(|e| CoreError::InvalidArgument(format!("invalid refresh url: {e}")))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(CoreError::InvalidArgument(format!(
+                "refresh url must be http or https, got {}",
+                parsed.scheme()
+            )));
+        }
+
+        // Probe with the NEW headers, using the same timeout / user-agent
+        // settings the worker will use. A probe that passes under different
+        // settings than the download would be worthless.
+        let (connect_timeout, read_timeout) = queue::timeouts(&self.inner.pool).await;
+        let ua = queue::user_agent_setting(&self.inner.pool).await;
+        let header_slice = headers.as_deref().unwrap_or(&[]);
+        let client =
+            engine::http::build_client(connect_timeout, read_timeout, ua.as_deref(), header_slice)?;
+        // A dead replacement fails HERE, before the row is touched, so the
+        // caller can say "that link is expired too" instead of queueing
+        // another identical failure.
+        let remote = engine::probe(&client, &parsed).await?;
+
+        // Does the new URL serve the same body the partial file came from?
+        // `matches_remote` is the exact check `resume_at` runs, so agreeing
+        // with it here means the worker will agree with us later.
+        let sidecar = engine::Meta::sidecar_path(&record.output_path);
+        let mut meta = engine::Meta::load(&sidecar).await.ok();
+        let resumable = match meta.as_ref() {
+            Some(m) => m.matches_remote(
+                remote.etag.as_deref(),
+                remote.last_modified.as_deref(),
+                remote.content_length,
+            ),
+            // No sidecar means there is nothing to resume. That is a restart,
+            // not a mismatch.
+            None => false,
+        };
+
+        if meta.is_some() && !resumable && !force_restart {
+            return Ok(RefreshOutcome::SourceChanged {
+                old_bytes: meta.as_ref().and_then(|m| m.total_bytes),
+                new_bytes: remote.content_length,
+            });
+        }
+
+        if !resumable {
+            // Drops the sidecar and zeroes the progress columns, so the row
+            // cannot show a bar it has no bytes behind.
+            download::reset_for_restart(&self.inner.pool, id).await?;
+        }
+
+        download::update_source(&self.inner.pool, id, parsed.as_str(), headers.as_deref()).await?;
+
+        if resumable {
+            // The DB column is not what the worker resumes against.
+            // `engine::resume_at_with_control` takes no URL argument at all —
+            // it reads `Meta.url` out of the sidecar. Rewriting only the row
+            // would leave the worker fetching the dead link and failing with
+            // the same 403 that started this. Write the sidecar BEFORE the
+            // row goes back to `Queued`, so the queue can never observe a
+            // refreshed row pointing at a stale sidecar.
+            if let Some(m) = meta.as_mut() {
+                m.url = parsed.to_string();
+                m.save(&sidecar).await?;
+            }
+            // `update_source` cleared the validators along with the URL. Put
+            // the freshly probed ones back so the DB mirrors the sidecar the
+            // worker is about to validate against.
+            download::persist_progress(
+                &self.inner.pool,
+                id,
+                record.downloaded_bytes,
+                remote.content_length,
+                remote.etag.as_deref(),
+                remote.last_modified.as_deref(),
+                None,
+            )
+            .await?;
+        }
+
+        self.change_status(id, &[Status::Failed, Status::Paused], Status::Queued)
+            .await?;
+
+        if resumable {
+            Ok(RefreshOutcome::Resumed {
+                downloaded_bytes: record.downloaded_bytes,
+                total_bytes: remote.content_length,
+            })
+        } else {
+            // Drop the live bar to zero straight away, the same way `retry`
+            // does for a restarted completed row.
+            let _ = self.inner.events.send(CoreEvent::ProgressUpdate {
+                id,
+                downloaded: 0,
+                total: remote.content_length,
+                speed_bps: 0.0,
+                eta: None,
+            });
+            Ok(RefreshOutcome::Restarted)
+        }
     }
 
     /// Remove a download row. When `delete_data` is true, the file on
@@ -967,8 +1114,36 @@ pub fn default_db_path() -> Option<PathBuf> {
     directories_root().map(|dir| dir.join("unduhin.db"))
 }
 
+/// Environment variable that relocates the entire app-data root.
+///
+/// Set by `scripts/dev.ps1` so a `cargo tauri dev` build can run beside an
+/// installed release without sharing the database, logs, managed binaries,
+/// torrent state, or the canonical unpacked-extension folder. Because the
+/// value is read here, every derived path moves with it — callers never
+/// need their own override.
+pub const DATA_ROOT_ENV: &str = "UNDUHIN_DATA_ROOT";
+
+/// Pure half of the [`DATA_ROOT_ENV`] lookup, split out so it is testable
+/// without mutating process-global environment state (which would race the
+/// other unit tests in this crate).
+///
+/// An unset *or* blank value falls through to the platform default — the
+/// same non-empty guard `resolve_db_path` applies to `UNDUHIN_DB`, so an
+/// accidentally-cleared variable degrades to normal behavior instead of
+/// rooting the app data at the filesystem root.
+fn data_root_override(raw: Option<&str>) -> Option<PathBuf> {
+    let trimmed = raw?.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(trimmed))
+}
+
 #[doc(hidden)]
 pub fn directories_root() -> Option<PathBuf> {
+    if let Some(root) = data_root_override(std::env::var(DATA_ROOT_ENV).ok().as_deref()) {
+        return Some(root);
+    }
     // We avoid pulling in `directories` here to keep deps tight; mimic the
     // behavior we want for Windows local data.
     #[cfg(target_os = "windows")]
@@ -1013,4 +1188,38 @@ pub fn fallback_download_dir() -> PathBuf {
 #[doc(hidden)]
 pub fn now_iso() -> String {
     Utc::now().to_rfc3339()
+}
+
+#[cfg(test)]
+mod dirs_tests {
+    use super::*;
+
+    #[test]
+    fn data_root_override_returns_the_configured_path() {
+        assert_eq!(
+            data_root_override(Some(r"C:\Users\dev\AppData\Local\unduhin-dev")),
+            Some(PathBuf::from(r"C:\Users\dev\AppData\Local\unduhin-dev"))
+        );
+    }
+
+    #[test]
+    fn data_root_override_trims_surrounding_whitespace() {
+        assert_eq!(
+            data_root_override(Some("  /tmp/unduhin-dev  ")),
+            Some(PathBuf::from("/tmp/unduhin-dev"))
+        );
+    }
+
+    #[test]
+    fn data_root_override_falls_through_when_unset() {
+        assert_eq!(data_root_override(None), None);
+    }
+
+    #[test]
+    fn data_root_override_falls_through_when_blank() {
+        // An accidentally-cleared variable must degrade to the platform
+        // default rather than rooting every app-data path at "".
+        assert_eq!(data_root_override(Some("")), None);
+        assert_eq!(data_root_override(Some("   ")), None);
+    }
 }

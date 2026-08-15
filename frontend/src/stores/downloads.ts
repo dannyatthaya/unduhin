@@ -166,6 +166,7 @@ export function applyEvent(state: DownloadsState, event: CoreEvent): void {
       if (rec) {
         rec.status = "failed";
         rec.error = event.error;
+        rec.error_kind = event.error_kind;
       }
       state.stats.delete(event.id);
       break;
@@ -427,6 +428,15 @@ export const useDownloadsStore = defineStore("downloads", () => {
     pause: api.pauseDownload,
     resume: api.resumeDownload,
     retry: api.retryDownload,
+    /**
+     * Recovery for a row whose link expired (`error_kind === "expired_auth"`),
+     * where `retry` cannot help — it replays the same dead URL.
+     *
+     * Resolves to `{ outcome: "source_changed" }` without changing anything
+     * when the new URL serves a different body; the caller must confirm with
+     * the user and call again with `forceRestart`.
+     */
+    refreshSource: api.refreshDownloadSource,
     /**
      * Direct passthrough to the backend's `remove_download` command.
      * Most UI surfaces should call `useDeleteConfirm().requestDelete(ids)`

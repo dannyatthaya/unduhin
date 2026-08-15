@@ -61,6 +61,12 @@ const UNSOLICITED_TYPES = new Set<Outbound["type"]>([
   "settingsChanged",
   "handoffDecision",
   "extensionUpdated",
+  // Both halves of the link refresh are app-initiated pushes with no reply on
+  // this port: `armRefresh` is fire-and-forget, and `refreshCredentials` is
+  // answered by a *separate* `credentialsRefreshed` send. Routing them here
+  // keeps them out of the reply FIFO, where they would hijack a pending ack.
+  "armRefresh",
+  "refreshCredentials",
 ]);
 
 /** Resolved on every reply except `pong` (which is consumed by the health check). */

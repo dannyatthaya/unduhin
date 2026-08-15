@@ -31,7 +31,7 @@ use tokio::net::TcpListener;
 use unduhin_core::settings::settings_keys;
 use unduhin_core::{
     AddDownload, CategorySelector, Core, CoreEvent, DownloadFilter, DownloadKind, DownloadSource,
-    NewSchedule, ScheduleKind, SettingValue, Status,
+    ErrorKind, NewSchedule, ScheduleKind, SettingValue, Status,
 };
 use url::Url;
 
@@ -76,6 +76,10 @@ struct ServerState {
     payload: Arc<Vec<u8>>,
     mode: ServerMode,
     requests: Arc<AtomicUsize>,
+    /// Token `/expiring` currently accepts. Any other value gets a 403,
+    /// which is how a signed URL dies in the wild. Mutable so a test can
+    /// rotate it mid-flight and then hand the row a fresh URL.
+    valid_token: Arc<std::sync::Mutex<String>>,
 }
 
 type Body = BoxBody<Bytes, Infallible>;
@@ -117,6 +121,28 @@ async fn handle(
                 .header(CONTENT_LENGTH, 0u64)
                 .body(full_body(Bytes::new()))
                 .unwrap());
+        }
+        // A signed URL. Serves the real bytes while the `token` query
+        // parameter matches the server's current token, and 403s once it
+        // does not — the ordinary way a time-limited CDN link expires.
+        // Falls through to the normal ranged handler on a good token so
+        // resume, `Range`, and the validators all behave as usual.
+        "/expiring" => {
+            let supplied = req
+                .uri()
+                .query()
+                .unwrap_or("")
+                .split('&')
+                .find_map(|kv| kv.strip_prefix("token="))
+                .unwrap_or("");
+            let current = state.valid_token.lock().unwrap().clone();
+            if supplied != current {
+                return Ok(Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .header(CONTENT_LENGTH, 0u64)
+                    .body(full_body(Bytes::new()))
+                    .unwrap());
+            }
         }
         // 200 OK with an HTML interstitial where a file was expected.
         "/landing" => {
@@ -196,6 +222,8 @@ struct TestServer {
     payload: Arc<Vec<u8>>,
     shutdown: tokio::sync::oneshot::Sender<()>,
     handle: tokio::task::JoinHandle<()>,
+    /// Shared with the request handler; see [`ServerState::valid_token`].
+    valid_token: Arc<std::sync::Mutex<String>>,
 }
 
 impl TestServer {
@@ -203,10 +231,12 @@ impl TestServer {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
         let payload = Arc::new(payload(size));
+        let valid_token = Arc::new(std::sync::Mutex::new("fresh".to_string()));
         let state = ServerState {
             payload: payload.clone(),
             mode,
             requests: Arc::new(AtomicUsize::new(0)),
+            valid_token: valid_token.clone(),
         };
         let st = state.clone();
         let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
@@ -238,11 +268,18 @@ impl TestServer {
             payload,
             shutdown: tx,
             handle,
+            valid_token,
         })
     }
 
     fn url(&self, path: &str) -> Url {
         Url::parse(&format!("http://{}{}", self.addr, path)).unwrap()
+    }
+
+    /// Rotate the token `/expiring` accepts, invalidating every URL that
+    /// carries the old one.
+    fn rotate_token(&self, next: &str) {
+        *self.valid_token.lock().unwrap() = next.to_string();
     }
 
     async fn stop(self) {
@@ -769,6 +806,423 @@ async fn empty_body_download_fails_instead_of_completing() -> Result<()> {
 
     core.shutdown().await?;
     server.stop().await;
+    Ok(())
+}
+
+/// Drive a download on `/expiring` until it has real bytes on disk, then pause
+/// it and kill the token. Leaves the row `Paused` with a valid sidecar and a
+/// URL that now 403s — the exact state a user hits when a signed link dies
+/// mid-download.
+async fn stalled_on_expired_link(
+    dir: &tempfile::TempDir,
+    server: &TestServer,
+) -> Result<(Core, i64, PathBuf)> {
+    let (core, _) = fresh_core(dir).await?;
+    let out = dir.path().join("file.bin");
+    let mut events = core.subscribe();
+    core.start().await?;
+
+    let id = core
+        .add_download(AddDownload {
+            url: server.url("/expiring?token=fresh"),
+            filename: Some("file.bin".into()),
+            output_path: Some(out.clone()),
+            category: Some(CategorySelector::Name("Other".into())),
+            priority: 0,
+            // Segmented, not single-stream. A single-stream transfer cannot
+            // resume at all (`engine::transfer` returns "cannot resume
+            // single-stream download mid-flight" once any bytes have landed),
+            // so a partial file only exists to preserve in the segmented case.
+            segments: Some(4),
+            media_info: None,
+            headers: None,
+            source: DownloadSource::Manual,
+            kind: DownloadKind::Http,
+            torrent: None,
+        })
+        .await?;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut saw_progress = false;
+    while std::time::Instant::now() < deadline {
+        tokio::select! {
+            ev = events.recv() => match ev {
+                Ok(CoreEvent::ProgressUpdate { downloaded, .. }) if downloaded > 0 => {
+                    saw_progress = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            },
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+    }
+    assert!(saw_progress, "never saw progress before pausing");
+
+    core.pause(id).await?;
+    wait_for_status(&core, id, Status::Paused, Duration::from_secs(10)).await?;
+
+    let rec = core.get_download(id).await?;
+    assert!(rec.downloaded_bytes > 0, "paused with zero bytes");
+    assert!(
+        rec.downloaded_bytes < server.payload.len() as u64,
+        "paused after already completing"
+    );
+
+    // The link dies while the user was away.
+    server.rotate_token("rotated");
+    Ok((core, id, out))
+}
+
+/// The whole point of the feature: a partial file survives the refresh.
+#[tokio::test]
+async fn refresh_source_resumes_from_the_partial_file() -> Result<()> {
+    let server = TestServer::start(
+        ServerMode {
+            delay_ms: 40,
+            chunk_size: 16 * 1024,
+        },
+        1024 * 1024,
+    )
+    .await?;
+    let dir = tempfile::tempdir()?;
+    let (core, id, out) = stalled_on_expired_link(&dir, &server).await?;
+    let before = core.get_download(id).await?.downloaded_bytes;
+
+    // Resuming against the dead link must fail, and must say why.
+    core.resume(id).await?;
+    wait_for_status(&core, id, Status::Failed, Duration::from_secs(20)).await?;
+    let rec = core.get_download(id).await?;
+    assert_eq!(rec.error_kind, Some(ErrorKind::ExpiredAuth));
+
+    // Now hand it the replacement the browser would have produced.
+    let outcome = core
+        .refresh_source(
+            id,
+            server.url("/expiring?token=rotated").as_str(),
+            None,
+            false,
+        )
+        .await?;
+    match outcome {
+        unduhin_core::RefreshOutcome::Resumed {
+            downloaded_bytes, ..
+        } => {
+            assert!(
+                downloaded_bytes > 0,
+                "refresh threw away the partial file ({downloaded_bytes} bytes)"
+            );
+        }
+        other => panic!("expected Resumed, got {other:?}"),
+    }
+
+    // The row carries the new URL and no longer looks broken.
+    let rec = core.get_download(id).await?;
+    assert!(
+        rec.url.contains("token=rotated"),
+        "url not updated: {}",
+        rec.url
+    );
+    assert_eq!(rec.error_kind, None);
+    assert_eq!(rec.error, None);
+
+    // And it finishes correctly — the resumed bytes and the new bytes are the
+    // same file, so the hash must match.
+    if wait_for_status(&core, id, Status::Completed, Duration::from_secs(60))
+        .await
+        .is_err()
+    {
+        let rec = core.get_download(id).await?;
+        panic!(
+            "refreshed download did not complete: status={:?} bytes={} error={:?}",
+            rec.status, rec.downloaded_bytes, rec.error
+        );
+    }
+    let written = std::fs::read(&out)?;
+    assert_eq!(written.len(), server.payload.len());
+    assert_eq!(sha256_hex(&written), sha256_hex(&server.payload));
+    assert!(
+        before <= written.len() as u64,
+        "sanity: partial cannot exceed the whole"
+    );
+
+    core.shutdown().await?;
+    server.stop().await;
+    Ok(())
+}
+
+/// A refresh that points at a *different* file must not splice two bodies
+/// together. It reports the mismatch and changes nothing.
+#[tokio::test]
+async fn refresh_source_refuses_a_different_body_then_restarts_on_force() -> Result<()> {
+    let server = TestServer::start(
+        ServerMode {
+            delay_ms: 40,
+            chunk_size: 16 * 1024,
+        },
+        1024 * 1024,
+    )
+    .await?;
+    // A second server with a different payload size stands in for "the link
+    // now points at something else".
+    let other = TestServer::start(
+        ServerMode {
+            delay_ms: 0,
+            chunk_size: 64 * 1024,
+        },
+        4096,
+    )
+    .await?;
+    let dir = tempfile::tempdir()?;
+    let (core, id, _out) = stalled_on_expired_link(&dir, &server).await?;
+    let before = core.get_download(id).await?;
+
+    let outcome = core
+        .refresh_source(id, other.url("/file.bin").as_str(), None, false)
+        .await?;
+    match outcome {
+        unduhin_core::RefreshOutcome::SourceChanged { new_bytes, .. } => {
+            assert_eq!(new_bytes, Some(4096));
+        }
+        other => panic!("expected SourceChanged, got {other:?}"),
+    }
+
+    // Nothing moved: same url, same status, same bytes.
+    let after = core.get_download(id).await?;
+    assert_eq!(after.url, before.url, "url must not change on a mismatch");
+    assert_eq!(after.status, Status::Paused);
+    assert_eq!(after.downloaded_bytes, before.downloaded_bytes);
+
+    // The user confirms. Now the partial is discarded and the row restarts.
+    let outcome = core
+        .refresh_source(id, other.url("/file.bin").as_str(), None, true)
+        .await?;
+    assert_eq!(outcome, unduhin_core::RefreshOutcome::Restarted);
+    let after = core.get_download(id).await?;
+    assert_eq!(
+        after.downloaded_bytes, 0,
+        "forced restart must zero progress"
+    );
+    assert!(after.url.contains(&other.addr.port().to_string()));
+
+    core.shutdown().await?;
+    server.stop().await;
+    other.stop().await;
+    Ok(())
+}
+
+/// Guards. Refreshing is only meaningful for a stopped HTTP row, and the URL
+/// arrives from the browser in the extension flow, so it is untrusted.
+#[tokio::test]
+async fn refresh_source_rejects_bad_input() -> Result<()> {
+    let server = TestServer::start(
+        ServerMode {
+            delay_ms: 40,
+            chunk_size: 16 * 1024,
+        },
+        1024 * 1024,
+    )
+    .await?;
+    let dir = tempfile::tempdir()?;
+    let (core, id, _out) = stalled_on_expired_link(&dir, &server).await?;
+
+    // Not http/https.
+    let err = core
+        .refresh_source(id, "ftp://example.com/file.bin", None, false)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, unduhin_core::CoreError::InvalidArgument(_)),
+        "expected InvalidArgument, got {err:?}"
+    );
+
+    // Not a URL at all.
+    assert!(matches!(
+        core.refresh_source(id, "not a url", None, false)
+            .await
+            .unwrap_err(),
+        unduhin_core::CoreError::InvalidArgument(_)
+    ));
+
+    // An unknown row.
+    assert!(matches!(
+        core.refresh_source(9_999, server.url("/file.bin").as_str(), None, false)
+            .await
+            .unwrap_err(),
+        unduhin_core::CoreError::DownloadNotFound(9_999)
+    ));
+
+    // A running row: swapping the URL under a live worker is not allowed.
+    core.resume(id).await?;
+    wait_for_status(&core, id, Status::Failed, Duration::from_secs(20)).await?;
+    core.retry(id).await?;
+    // `retry` moves Failed → Queued, which is not a refreshable state either.
+    let err = core
+        .refresh_source(
+            id,
+            server.url("/expiring?token=rotated").as_str(),
+            None,
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, unduhin_core::CoreError::InvalidTransition { .. }),
+        "expected InvalidTransition, got {err:?}"
+    );
+
+    core.shutdown().await?;
+    server.stop().await;
+    Ok(())
+}
+
+/// A signed URL that has expired answers 403. `retry::classify` files every
+/// 4xx under `Terminal`, which is right for the transfer but too coarse for
+/// the UI: 403 is fixable with a fresh link, 404 is not. The row must record
+/// `expired_auth` so the UI can offer "Refresh link" instead of a retry that
+/// replays the same dead URL.
+#[tokio::test]
+async fn expired_link_is_classified_as_expired_auth() -> Result<()> {
+    let server = TestServer::start(
+        ServerMode {
+            delay_ms: 0,
+            chunk_size: 64 * 1024,
+        },
+        1024,
+    )
+    .await?;
+    let dir = tempfile::tempdir()?;
+    let (core, _) = fresh_core(&dir).await?;
+    let out_dir = dir.path().join("out");
+    std::fs::create_dir_all(&out_dir)?;
+
+    // The server's token is "fresh"; this URL carries a dead one.
+    let id = core
+        .add_download(AddDownload {
+            url: server.url("/expiring?token=stale"),
+            filename: Some("movie.mkv".into()),
+            output_path: Some(out_dir.join("movie.mkv")),
+            category: Some(CategorySelector::Name("Other".into())),
+            priority: 0,
+            segments: Some(1),
+            media_info: None,
+            headers: None,
+            source: DownloadSource::Manual,
+            kind: DownloadKind::Http,
+            torrent: None,
+        })
+        .await?;
+    core.start().await?;
+
+    wait_for_status(&core, id, Status::Failed, Duration::from_secs(15)).await?;
+    let rec = core.get_download(id).await?;
+    assert_eq!(
+        rec.error_kind,
+        Some(ErrorKind::ExpiredAuth),
+        "403 must classify as expired_auth, got {:?} (error: {:?})",
+        rec.error_kind,
+        rec.error
+    );
+
+    core.shutdown().await?;
+    server.stop().await;
+    Ok(())
+}
+
+/// The completion gate catches the *silent* form of the same failure: the
+/// host answers 200 with a 0-byte body or an HTML landing page rather than
+/// an honest 403. Same remedy, so same classification.
+#[tokio::test]
+async fn silent_expiry_is_classified_as_expired_auth() -> Result<()> {
+    for (path, label) in [("/empty", "empty body"), ("/landing", "landing page")] {
+        let server = TestServer::start(
+            ServerMode {
+                delay_ms: 0,
+                chunk_size: 64 * 1024,
+            },
+            1024,
+        )
+        .await?;
+        let dir = tempfile::tempdir()?;
+        let (core, _) = fresh_core(&dir).await?;
+        let out_dir = dir.path().join("out");
+        std::fs::create_dir_all(&out_dir)?;
+
+        let id = core
+            .add_download(AddDownload {
+                url: server.url(path),
+                filename: Some("movie.mkv".into()),
+                output_path: Some(out_dir.join("movie.mkv")),
+                category: Some(CategorySelector::Name("Other".into())),
+                priority: 0,
+                segments: Some(1),
+                media_info: None,
+                headers: None,
+                source: DownloadSource::Manual,
+                kind: DownloadKind::Http,
+                torrent: None,
+            })
+            .await?;
+        core.start().await?;
+
+        wait_for_status(&core, id, Status::Failed, Duration::from_secs(15)).await?;
+        let rec = core.get_download(id).await?;
+        assert_eq!(
+            rec.error_kind,
+            Some(ErrorKind::ExpiredAuth),
+            "{label} must classify as expired_auth, got {:?}",
+            rec.error_kind
+        );
+
+        core.shutdown().await?;
+        server.stop().await;
+    }
+    Ok(())
+}
+
+/// The classification has to stay narrow. A dead host is a network problem,
+/// and offering "Refresh link" for it would send the user to a page that was
+/// never the issue.
+#[tokio::test]
+async fn connection_failure_is_not_expired_auth() -> Result<()> {
+    // Bind and immediately drop the listener so the port is almost certainly
+    // closed — nothing is listening there.
+    let dead_port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0")?;
+        l.local_addr()?.port()
+    };
+    let dir = tempfile::tempdir()?;
+    let (core, _) = fresh_core(&dir).await?;
+    let out_dir = dir.path().join("out");
+    std::fs::create_dir_all(&out_dir)?;
+
+    let id = core
+        .add_download(AddDownload {
+            url: Url::parse(&format!("http://127.0.0.1:{dead_port}/movie.mkv"))?,
+            filename: Some("movie.mkv".into()),
+            output_path: Some(out_dir.join("movie.mkv")),
+            category: Some(CategorySelector::Name("Other".into())),
+            priority: 0,
+            segments: Some(1),
+            media_info: None,
+            headers: None,
+            source: DownloadSource::Manual,
+            kind: DownloadKind::Http,
+            torrent: None,
+        })
+        .await?;
+    core.start().await?;
+
+    wait_for_status(&core, id, Status::Failed, Duration::from_secs(60)).await?;
+    let rec = core.get_download(id).await?;
+    assert_ne!(
+        rec.error_kind,
+        Some(ErrorKind::ExpiredAuth),
+        "a connection failure must not be expired_auth (error: {:?})",
+        rec.error
+    );
+
+    core.shutdown().await?;
     Ok(())
 }
 

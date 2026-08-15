@@ -26,6 +26,7 @@ function sampleRecord(overrides: Partial<DownloadRecord> = {}): DownloadRecord {
     downloaded_bytes: 0,
     status: "queued",
     error: null,
+    error_kind: null,
     category_id: null,
     priority: 0,
     segments: 8,
@@ -121,10 +122,27 @@ describe("applyEvent", () => {
     const state = emptyState();
     state.records.set(1, sampleRecord({ status: "active" }));
     state.stats.set(1, { speed_bps: 1024, eta: 1 });
-    applyEvent(state, { type: "failed", id: 1, error: "Connection reset" });
+    applyEvent(state, {
+      type: "failed",
+      id: 1,
+      error: "Connection reset",
+      error_kind: "network",
+    });
     expect(state.records.get(1)?.status).toBe("failed");
     expect(state.records.get(1)?.error).toBe("Connection reset");
     expect(state.stats.has(1)).toBe(false);
+  });
+
+  it("records the typed reason on failed so the row can offer a refresh", () => {
+    const state = emptyState();
+    state.records.set(1, sampleRecord({ status: "active" }));
+    applyEvent(state, {
+      type: "failed",
+      id: 1,
+      error: "server returned terminal status 403",
+      error_kind: "expired_auth",
+    });
+    expect(state.records.get(1)?.error_kind).toBe("expired_auth");
   });
 
   it("removes both record and stats on removed", () => {

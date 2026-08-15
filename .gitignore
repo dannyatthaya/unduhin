@@ -32,6 +32,11 @@ Desktop.ini
 # Local Claude Code state
 /.claude
 
+# Dev-channel browser profile created by scripts/dev.ps1. Holds the dev
+# Chrome user-data dir; the dev native host and its manifest are staged under
+# /target, which is already ignored.
+/.dev-browser
+
 # Environment variables
 .env
 

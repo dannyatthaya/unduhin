@@ -103,9 +103,27 @@ export type Inbound = { "type": "ping" } | { "type": "download", job: DownloadJo
  * matching `HandoffDecision`. UUID-ish in practice; opaque to
  * the native side.
  */
-id: string, job: DownloadJob, } | { "type": "ruleMetrics", metrics: Array<RuleMetric>, };
+id: string, job: DownloadJob, } | { "type": "ruleMetrics", metrics: Array<RuleMetric>, } | { "type": "refreshDownload", downloadId: number, job: DownloadJob, } | { "type": "credentialsRefreshed", token: string, downloadId: number, cookieHeader: string | null, userAgent: string | null, requestHeaders: Array<RequestHeader>, };
 
-export type Outbound = { "type": "pong" } | { "type": "ack", id: number, } | { "type": "status", downloads: Array<StatusEntry>, } | { "type": "error", message: string, } | { "type": "settings", full: ExtensionSettings, } | { "type": "settingsChanged", full: ExtensionSettings, } | { "type": "handoffDecision", id: string, decision: HandoffDecision, } | { "type": "extensionUpdated", version: string, } | { "type": "mediaFormats", formats: Array<MediaFormat>, };
+export type Outbound = { "type": "pong" } | { "type": "ack", id: number, } | { "type": "status", downloads: Array<StatusEntry>, } | { "type": "error", message: string, } | { "type": "settings", full: ExtensionSettings, } | { "type": "settingsChanged", full: ExtensionSettings, } | { "type": "handoffDecision", id: string, decision: HandoffDecision, } | { "type": "extensionUpdated", version: string, } | { "type": "mediaFormats", formats: Array<MediaFormat>, } | { "type": "armRefresh", downloadId: number, 
+/**
+ * File name to match against `chrome.downloads.DownloadItem`.
+ */
+filename: string | null, 
+/**
+ * Expected size in bytes. `None` when the row never learned one, in
+ * which case the extension matches on the file name alone.
+ */
+sizeBytes: number | null, 
+/**
+ * Origin of the dead URL, shown by the app's dialog so the user can
+ * confirm a capture that arrives from a different host.
+ */
+origin: string | null, 
+/**
+ * Unix epoch milliseconds after which the extension drops the entry.
+ */
+expiresAtMs: number, } | { "type": "refreshCredentials", token: string, downloadId: number, url: string, };
 
 export const HOST_NAME = "com.unduhin.host" as const;
 export const ALLOWED_DEV_EXTENSION_ID = "blbgjagjodpiiclpecohlfhebgddkejn" as const;

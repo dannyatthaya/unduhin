@@ -30,7 +30,7 @@ use tokio::time::sleep;
 use url::Url;
 
 use crate::download::{
-    self, DownloadId, DownloadKind, DownloadRecord, Status, SwarmStats, TorrentSource,
+    self, DownloadId, DownloadKind, DownloadRecord, ErrorKind, Status, SwarmStats, TorrentSource,
 };
 use crate::event::CoreEvent;
 use crate::schedule::{self, SchedulesCache};
@@ -635,7 +635,14 @@ async fn run_worker(
         match record.url.parse::<Url>() {
             Ok(u) => Some(u),
             Err(e) => {
-                mark_worker_failed(&pool, &events, id, &format!("invalid url: {e}")).await;
+                mark_worker_failed(
+                    &pool,
+                    &events,
+                    id,
+                    &format!("invalid url: {e}"),
+                    ErrorKind::Other,
+                )
+                .await;
                 return;
             }
         }
@@ -1014,7 +1021,13 @@ async fn run_worker(
                         // 0 B file on disk.
                         let _ = tokio::fs::remove_file(&output_path).await;
                         let _ = tokio::fs::remove_file(&meta_path).await;
-                        mark_worker_failed(&pool, &events, id, &reason).await;
+                        // The 0-byte and HTML-landing-page cases are exactly
+                        // an expired link failing *silently* — the server
+                        // answers 200 and hands back a click-through page
+                        // instead of the bytes. Same remedy as a 403: the
+                        // row needs a fresh URL, not a retry.
+                        mark_worker_failed(&pool, &events, id, &reason, ErrorKind::ExpiredAuth)
+                            .await;
                     }
                     return;
                 }
@@ -1144,6 +1157,7 @@ async fn run_worker(
                         &events,
                         id,
                         "remote file kept changing; gave up after repeated restarts",
+                        ErrorKind::Other,
                     )
                     .await;
                 }
@@ -1156,7 +1170,14 @@ async fn run_worker(
                 current_status(&pool, id).await.ok(),
                 Some(Status::Active | Status::Muxing)
             ) {
-                mark_worker_failed(&pool, &events, id, &err.to_string()).await;
+                mark_worker_failed(
+                    &pool,
+                    &events,
+                    id,
+                    &err.to_string(),
+                    classify_engine_error(&err),
+                )
+                .await;
             }
         }
     }
@@ -1405,7 +1426,7 @@ async fn run_ytdlp(
     }
 }
 
-async fn timeouts(pool: &SqlitePool) -> (Duration, Duration) {
+pub(crate) async fn timeouts(pool: &SqlitePool) -> (Duration, Duration) {
     let connect = settings::get(pool, settings::settings_keys::CONNECT_TIMEOUT_SECS)
         .await
         .ok()
@@ -1423,7 +1444,7 @@ async fn timeouts(pool: &SqlitePool) -> (Duration, Duration) {
 
 /// Read the `user_agent` setting. Empty strings normalize to `None`,
 /// which lets the engine fall back to its compiled-in default.
-async fn user_agent_setting(pool: &SqlitePool) -> Option<String> {
+pub(crate) async fn user_agent_setting(pool: &SqlitePool) -> Option<String> {
     settings::get(pool, settings::settings_keys::USER_AGENT)
         .await
         .ok()
@@ -1498,17 +1519,45 @@ fn http_completion_rejection(summary: &engine::DownloadSummary) -> Option<String
     None
 }
 
+/// Sort an engine failure into the typed reason persisted on the row.
+///
+/// The interesting case is `TerminalStatus`. `retry::classify` puts every
+/// 4xx in `Terminal`, which lumps "your link expired" together with "no such
+/// file". 401, 403 and 410 are the three that a fresh URL or fresh cookies can
+/// actually fix, so only those become [`ErrorKind::ExpiredAuth`].
+///
+/// This does not overlap with `looks_like_concurrency_limit` in the engine,
+/// which also keys on 403: that runs *inside* the transfer and retries
+/// single-stream first. By the time an error reaches here, that fallback has
+/// already been tried and lost.
+///
+/// `RemoteChanged` is deliberately `Other`. The file moved on — a different
+/// problem from an expired link, and the queue already restarts those.
+fn classify_engine_error(err: &engine::EngineError) -> ErrorKind {
+    match err {
+        engine::EngineError::TerminalStatus {
+            status: 401 | 403 | 410,
+        } => ErrorKind::ExpiredAuth,
+        engine::EngineError::Io { .. } => ErrorKind::Disk,
+        engine::EngineError::TransientStatus { .. }
+        | engine::EngineError::RetryExhausted { .. }
+        | engine::EngineError::BodyTruncated { .. } => ErrorKind::Network,
+        _ => ErrorKind::Other,
+    }
+}
+
 async fn mark_worker_failed(
     pool: &SqlitePool,
     events: &broadcast::Sender<CoreEvent>,
     id: DownloadId,
     err: &str,
+    kind: ErrorKind,
 ) {
     // Read the current status before flipping so the StatusChanged
     // event reports the actual transition (Active → Failed or
     // Muxing → Failed). The timeline UI uses `from` for messaging.
     let from = current_status(pool, id).await.unwrap_or(Status::Active);
-    let _ = download::mark_failed(pool, id, err).await;
+    let _ = download::mark_failed(pool, id, err, kind).await;
     let _ = events.send(CoreEvent::StatusChanged {
         id,
         from,
@@ -1517,6 +1566,7 @@ async fn mark_worker_failed(
     let _ = events.send(CoreEvent::Failed {
         id,
         error: err.to_string(),
+        error_kind: kind,
     });
 }
 
@@ -1800,6 +1850,42 @@ mod tests {
             content_type: content_type.map(|s| s.to_string()),
             filename_hint: None,
         }
+    }
+
+    /// Only the three statuses a fresh link can actually fix become
+    /// `ExpiredAuth`. 404 and 400 share the `Terminal` retry class but no
+    /// amount of re-capturing helps them, so offering "Refresh link" there
+    /// would send the user on a pointless trip to the browser.
+    #[test]
+    fn classify_maps_only_auth_statuses_to_expired_auth() {
+        for status in [401u16, 403, 410] {
+            assert_eq!(
+                classify_engine_error(&engine::EngineError::TerminalStatus { status }),
+                ErrorKind::ExpiredAuth,
+                "{status} should be expired_auth"
+            );
+        }
+        for status in [400u16, 404, 451] {
+            assert_eq!(
+                classify_engine_error(&engine::EngineError::TerminalStatus { status }),
+                ErrorKind::Other,
+                "{status} should not be expired_auth"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_maps_transient_failures_to_network() {
+        assert_eq!(
+            classify_engine_error(&engine::EngineError::TransientStatus { status: 503 }),
+            ErrorKind::Network
+        );
+        // A file that moved on is not an expired link — the queue already
+        // restarts those, bounded.
+        assert_eq!(
+            classify_engine_error(&engine::EngineError::RemoteChanged),
+            ErrorKind::Other
+        );
     }
 
     #[test]

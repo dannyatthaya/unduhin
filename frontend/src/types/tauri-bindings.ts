@@ -123,6 +123,21 @@ export interface TorrentMeta {
   swarm: SwarmStats | null;
 }
 
+/** Mirrors `core::download::ErrorKind`. Only `expired_auth` changes what the
+ *  UI offers; the rest exist so the column never holds a free-form string. */
+export type ErrorKind = "expired_auth" | "network" | "disk" | "other";
+
+/** Result of `refreshDownloadSource`. Mirrors `core::download::RefreshOutcome`
+ *  (serde tags it on `outcome`).
+ *
+ *  `source_changed` is a question, not a failure: the new URL works but serves
+ *  a different body than the partial file on disk, so nothing was committed.
+ *  Ask the user, then call again with `forceRestart: true`. */
+export type RefreshOutcome =
+  | { outcome: "resumed"; downloaded_bytes: number; total_bytes: number | null }
+  | { outcome: "restarted" }
+  | { outcome: "source_changed"; old_bytes: number | null; new_bytes: number | null };
+
 export interface DownloadRecord {
   id: DownloadId;
   url: string;
@@ -132,6 +147,11 @@ export interface DownloadRecord {
   downloaded_bytes: number;
   status: Status;
   error: string | null;
+  /** Why the row failed, when `error` is set. Survives a plain resume, so a
+   * row that failed on an expired link keeps offering "Refresh link" even
+   * after the user tries retrying it. Null for rows that never failed and
+   * for rows predating the `error_kind` migration. */
+  error_kind: ErrorKind | null;
   category_id: CategoryId | null;
   priority: number;
   segments: number;
@@ -296,6 +316,9 @@ export type CoreEvent =
       type: "failed";
       id: DownloadId;
       error: string;
+      /** Typed reason, mirroring the row's `error_kind`. The row uses this to
+       *  offer "Refresh link" instead of "Retry now" on `expired_auth`. */
+      error_kind: ErrorKind;
     }
   | {
       /** Live swarm snapshot for a torrent download. The queue pump also
@@ -511,6 +534,39 @@ export const api = {
   pauseDownload: (id: DownloadId) => invoke<void>("pause_download", { id }),
   resumeDownload: (id: DownloadId) => invoke<void>("resume_download", { id }),
   retryDownload: (id: DownloadId) => invoke<void>("retry_download", { id }),
+  /**
+   * Point a failed or paused download at a new URL and continue it.
+   *
+   * Use this instead of `retryDownload` when `error_kind === "expired_auth"`.
+   * Retry replays the same dead URL and fails the same way; this replaces the
+   * URL and the captured headers first.
+   *
+   * Resolves to `{ outcome: "source_changed" }` **without changing anything**
+   * when the replacement serves a different body than the partial file. Show
+   * the user the size difference, then call again with `forceRestart: true`
+   * to discard the partial and start over.
+   */
+  /**
+   * Tell the extension to fold the next matching browser capture into this
+   * download instead of adding a new row. Resolves to the epoch-millisecond
+   * deadline after which the extension drops the arm.
+   *
+   * Best-effort — with no extension connected the push goes nowhere, and the
+   * dialog's paste field is the remaining path.
+   */
+  armLinkRefresh: (id: DownloadId) => invoke<number>("arm_link_refresh", { id }),
+  refreshDownloadSource: (
+    id: DownloadId,
+    url: string,
+    headers?: [string, string][] | null,
+    forceRestart = false,
+  ) =>
+    invoke<RefreshOutcome>("refresh_download_source", {
+      id,
+      url,
+      headers: headers ?? null,
+      forceRestart,
+    }),
   removeDownload: (id: DownloadId, deleteData = false) =>
     invoke<void>("remove_download", { id, deleteData }),
   setPriority: (id: DownloadId, priority: number) =>

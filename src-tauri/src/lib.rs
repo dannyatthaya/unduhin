@@ -123,8 +123,7 @@ pub fn run() {
                 // Off the setup path: it's file IO, and a failure only
                 // costs auto-update, never startup.
                 tauri::async_runtime::spawn(async move {
-                    let synced =
-                        tauri::async_runtime::spawn_blocking(extension_sync::sync).await;
+                    let synced = tauri::async_runtime::spawn_blocking(extension_sync::sync).await;
                     match synced {
                         Ok(Ok(changed)) => {
                             // Greetings need the staged version even on
@@ -183,6 +182,8 @@ pub fn run() {
             commands::pause_download,
             commands::resume_download,
             commands::retry_download,
+            commands::refresh_download_source,
+            commands::arm_link_refresh,
             commands::remove_download,
             commands::set_priority,
             commands::set_segments,
@@ -374,6 +375,47 @@ fn forward_core_events(app: AppHandle, core: Core) {
                                 reconcile_autostart_once(&app, &core, "setting_changed").await;
                             });
                         }
+                    }
+                    match &event {
+                        // Tier 0 of the link refresh. A cookie-gated CDN keeps
+                        // a working URL and only loses the session, which the
+                        // browser can restore with no page and no user action.
+                        // Ask; if it works the user sees nothing but a retry.
+                        // A signed URL whose token expired fails again and
+                        // falls through to the "Refresh link" button.
+                        unduhin_core::CoreEvent::Failed {
+                            id,
+                            error_kind: unduhin_core::ErrorKind::ExpiredAuth,
+                            ..
+                        } => {
+                            let id = *id;
+                            let core = core.clone();
+                            tauri::async_runtime::spawn(async move {
+                                let Some(token) = pipe::begin_credential_refresh(id).await else {
+                                    return; // already tried, or no extension connected
+                                };
+                                match core.get_download(id).await {
+                                    Ok(rec) => {
+                                        pipe::broadcast_refresh_credentials(token, id, rec.url)
+                                            .await;
+                                    }
+                                    Err(e) => {
+                                        tracing::debug!(id, error = %e, "credential refresh: row vanished");
+                                        pipe::forget_credential_refresh(id).await;
+                                    }
+                                }
+                            });
+                        }
+                        // The row is healthy or gone, so the next failure is a
+                        // new situation and deserves its own automatic try.
+                        unduhin_core::CoreEvent::Completed { id, .. }
+                        | unduhin_core::CoreEvent::Removed { id } => {
+                            let id = *id;
+                            tauri::async_runtime::spawn(async move {
+                                pipe::forget_credential_refresh(id).await;
+                            });
+                        }
+                        _ => {}
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {

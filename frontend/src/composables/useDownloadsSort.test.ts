@@ -20,6 +20,7 @@ function row(over: Partial<DownloadRecord> = {}): DownloadRecord {
     downloaded_bytes: 0,
     status: "active",
     error: null,
+    error_kind: null,
     category_id: null,
     priority: 0,
     segments: 1,

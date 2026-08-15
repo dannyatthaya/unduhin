@@ -64,6 +64,64 @@ impl FromStr for DownloadSource {
     }
 }
 
+/// Why a download failed. Persisted to the `downloads.error_kind` column
+/// (migration `20260908000001_download_error_kind`) beside the free-form
+/// `error` string, so the UI can offer a remedy instead of only printing a
+/// message. Mirrors [`DownloadSource`] in shape (derives, snake_case serde,
+/// `as_str`/`Display`/`FromStr`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorKind {
+    /// The link or the session died. HTTP 401 / 403 / 410, or the silent
+    /// variants `queue::http_completion_rejection` catches (200 with an empty
+    /// body, 200 with an HTML landing page). Retrying replays the same dead
+    /// URL and fails identically — the row needs a *new* URL or new
+    /// credentials, which is what `Core::refresh_source` supplies.
+    ExpiredAuth,
+    /// Transient status, retries exhausted, or a truncated body.
+    Network,
+    /// Local I/O failure.
+    Disk,
+    /// Anything else, including `RemoteChanged` (a different problem from an
+    /// expired link — the queue already restarts those, bounded).
+    #[default]
+    Other,
+}
+
+impl ErrorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ErrorKind::ExpiredAuth => "expired_auth",
+            ErrorKind::Network => "network",
+            ErrorKind::Disk => "disk",
+            ErrorKind::Other => "other",
+        }
+    }
+}
+
+impl std::fmt::Display for ErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ErrorKind {
+    type Err = CoreError;
+    fn from_str(s: &str) -> Result<Self> {
+        Ok(match s {
+            "expired_auth" => ErrorKind::ExpiredAuth,
+            "network" => ErrorKind::Network,
+            "disk" => ErrorKind::Disk,
+            "other" => ErrorKind::Other,
+            other => {
+                return Err(CoreError::InvalidArgument(format!(
+                    "unknown download error kind: {other}"
+                )))
+            }
+        })
+    }
+}
+
 /// Which backend runs a download. Persisted to the `downloads.kind`
 /// column (migration `20260905000001_downloads_torrent`) as the explicit
 /// discriminator the queue worker branches on, replacing the older
@@ -246,6 +304,14 @@ pub struct DownloadRecord {
     pub downloaded_bytes: u64,
     pub status: Status,
     pub error: Option<String>,
+    /// Why the row failed, when `error` is set. Drives the UI's remedy: an
+    /// `ExpiredAuth` row offers "Refresh link" instead of "Retry now".
+    /// Survives `transition_status` / `claim` (both of which clear `error`)
+    /// so the button is still there after the user tries a plain resume.
+    /// `None` for rows that never failed and for rows predating
+    /// `20260908000001_download_error_kind.sql`.
+    #[serde(default)]
+    pub error_kind: Option<ErrorKind>,
     pub category_id: Option<i64>,
     pub priority: i64,
     pub segments: u32,
@@ -321,6 +387,32 @@ pub struct AddDownload {
     pub kind: DownloadKind,
     /// Torrent state when `kind == Torrent`. `None` otherwise.
     pub torrent: Option<TorrentMeta>,
+}
+
+/// What [`crate::Core::refresh_source`] did with a row.
+///
+/// `SourceChanged` is a question, not a failure: the new URL works, but it
+/// serves a different body than the partial file on disk, so resuming would
+/// splice two different files together. The call committed nothing. The caller
+/// decides whether to discard the partial and try again with `force_restart`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum RefreshOutcome {
+    /// Validators matched. The partial file survived and the row is queued.
+    Resumed {
+        downloaded_bytes: u64,
+        total_bytes: Option<u64>,
+    },
+    /// Nothing to resume — no sidecar, or the caller forced a restart. The row
+    /// is queued from zero.
+    Restarted,
+    /// The new URL serves a different body. Nothing was changed.
+    SourceChanged {
+        /// Size the partial file was recorded against, if known.
+        old_bytes: Option<u64>,
+        /// Size the new URL advertises, if it advertised one.
+        new_bytes: Option<u64>,
+    },
 }
 
 /// Either a database id or a name when calling [`AddDownload`]. The CLI
@@ -1578,7 +1670,8 @@ pub(crate) async fn mark_completed(pool: &SqlitePool, id: DownloadId, bytes: u64
     sqlx::query(
         "UPDATE downloads SET status = 'completed', downloaded_bytes = ?, \
                               total_bytes = ?, \
-                              completed_at = ?, error = NULL WHERE id = ?",
+                              completed_at = ?, error = NULL, error_kind = NULL \
+         WHERE id = ?",
     )
     .bind(bytes as i64)
     .bind(bytes as i64)
@@ -1612,13 +1705,69 @@ pub(crate) async fn reset_for_restart(pool: &SqlitePool, id: DownloadId) -> Resu
     Ok(())
 }
 
-/// Mark a download `failed` with an error message.
-pub(crate) async fn mark_failed(pool: &SqlitePool, id: DownloadId, err: &str) -> Result<()> {
-    sqlx::query("UPDATE downloads SET status = 'failed', error = ? WHERE id = ?")
+/// Mark a download `failed` with an error message and a typed reason.
+///
+/// `kind` is what the UI branches on. The `error` string stays the
+/// human-readable detail; unlike `error`, `kind` is *not* cleared by
+/// [`transition_status`] or [`claim`], so a row that the user resumes and
+/// that fails again still reports why.
+pub(crate) async fn mark_failed(
+    pool: &SqlitePool,
+    id: DownloadId,
+    err: &str,
+    kind: ErrorKind,
+) -> Result<()> {
+    sqlx::query("UPDATE downloads SET status = 'failed', error = ?, error_kind = ? WHERE id = ?")
         .bind(err)
+        .bind(kind.as_str())
         .bind(id)
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+/// Point a download row at a new URL, with new captured headers.
+///
+/// The one writer of `downloads.url` after insert. Used by
+/// [`crate::Core::refresh_source`] when a link expires and the browser
+/// supplies a fresh one.
+///
+/// Two invariants:
+///
+/// 1. The headers carry `Cookie` / `Authorization`, so they go through
+///    `crate::secret::protect` exactly as [`insert`] does. A plaintext write
+///    here would make `record_from_row` hand back garbage after `unprotect`.
+/// 2. `etag` and `last_modified` are cleared in the same statement. They
+///    describe the *old* URL's body; leaving them while the URL changes is the
+///    one state that could let a mismatched file resume. The caller writes the
+///    freshly probed validators back straight after.
+///
+/// Clears `error` and `error_kind` too — the row is about to be re-queued.
+pub(crate) async fn update_source(
+    pool: &SqlitePool,
+    id: DownloadId,
+    url: &str,
+    headers: Option<&[(String, String)]>,
+) -> Result<()> {
+    let headers_json = match headers {
+        Some(pairs) if !pairs.is_empty() => {
+            Some(crate::secret::protect(&serde_json::to_string(pairs)?))
+        }
+        _ => None,
+    };
+    let res = sqlx::query(
+        "UPDATE downloads SET url = ?, headers = ?, etag = NULL, last_modified = NULL, \
+                              error = NULL, error_kind = NULL \
+         WHERE id = ?",
+    )
+    .bind(url)
+    .bind(headers_json)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    if res.rows_affected() == 0 {
+        return Err(CoreError::DownloadNotFound(id));
+    }
     Ok(())
 }
 
@@ -1850,6 +1999,16 @@ fn record_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<DownloadRecord> {
         .ok()
         .and_then(|s| s.parse::<DownloadKind>().ok())
         .unwrap_or(DownloadKind::Http);
+    // Defensive `try_get` for `error_kind` (migration 20260908000001):
+    // absent column / NULL / unknown value all degrade to `None`. An
+    // unrecognised string must not make the whole row unreadable — the
+    // worst case is a failed row that offers a plain retry instead of
+    // "Refresh link".
+    let error_kind = row
+        .try_get::<Option<String>, _>("error_kind")
+        .ok()
+        .flatten()
+        .and_then(|s| s.parse::<ErrorKind>().ok());
     // Defensive `try_get` for `torrent` (same migration): absent column /
     // NULL / unparseable JSON all degrade to `None`.
     let torrent = row
@@ -1867,6 +2026,7 @@ fn record_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<DownloadRecord> {
         downloaded_bytes: row.get::<i64, _>("downloaded_bytes") as u64,
         status: status_str.parse()?,
         error: row.get("error"),
+        error_kind,
         category_id: row.get("category_id"),
         priority: row.get("priority"),
         segments: row.get::<i64, _>("segments") as u32,
@@ -2117,6 +2277,198 @@ mod tests {
         for s in ALL_STATUSES {
             assert_eq!(s.as_str().parse::<Status>().unwrap(), *s);
         }
+    }
+
+    #[test]
+    fn error_kind_round_trip() {
+        for k in [
+            ErrorKind::ExpiredAuth,
+            ErrorKind::Network,
+            ErrorKind::Disk,
+            ErrorKind::Other,
+        ] {
+            assert_eq!(k.as_str().parse::<ErrorKind>().unwrap(), k);
+        }
+    }
+
+    #[test]
+    fn error_kind_rejects_unknown() {
+        assert!("not_a_kind".parse::<ErrorKind>().is_err());
+    }
+
+    /// A test row: the smallest `AddDownload` the insert path accepts.
+    async fn insert_row(pool: &SqlitePool, dir: &tempfile::TempDir) -> DownloadId {
+        insert(
+            pool,
+            AddDownload {
+                url: "https://example.com/old?token=stale".parse().unwrap(),
+                filename: Some("movie.mkv".into()),
+                output_path: Some(dir.path().join("movie.mkv")),
+                category: None,
+                priority: 0,
+                segments: Some(1),
+                media_info: None,
+                headers: Some(vec![("Cookie".into(), "session=old".into())]),
+                source: DownloadSource::Manual,
+                kind: DownloadKind::Http,
+                torrent: None,
+            },
+        )
+        .await
+        .unwrap()
+        .id
+    }
+
+    /// `update_source` is the only writer of `url` after insert. It must
+    /// encrypt the headers the same way `insert` does — a plaintext write
+    /// here would come back as garbage through `secret::unprotect`.
+    #[tokio::test]
+    async fn update_source_round_trips_encrypted_headers() {
+        let pool = fresh_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let id = insert_row(&pool, &dir).await;
+
+        let fresh = vec![
+            ("Cookie".to_string(), "session=new".to_string()),
+            ("Referer".to_string(), "https://example.com/".to_string()),
+        ];
+        update_source(
+            &pool,
+            id,
+            "https://cdn.example.com/new?token=fresh",
+            Some(&fresh),
+        )
+        .await
+        .unwrap();
+
+        let rec = get(&pool, id).await.unwrap();
+        assert_eq!(rec.url, "https://cdn.example.com/new?token=fresh");
+        assert_eq!(rec.headers.as_deref(), Some(fresh.as_slice()));
+
+        // The raw column must NOT be readable plaintext on a platform where
+        // DPAPI is real; on others `protect` is identity. Either way the
+        // round-trip above is the contract that matters.
+        let raw: Option<String> = sqlx::query("SELECT headers FROM downloads WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get("headers");
+        let raw = raw.expect("headers column must be written");
+        assert_eq!(
+            serde_json::from_str::<Vec<(String, String)>>(&crate::secret::unprotect(&raw)).unwrap(),
+            fresh
+        );
+    }
+
+    /// The stored validators describe the *old* URL's body. Leaving them in
+    /// place while the URL changes is the one state that could let a
+    /// mismatched file resume, so `update_source` clears them.
+    #[tokio::test]
+    async fn update_source_clears_stale_validators_and_error() {
+        let pool = fresh_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let id = insert_row(&pool, &dir).await;
+
+        persist_progress(
+            &pool,
+            id,
+            512,
+            Some(1024),
+            Some("\"old-etag\""),
+            Some("Wed, 21 Oct 2026 07:28:00 GMT"),
+            None,
+        )
+        .await
+        .unwrap();
+        mark_failed(
+            &pool,
+            id,
+            "server returned terminal status 403",
+            ErrorKind::ExpiredAuth,
+        )
+        .await
+        .unwrap();
+
+        let before = get(&pool, id).await.unwrap();
+        assert_eq!(before.etag.as_deref(), Some("\"old-etag\""));
+        assert_eq!(before.error_kind, Some(ErrorKind::ExpiredAuth));
+
+        update_source(&pool, id, "https://cdn.example.com/new", None)
+            .await
+            .unwrap();
+
+        let after = get(&pool, id).await.unwrap();
+        assert_eq!(after.etag, None);
+        assert_eq!(after.last_modified, None);
+        assert_eq!(after.error, None);
+        assert_eq!(after.error_kind, None);
+        assert_eq!(after.headers, None);
+        // Progress is deliberately untouched — the partial file is the whole
+        // point of refreshing rather than re-adding.
+        assert_eq!(after.downloaded_bytes, 512);
+    }
+
+    #[tokio::test]
+    async fn update_source_rejects_unknown_id() {
+        let pool = fresh_pool().await;
+        assert!(matches!(
+            update_source(&pool, 9_999, "https://example.com/x", None).await,
+            Err(CoreError::DownloadNotFound(9_999))
+        ));
+    }
+
+    /// `transition_status` and `claim` both clear `error`. They must NOT
+    /// clear `error_kind`, or the row loses its "Refresh link" button the
+    /// moment the user tries a plain resume.
+    #[tokio::test]
+    async fn error_kind_survives_resume_and_claim() {
+        let pool = fresh_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let id = insert_row(&pool, &dir).await;
+
+        mark_failed(
+            &pool,
+            id,
+            "server returned terminal status 403",
+            ErrorKind::ExpiredAuth,
+        )
+        .await
+        .unwrap();
+
+        // Failed → Queued, the resume path.
+        transition_status(&pool, id, &[Status::Failed], Status::Queued)
+            .await
+            .unwrap();
+        let rec = get(&pool, id).await.unwrap();
+        assert_eq!(rec.error, None, "transition clears the message");
+        assert_eq!(
+            rec.error_kind,
+            Some(ErrorKind::ExpiredAuth),
+            "transition must keep the reason"
+        );
+
+        // Queued → Active, the claim path.
+        assert!(claim(&pool, id).await.unwrap());
+        let rec = get(&pool, id).await.unwrap();
+        assert_eq!(rec.error_kind, Some(ErrorKind::ExpiredAuth));
+    }
+
+    /// Completing a download clears the reason — the row is healthy again.
+    #[tokio::test]
+    async fn mark_completed_clears_error_kind() {
+        let pool = fresh_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        let id = insert_row(&pool, &dir).await;
+
+        mark_failed(&pool, id, "boom", ErrorKind::ExpiredAuth)
+            .await
+            .unwrap();
+        mark_completed(&pool, id, 1024).await.unwrap();
+
+        let rec = get(&pool, id).await.unwrap();
+        assert_eq!(rec.status, Status::Completed);
+        assert_eq!(rec.error_kind, None);
     }
 
     #[test]

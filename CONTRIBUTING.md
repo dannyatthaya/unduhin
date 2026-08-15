@@ -96,7 +96,8 @@ Optional, but useful:
 
 ```powershell
 # one-time
-npm --prefix frontend install
+bun install --cwd frontend
+bun install --cwd extension
 
 # dev — launches the desktop window with HMR'd Vite frontend
 cargo tauri dev
@@ -106,9 +107,57 @@ This spins up the Vite server on `127.0.0.1:5173` and opens the Tauri
 window. Both halves hot-reload on save (frontend immediately,
 Rust on `cargo tauri dev` re-running).
 
-The dev shell opens the same SQLite database the CLI uses
+Plain `cargo tauri dev` opens the same SQLite database the CLI uses
 (`%LOCALAPPDATA%\unduhin\unduhin.db` by default; override with
-`UNDUHIN_DB`).
+`UNDUHIN_DB`), so it **cannot run alongside an installed release** — they
+also share the single-instance mutex, the `\\.\pipe\unduhin` handoff pipe,
+and the `com.unduhin.host` native-messaging registration. Use the dev
+channel below if you have Unduhin installed.
+
+## Dev channel (running beside an installed release)
+
+```powershell
+.\scripts\dev.ps1
+```
+
+Brings up a fully isolated dev instance so you can test a change end to end
+— browser handoffs included — without touching the installed app:
+
+| Resource | Production | Dev channel |
+|---|---|---|
+| Single-instance mutex | `com.unduhin.app-sim` | `com.unduhin.app.dev-sim` |
+| Named pipe | `\\.\pipe\unduhin` | `\\.\pipe\unduhin-dev` |
+| Data root | `%LOCALAPPDATA%\unduhin` | `%LOCALAPPDATA%\unduhin-dev` |
+| Native-messaging host | `com.unduhin.host` | `com.unduhin.host.dev` |
+| Autostart Run key | `Unduhin` | `Unduhin Dev` |
+| Browser profile | yours | `.dev-browser\<browser>` |
+
+Isolation comes from `src-tauri/tauri.dev.conf.json` (merged in via
+`cargo tauri dev --config`, which changes the identifier and product name)
+plus two environment variables the script exports — `UNDUHIN_DATA_ROOT` and
+`UNDUHIN_PIPE_NAME`. Every child process inherits them, including the
+native host the dev browser spawns; that inheritance is what keeps handoffs
+on the dev pipe.
+
+**One-time step:** in the dev browser profile, open the Unduhin extension's
+Options page and set *Native host name* to `com.unduhin.host.dev`. The
+extension pushes its local settings up on every connect, so this sticks.
+
+**Seeding from production.** The first run copies production's database,
+torrent state, and managed binaries into the dev root so you can reproduce a
+live bug; `-Reseed` refreshes it later. Quit the production app first — the
+script refuses to seed while it is running, because the SQLite snapshot
+would be torn and any in-flight download would be resumed by the dev app
+into the same output file. Pass `-NoSeed` to start empty.
+
+Useful switches: `-Reseed`, `-NoSeed`, `-SkipExtensionBuild`, `-NoBrowser`,
+`-Browser chrome|brave|edge`, and `-Unregister` to remove the dev
+native-messaging keys (production's are never touched).
+
+> Do not sign the dev browser profile into Google. Both profiles run the
+> same extension ID, so `chrome.storage.sync` would propagate the dev host
+> name back to your real browser. The script passes `--disable-sync` as a
+> guard; leave it in place.
 
 ## CLI
 

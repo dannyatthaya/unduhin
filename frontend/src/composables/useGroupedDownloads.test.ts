@@ -15,6 +15,7 @@ function rec(over: Partial<DownloadRecord>): DownloadRecord {
     downloaded_bytes: 1,
     status: "completed",
     error: null,
+    error_kind: null,
     category_id: null,
     priority: 0,
     segments: 1,

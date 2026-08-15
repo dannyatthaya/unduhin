@@ -16,7 +16,7 @@ use unduhin_core::{
     ytdlp::{MediaInfo, ProbeResult},
     AddDownload, Category, CategoryId, CategorySelector, Core, DownloadFilter, DownloadId,
     DownloadKind, DownloadRecord, DownloadSource, NewCategory, NewSchedule, QuietHoursState,
-    Schedule, ScheduleId, SettingValue, Status, TorrentMeta,
+    RefreshOutcome, Schedule, ScheduleId, SettingValue, Status, TorrentMeta,
 };
 
 use crate::error::{CommandError, CommandResult};
@@ -404,6 +404,79 @@ pub async fn retry_download(core: State<'_, Core>, id: DownloadId) -> CommandRes
     Ok(core.retry(id).await?)
 }
 
+/// Point a failed or paused download at a new URL and continue it.
+///
+/// The recovery path for an expired link, where [`retry_download`] cannot
+/// help: retry re-queues the same dead URL with the same stale cookies and
+/// fails identically.
+///
+/// `headers` carries the freshly captured browser context (Cookie, Referer,
+/// User-Agent, and anything else observed). Pass `None` to keep the row
+/// running on no headers at all — appropriate for a plain pasted URL that
+/// needs no session.
+///
+/// Returns [`RefreshOutcome::SourceChanged`] **without changing anything**
+/// when the replacement serves a different body than the partial file on
+/// disk. The UI asks the user, then calls again with `force_restart: true`
+/// to discard the partial and start over.
+#[tauri::command]
+pub async fn refresh_download_source(
+    core: State<'_, Core>,
+    id: DownloadId,
+    url: String,
+    headers: Option<Vec<(String, String)>>,
+    force_restart: Option<bool>,
+) -> CommandResult<RefreshOutcome> {
+    Ok(core
+        .refresh_source(id, &url, headers, force_restart.unwrap_or(false))
+        .await?)
+}
+
+/// How long the extension holds an armed refresh. Long enough for the user to
+/// switch to the browser, find the page, log in again if needed, and click the
+/// link. Short enough that a forgotten arm cannot silently swallow an
+/// unrelated download later in the session.
+const ARM_REFRESH_TTL_MS: i64 = 5 * 60 * 1000;
+
+/// Tell the extension to fold the next matching capture into `id` instead of
+/// creating a new row.
+///
+/// Called when the user opens the "Refresh link" dialog. The extension matches
+/// on the row's file name and byte size, because an intercepted download
+/// carries no tab or page URL to correlate on. Both are columns every row
+/// already has, so this works on downloads that failed before the feature
+/// shipped.
+///
+/// Best-effort: with no extension connected the push goes nowhere and the
+/// dialog's paste field is the remaining path. That is why this returns the
+/// deadline rather than an error — the dialog uses it to stop waiting.
+#[tauri::command]
+pub async fn arm_link_refresh(core: State<'_, Core>, id: DownloadId) -> CommandResult<i64> {
+    let record = core.get_download(id).await?;
+    if record.kind != DownloadKind::Http {
+        return Err(CommandError::from(format!(
+            "only direct HTTP downloads can have their link refreshed (this row is {})",
+            record.kind
+        )));
+    }
+    let origin = record
+        .url
+        .parse::<url::Url>()
+        .ok()
+        .map(|u| u.origin().ascii_serialization());
+    let expires_at_ms = chrono::Utc::now().timestamp_millis() + ARM_REFRESH_TTL_MS;
+
+    crate::pipe::broadcast_arm_refresh(
+        id,
+        Some(record.filename),
+        record.total_bytes,
+        origin,
+        expires_at_ms,
+    )
+    .await;
+    Ok(expires_at_ms)
+}
+
 #[tauri::command]
 pub async fn remove_download(
     core: State<'_, Core>,
@@ -593,7 +666,9 @@ pub async fn probe_media_url(
     // source one from.
     match core.probe_media_url(&url, None).await {
         Ok(result) => Ok(Some(result)),
-        Err(e @ (YtdlpError::Unsupported | YtdlpError::Timeout(_) | YtdlpError::Process { .. })) => {
+        Err(
+            e @ (YtdlpError::Unsupported | YtdlpError::Timeout(_) | YtdlpError::Process { .. }),
+        ) => {
             tracing::debug!(%url, error = %e, "probe_media_url: not media, falling back to HTTP engine");
             Ok(None)
         }

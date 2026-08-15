@@ -758,6 +758,7 @@ mod tests {
             downloaded_bytes: downloaded,
             status,
             error: None,
+            error_kind: None,
             category_id: None,
             priority: 0,
             segments: 1,

@@ -38,6 +38,7 @@ import type { DownloadJob, RequestHeader } from "../shared/types.js";
 import { buildCookieHeader } from "./cookie-forwarder.js";
 import type { HeaderCache } from "./header-capture.js";
 import type { NativeBridge } from "./native-bridge.js";
+import type { ArmedRefresh, RefreshArmTable } from "./refresh-arm.js";
 import { shouldIntercept, type ShouldInterceptDecision } from "./intercept-rules.js";
 import { recordRuleHit } from "./rule-metrics.js";
 import type { SettingsReader } from "../shared/settings.js";
@@ -46,6 +47,10 @@ export interface InterceptorDeps {
   readonly headerCache: HeaderCache;
   readonly bridge: NativeBridge;
   readonly settings: SettingsReader;
+  /** Rows the app asked us to repair. Optional so existing tests that build
+   *  deps by hand keep working — absent means "nothing armed", which is the
+   *  behaviour the interceptor had before the refresh feature. */
+  readonly refreshArms?: RefreshArmTable;
 }
 
 /**
@@ -125,6 +130,26 @@ export function installDownloadInterceptor(deps: InterceptorDeps): void {
 
     const settings = deps.settings.current();
     const filename = pickFilename(item);
+
+    // An armed refresh outranks the normal rules. The user explicitly asked
+    // to repair THIS download, so a passthrough rule that would otherwise let
+    // it go to the browser must not strand them — they would click the link,
+    // watch the browser save a duplicate, and the broken row would sit there
+    // untouched. Checked before `shouldIntercept` for that reason.
+    const armed = deps.refreshArms?.match(filename, item.totalBytes > 0 ? item.totalBytes : null);
+    if (armed) {
+      if (!deps.bridge.isHealthy()) {
+        log.info("armed refresh but bridge unhealthy — leaving to the browser:", url);
+        void notifyNotRunningOnce();
+        return;
+      }
+      handlingIds.add(item.id);
+      void handleRefreshCapture(item, armed, url, filename, deps)
+        .catch((err) => log.warn("handleRefreshCapture failed", err))
+        .finally(() => handlingIds.delete(item.id));
+      return true; // BARRIER, same as a normal capture.
+    }
+
     const decision = shouldIntercept({ url, filename, size: item.totalBytes, settings });
     // Record a hit for any rule that decided the outcome. Buffered;
     // the alarm tick pushes the snapshot to Tauri every 6 s.
@@ -251,6 +276,54 @@ async function handleCapture(
     log.warn("bridge.send failed after cancel; re-downloading", err);
     await notifyNotRunningOnce();
     await redownloadInBrowser(url);
+  }
+}
+
+/**
+ * Hand a re-captured download to the app as a REPLACEMENT for an existing row.
+ *
+ * Same cancel-and-forward shape as `handleCapture`, with one difference that
+ * matters: it sends `refreshDownload`, which re-points the existing row and
+ * keeps its partial file, instead of `download`, which would create a second
+ * row and start from zero.
+ *
+ * The arm is only released after a successful send. A failed send leaves it
+ * armed so the user can simply click the link again.
+ */
+async function handleRefreshCapture(
+  item: chrome.downloads.DownloadItem,
+  armed: ArmedRefresh,
+  url: string,
+  filename: string,
+  deps: InterceptorDeps,
+): Promise<void> {
+  const settings = deps.settings.current();
+  const referrer = item.referrer && item.referrer.length > 0 ? item.referrer : null;
+
+  await cancelBrowserDownload(item.id, settings.hideShelf);
+
+  const job = await buildJob({
+    item,
+    url,
+    filename,
+    referrer,
+    cached: deps.headerCache.getHeadersFor(url) ?? [],
+    // A refresh exists because the session died, so cookies are the whole
+    // point. Honour the user's setting anyway — someone who turned cookie
+    // forwarding off did so deliberately.
+    forwardCookies: settings.forwardCookies,
+  });
+
+  try {
+    await deps.bridge.send({ type: "refreshDownload", downloadId: armed.downloadId, job });
+    deps.refreshArms?.remove(armed.downloadId);
+    log.info(`refreshed download ${armed.downloadId} with a fresh capture`);
+  } catch (err) {
+    // Unlike `handleCapture`, do NOT re-download in the browser. The user
+    // asked to repair a specific row; handing them a loose duplicate file
+    // would leave the broken row exactly as it was.
+    log.warn("refreshDownload send failed; arm kept for another try", err);
+    await notifyNotRunningOnce();
   }
 }
 

@@ -1,0 +1,19 @@
+{
+  "type": "refreshDownload",
+  "downloadId": 42,
+  "job": {
+    "finalUrl": "https://cdn.example.com/file.zip?token=fresh",
+    "originalUrl": "https://example.com/download",
+    "referrer": "https://example.com/page",
+    "filename": "file.zip",
+    "mime": "application/zip",
+    "size": 123456,
+    "cookieHeader": "session=new; csrf=xyz",
+    "userAgent": "Mozilla/5.0 (X11)",
+    "requestHeaders": [
+      { "name": "Accept", "value": "*/*" }
+    ],
+    "tabId": null,
+    "pageUrl": null
+  }
+}

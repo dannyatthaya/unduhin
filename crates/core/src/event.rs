@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use engine::SegmentRuntimeState;
 
-use crate::download::{DownloadId, DownloadRecord, Status};
+use crate::download::{DownloadId, DownloadRecord, ErrorKind, Status};
 use crate::tooling::Tool;
 
 /// One event on the core event bus.
@@ -55,6 +55,10 @@ pub enum CoreEvent {
     Failed {
         id: DownloadId,
         error: String,
+        /// Typed reason, mirroring the row's `error_kind` column. The UI
+        /// branches on `expired_auth` to offer "Refresh link" in place of
+        /// "Retry now".
+        error_kind: ErrorKind,
     },
     /// Live swarm snapshot for a torrent download. Translated from the
     /// engine's [`engine::ProgressEvent::SwarmProgress`] in `queue.rs`; the

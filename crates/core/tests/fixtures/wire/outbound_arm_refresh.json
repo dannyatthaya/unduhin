@@ -1,0 +1,8 @@
+{
+  "type": "armRefresh",
+  "downloadId": 42,
+  "filename": "file.zip",
+  "sizeBytes": 123456,
+  "origin": "https://cdn.example.com",
+  "expiresAtMs": 1786000000000
+}

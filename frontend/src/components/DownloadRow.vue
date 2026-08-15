@@ -40,6 +40,7 @@ import { useDetailStore } from "@/stores/detail";
 import { useDownloadsStore } from "@/stores/downloads";
 import { useSelectionStore } from "@/stores/selection";
 import { useDeleteConfirm } from "@/composables/useDeleteConfirm";
+import { useRefreshLink } from "@/composables/useRefreshLink";
 import { useToast } from "@/composables/useToast";
 import {
   formatBytes,
@@ -229,8 +230,22 @@ const showProgress = computed(() =>
   ["active", "muxing", "paused", "failed"].includes(props.download.status)
 );
 
+function openRefreshLink() {
+  void useRefreshLink().requestRefresh(props.download.id, props.download.filename);
+}
+
+/** A link or session that expired. The row offers "Refresh link" for these,
+ *  because a plain retry replays the same dead URL and fails identically. */
+const isExpiredAuth = computed(
+  () => props.download.status === "failed" && props.download.error_kind === "expired_auth"
+);
+
 const errorLine = computed(() => {
   if (props.download.status !== "failed" || !props.download.error) return null;
+  // A raw "server returned terminal status 403" tells the user nothing they
+  // can act on. Say what happened and what fixes it; keep the backend string
+  // available in the detail pane for anyone debugging.
+  if (isExpiredAuth.value) return t("downloads.errorExpiredLink");
   return `${props.download.error}`;
 });
 
@@ -368,6 +383,11 @@ const menuItems = computed(() => {
       items.push({ label: t("downloads.menuResume"), onSelect: () => store.resume(props.download.id) });
       break;
     case "failed":
+      // Retry is still offered on an expired link — it is harmless, just
+      // futile — but Refresh link comes first because it is the one that works.
+      if (isExpiredAuth.value) {
+        items.push({ label: t("downloads.refreshLink"), onSelect: openRefreshLink });
+      }
       items.push({ label: t("downloads.batchRetry"), onSelect: () => restart(props.download.id) });
       break;
     case "cancelled":
@@ -480,7 +500,16 @@ const menuItems = computed(() => {
 
       <div class="flex shrink-0 items-center gap-1" @click.stop>
         <template v-if="download.status === 'failed'">
-          <Button size="sm" variant="secondary" @click="restart(download.id)">
+          <Button
+            v-if="isExpiredAuth"
+            size="sm"
+            variant="secondary"
+            :title="t('downloads.refreshLinkHint')"
+            @click="openRefreshLink"
+          >
+            {{ t("downloads.refreshLink") }}
+          </Button>
+          <Button v-else size="sm" variant="secondary" @click="restart(download.id)">
             {{ t("downloads.retryNow") }}
           </Button>
         </template>

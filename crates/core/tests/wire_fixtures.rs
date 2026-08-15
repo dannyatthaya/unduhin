@@ -42,6 +42,64 @@ fn inbound_download_fixture() {
     round_trip_inbound("inbound_download.json");
 }
 
+/// The refresh pair. These are the first variants with multi-word fields, and
+/// `rename_all` on the enum renames variants rather than fields — so each
+/// carries its own per-variant `rename_all`. These fixtures are what catches a
+/// regression back to `download_id`.
+#[test]
+fn inbound_refresh_download_fixture() {
+    round_trip_inbound("inbound_refresh_download.json");
+}
+
+#[test]
+fn inbound_credentials_refreshed_fixture() {
+    round_trip_inbound("inbound_credentials_refreshed.json");
+}
+
+#[test]
+fn outbound_arm_refresh_fixture() {
+    round_trip_outbound("outbound_arm_refresh.json");
+}
+
+#[test]
+fn outbound_refresh_credentials_fixture() {
+    round_trip_outbound("outbound_refresh_credentials.json");
+}
+
+/// The round-trip helpers would pass even if every field silently vanished
+/// into a default, so assert the camelCase keys are actually consumed.
+#[test]
+fn refresh_fixtures_use_camel_case_keys() {
+    let raw = read("inbound_refresh_download.json");
+    let parsed: Inbound = serde_json::from_str(&raw).expect("parse");
+    match parsed {
+        Inbound::RefreshDownload { download_id, job } => {
+            assert_eq!(download_id, 42);
+            assert_eq!(
+                job.final_url,
+                "https://cdn.example.com/file.zip?token=fresh"
+            );
+        }
+        other => panic!("wrong variant: {other:?}"),
+    }
+
+    let raw = read("outbound_arm_refresh.json");
+    let parsed: Outbound = serde_json::from_str(&raw).expect("parse");
+    match parsed {
+        Outbound::ArmRefresh {
+            download_id,
+            size_bytes,
+            expires_at_ms,
+            ..
+        } => {
+            assert_eq!(download_id, 42);
+            assert_eq!(size_bytes, Some(123_456));
+            assert_eq!(expires_at_ms, 1_786_000_000_000);
+        }
+        other => panic!("wrong variant: {other:?}"),
+    }
+}
+
 #[test]
 fn inbound_download_media_fixture() {
     round_trip_inbound("inbound_download_media.json");

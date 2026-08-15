@@ -6,6 +6,7 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 import AppTitleBar from "@/components/AppTitleBar.vue";
 import Toaster from "@/components/ui/Toaster.vue";
 import DeleteConfirmDialog from "@/components/DeleteConfirmDialog.vue";
+import RefreshLinkDialog from "@/components/RefreshLinkDialog.vue";
 import ConfirmOnQuitDialog from "@/components/ConfirmOnQuitDialog.vue";
 import AskHandoffDialog from "@/components/settings/browser/AskHandoffDialog.vue";
 import { useUnduhinEvents } from "@/composables/useUnduhinEvents";
@@ -82,6 +83,7 @@ onBeforeUnmount(() => {
 
     <ConfirmOnQuitDialog />
     <DeleteConfirmDialog />
+    <RefreshLinkDialog />
     <AskHandoffDialog />
     <Toaster />
   </div>

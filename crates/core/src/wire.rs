@@ -502,6 +502,45 @@ pub enum Inbound {
     RuleMetrics {
         metrics: Vec<RuleMetric>,
     },
+    /// The user re-clicked a download link for a row whose link had
+    /// expired, and the extension matched the capture against an armed
+    /// refresh (see [`Outbound::ArmRefresh`]).
+    ///
+    /// Unlike [`Inbound::Download`], this creates **no new row**. It
+    /// re-points `download_id` at the freshly captured URL and headers via
+    /// `Core::refresh_source`, so the partial file on disk survives.
+    ///
+    /// `job.final_url` is untrusted browser input; the pipe handler rejects
+    /// anything that is not an `http`/`https` URL before it reaches a request.
+    // `rename_all` on the enum renames VARIANTS, not fields. Every older
+    // variant happens to use single-word fields, so this is the first place
+    // it matters — without the per-variant attribute these would go out as
+    // `download_id` while the rest of the protocol is camelCase.
+    #[serde(rename_all = "camelCase")]
+    RefreshDownload {
+        #[cfg_attr(feature = "ts-rs-export", ts(type = "number"))]
+        download_id: i64,
+        job: DownloadJob,
+    },
+    /// Reply to [`Outbound::RefreshCredentials`]: a fresh cookie header for a
+    /// URL that is still valid but whose session died.
+    ///
+    /// This is the silent tier. Chrome's cookie jar is always live, so no page
+    /// and no tab are needed — the extension just re-reads the cookies for the
+    /// stored URL. It fixes a cookie-gated CDN; it cannot fix a signed URL
+    /// whose token expired, which needs the full recapture above.
+    ///
+    /// `token` echoes the request so a late reply for a superseded attempt can
+    /// be discarded.
+    #[serde(rename_all = "camelCase")]
+    CredentialsRefreshed {
+        token: String,
+        #[cfg_attr(feature = "ts-rs-export", ts(type = "number"))]
+        download_id: i64,
+        cookie_header: Option<String>,
+        user_agent: Option<String>,
+        request_headers: Vec<RequestHeader>,
+    },
 }
 
 /// Native host → browser. `Ack` carries the `core::download::DownloadId`
@@ -562,6 +601,46 @@ pub enum Outbound {
     /// [`Outbound::Error`], not an empty list.
     MediaFormats {
         formats: Vec<MediaFormat>,
+    },
+    /// Arm the extension to adopt the next matching capture into an existing
+    /// row instead of creating a new one. Pushed when the user clicks
+    /// "Refresh link" on a download whose link expired.
+    ///
+    /// The extension nulls `tab_id` and `page_url` on intercepted downloads,
+    /// so a capture carries no link back to the row it should replace. Arming
+    /// supplies that link out of band: the extension holds the entry until
+    /// `expires_at_ms`, then matches an incoming capture on `filename` and
+    /// `size_bytes` and answers with [`Inbound::RefreshDownload`].
+    ///
+    /// Matching on name and size is what makes this work for rows that
+    /// already exist — both are columns every row has, so no backfill of
+    /// page context is needed.
+    #[serde(rename_all = "camelCase")]
+    ArmRefresh {
+        #[cfg_attr(feature = "ts-rs-export", ts(type = "number"))]
+        download_id: i64,
+        /// File name to match against `chrome.downloads.DownloadItem`.
+        filename: Option<String>,
+        /// Expected size in bytes. `None` when the row never learned one, in
+        /// which case the extension matches on the file name alone.
+        #[cfg_attr(feature = "ts-rs-export", ts(type = "number | null"))]
+        size_bytes: Option<u64>,
+        /// Origin of the dead URL, shown by the app's dialog so the user can
+        /// confirm a capture that arrives from a different host.
+        origin: Option<String>,
+        /// Unix epoch milliseconds after which the extension drops the entry.
+        #[cfg_attr(feature = "ts-rs-export", ts(type = "number"))]
+        expires_at_ms: i64,
+    },
+    /// Ask the extension for a fresh cookie header for a URL that is still
+    /// good but whose session expired. Answered by
+    /// [`Inbound::CredentialsRefreshed`] carrying the same `token`.
+    #[serde(rename_all = "camelCase")]
+    RefreshCredentials {
+        token: String,
+        #[cfg_attr(feature = "ts-rs-export", ts(type = "number"))]
+        download_id: i64,
+        url: String,
     },
 }
 

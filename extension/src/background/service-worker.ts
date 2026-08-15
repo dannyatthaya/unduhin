@@ -31,6 +31,8 @@ import {
 } from "../shared/settings.js";
 import { compareVersions } from "../shared/version.js";
 import { installHeaderCapture } from "./header-capture.js";
+import { buildCookieHeader } from "./cookie-forwarder.js";
+import { createRefreshArmTable } from "./refresh-arm.js";
 import { createNativeBridge } from "./native-bridge.js";
 import type { NativeBridge } from "./native-bridge.js";
 import { installDownloadInterceptor } from "./download-interceptor.js";
@@ -57,6 +59,57 @@ async function readHostName(): Promise<string> {
 
 const headerCache = installHeaderCapture();
 
+/** Rows the app asked us to fold the next matching capture into. See
+ *  `refresh-arm.ts` for why the match is on file name and size. */
+const refreshArms = createRefreshArmTable();
+
+/**
+ * Answer an `Outbound::RefreshCredentials` with a freshly read cookie header.
+ *
+ * This is the silent tier of the link refresh: it fixes a cookie-gated CDN,
+ * where the URL never changed and only the session expired. `chrome.cookies`
+ * is live regardless of what tabs are open, so nothing is asked of the user.
+ *
+ * A signed URL whose token expired is NOT fixable here — the app will fail
+ * again and fall back to the "Refresh link" button.
+ *
+ * Failures are swallowed to a log: the app times its own attempt out, and a
+ * thrown error in an unsolicited handler would take down the port.
+ */
+async function handleRefreshCredentials(
+  token: string,
+  downloadId: number,
+  url: string,
+): Promise<void> {
+  let cookieHeader = "";
+  try {
+    cookieHeader = await buildCookieHeader(url);
+  } catch (err) {
+    log.warn("refreshCredentials: buildCookieHeader failed", err);
+  }
+  // Replay whatever headers we still hold for this exact URL. The cache is
+  // short-lived (90 s), so this is usually empty by the time a download has
+  // failed — the cookies above are the part that matters.
+  const cached = headerCache.getHeadersFor(url) ?? [];
+  const requestHeaders = cached
+    .filter((h) => typeof h.name === "string" && h.name.length > 0)
+    .map((h) => ({ name: h.name, value: typeof h.value === "string" ? h.value : "" }));
+
+  const msg: Inbound = {
+    type: "credentialsRefreshed",
+    token,
+    downloadId,
+    cookieHeader: cookieHeader.length > 0 ? cookieHeader : null,
+    userAgent: navigator.userAgent || null,
+    requestHeaders,
+  };
+  try {
+    await bridge.send(msg);
+  } catch (err) {
+    log.warn("refreshCredentials: reply failed", err);
+  }
+}
+
 // `ask-first` no longer round-trips a capture/passthrough decision through
 // the service worker. The interceptor sends the job to the app as an
 // `askHandoff`; the app shows its full config dialog and starts the download
@@ -77,6 +130,24 @@ const rawBridge = createNativeBridge(
     }
     if (msg.type === "extensionUpdated") {
       void handleExtensionUpdated(msg.version);
+      return;
+    }
+    // The user clicked "Refresh link" in the app. Hold the entry so the next
+    // matching capture folds into that row instead of adding a new one.
+    if (msg.type === "armRefresh") {
+      refreshArms.arm({
+        downloadId: msg.downloadId,
+        filename: msg.filename,
+        sizeBytes: msg.sizeBytes,
+        origin: msg.origin,
+        expiresAt: msg.expiresAtMs,
+      });
+      return;
+    }
+    // Tier 0: the URL is still good, only the session died. Chrome's cookie
+    // jar is always live, so this needs no page and no tab.
+    if (msg.type === "refreshCredentials") {
+      void handleRefreshCredentials(msg.token, msg.downloadId, msg.url);
       return;
     }
     // `handoffDecision` frames are vestigial — the app no longer drives the
@@ -233,7 +304,7 @@ const mediaSniffer = installMediaSniffer({
   },
 });
 
-installDownloadInterceptor({ headerCache, bridge, settings });
+installDownloadInterceptor({ headerCache, bridge, settings, refreshArms });
 installContextMenu({ headerCache, bridge, settings });
 
 // `chrome.runtime.sendMessage` excludes the sender from delivery, so the

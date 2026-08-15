@@ -139,63 +139,133 @@ pub async fn store_extension_settings(full: ExtensionSettings) {
     *settings_cache().lock().await = Some(full);
 }
 
-/// Broadcast a `SettingsChanged { full }` frame to every connected
-/// pipe client. Best-effort: per-client write errors are logged and
-/// the broken connection's writer eventually gets reaped by its
-/// owning task. Public so Tauri commands can push panel-driven edits
-/// back out to the extension.
+/// In-flight [`Outbound::RefreshCredentials`] requests, keyed by download id.
+///
+/// Two jobs. It correlates a reply to its request, so a late answer for a
+/// superseded attempt gets dropped instead of re-queueing a row the user may
+/// have since paused. And its presence marks "already tried", which is what
+/// bounds the silent tier to one attempt: without that, a row whose cookies
+/// are genuinely dead would loop fail → refresh → fail forever.
 #[cfg(windows)]
-pub async fn broadcast_settings_changed(full: ExtensionSettings) {
-    use unduhin_core::wire::framing::write_frame;
-    use unduhin_core::wire::Outbound;
+fn pending_credential_refresh() -> &'static AsyncMutex<std::collections::HashMap<i64, String>> {
+    static PENDING: OnceLock<AsyncMutex<std::collections::HashMap<i64, String>>> = OnceLock::new();
+    PENDING.get_or_init(|| AsyncMutex::new(std::collections::HashMap::new()))
+}
 
-    let frame = match serde_json::to_vec(&Outbound::SettingsChanged { full }) {
+/// Claim the right to make one silent credential-refresh attempt for `id`.
+///
+/// Returns the correlation token, or `None` when an attempt is already in
+/// flight or no extension is connected to answer. The caller must clear the
+/// entry via [`take_pending_credential_refresh`] or
+/// [`forget_credential_refresh`], otherwise the download never gets another
+/// automatic try.
+///
+/// The token only has to be unique among in-flight requests, so a monotonic
+/// counter is enough — it is a correlation tag, not a secret.
+#[cfg(windows)]
+pub async fn begin_credential_refresh(id: i64) -> Option<String> {
+    // Nobody to ask. Claiming the slot here would burn the row's one
+    // automatic attempt on a request that was never sent.
+    if connected_clients().lock().await.is_empty() {
+        return None;
+    }
+    let mut guard = pending_credential_refresh().lock().await;
+    if guard.contains_key(&id) {
+        return None;
+    }
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let token = format!(
+        "cred-{id}-{}",
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    guard.insert(id, token.clone());
+    Some(token)
+}
+
+/// Consume the pending entry for `id` when `token` matches. `false` means the
+/// reply is stale and must be ignored.
+#[cfg(windows)]
+async fn take_pending_credential_refresh(id: i64, token: &str) -> bool {
+    let mut guard = pending_credential_refresh().lock().await;
+    match guard.get(&id) {
+        Some(t) if t == token => {
+            guard.remove(&id);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Drop any pending entry for `id`, re-allowing a future automatic attempt.
+/// Called when a download completes or is removed — the next failure is a new
+/// situation, not a repeat of the one already tried.
+#[cfg(windows)]
+pub async fn forget_credential_refresh(id: i64) {
+    pending_credential_refresh().lock().await.remove(&id);
+}
+
+#[cfg(not(windows))]
+pub async fn begin_credential_refresh(_id: i64) -> Option<String> {
+    None
+}
+
+#[cfg(not(windows))]
+pub async fn forget_credential_refresh(_id: i64) {}
+
+/// Fan one unsolicited frame out to every connected pipe client.
+///
+/// Best-effort: per-client write errors are logged and the broken
+/// connection's writer eventually gets reaped by its owning task.
+///
+/// The client list is snapshotted so no per-client write happens while the
+/// outer lock is held — a slow client must only block its own per-writer
+/// mutex. The `Arc<Mutex<WriteHalf>>`s stay valid after the snapshot vec is
+/// dropped, because broken connections are pruned by their own task.
+///
+/// `label` names the frame in the log lines only.
+#[cfg(windows)]
+async fn broadcast(frame: unduhin_core::wire::Outbound, label: &str) {
+    use unduhin_core::wire::framing::write_frame;
+
+    let bytes = match serde_json::to_vec(&frame) {
         Ok(buf) => buf,
         Err(e) => {
-            tracing::warn!(error = %e, "serialize SettingsChanged failed");
+            tracing::warn!(error = %e, label, "serialize outbound frame failed");
             return;
         }
     };
-    // Snapshot the client list so we don't hold the outer lock across
-    // any per-client write. The Arc<Mutex<WriteHalf>>s stay valid even
-    // after the snapshot vec is dropped — broken connections are
-    // pruned by their own per-connection task.
     let snapshot: Vec<Arc<ClientWriter>> = connected_clients().lock().await.clone();
     for client in snapshot {
         let mut writer = client.lock().await;
-        if let Err(e) = write_frame(&mut *writer, &frame).await {
-            tracing::debug!(error = %e, "broadcast write failed (client likely gone)");
+        if let Err(e) = write_frame(&mut *writer, &bytes).await {
+            tracing::debug!(error = %e, label, "broadcast write failed (client likely gone)");
         }
     }
+}
+
+/// Broadcast a `SettingsChanged { full }` frame. Public so Tauri commands can
+/// push panel-driven edits back out to the extension.
+#[cfg(windows)]
+pub async fn broadcast_settings_changed(full: ExtensionSettings) {
+    broadcast(
+        unduhin_core::wire::Outbound::SettingsChanged { full },
+        "SettingsChanged",
+    )
+    .await;
 }
 
 #[cfg(not(windows))]
 pub async fn broadcast_settings_changed(_full: unduhin_core::wire::ExtensionSettings) {}
 
-/// Broadcast a `HandoffDecision { id, decision }` frame. Mirrors
-/// [`broadcast_settings_changed`]: snapshot-then-fan-out so a slow
-/// client only blocks its own per-writer mutex. The extension routes
-/// the unsolicited frame back to the matching `ask-first` waiter by
-/// `id`.
+/// Broadcast a `HandoffDecision { id, decision }` frame. The extension routes
+/// the unsolicited frame back to the matching `ask-first` waiter by `id`.
 #[cfg(windows)]
 pub async fn broadcast_handoff_decision(id: String, decision: HandoffDecision) {
-    use unduhin_core::wire::framing::write_frame;
-    use unduhin_core::wire::Outbound;
-
-    let frame = match serde_json::to_vec(&Outbound::HandoffDecision { id, decision }) {
-        Ok(buf) => buf,
-        Err(e) => {
-            tracing::warn!(error = %e, "serialize HandoffDecision failed");
-            return;
-        }
-    };
-    let snapshot: Vec<Arc<ClientWriter>> = connected_clients().lock().await.clone();
-    for client in snapshot {
-        let mut writer = client.lock().await;
-        if let Err(e) = write_frame(&mut *writer, &frame).await {
-            tracing::debug!(error = %e, "handoff broadcast write failed (client likely gone)");
-        }
-    }
+    broadcast(
+        unduhin_core::wire::Outbound::HandoffDecision { id, decision },
+        "HandoffDecision",
+    )
+    .await;
 }
 
 #[cfg(not(windows))]
@@ -205,34 +275,74 @@ pub async fn broadcast_handoff_decision(
 ) {
 }
 
-/// Broadcast an `ExtensionUpdated { version }` frame to every connected
-/// pipe client. Mirrors [`broadcast_settings_changed`]: snapshot-then-fan-out
-/// so a slow client only blocks its own per-writer mutex. Sent by the
-/// startup sync after the canonical extension folder was replaced; the
-/// extension reloads itself when its running version is older.
+/// Broadcast an `ExtensionUpdated { version }` frame. Sent by the startup sync
+/// after the canonical extension folder was replaced; the extension reloads
+/// itself when its running version is older.
 #[cfg(windows)]
 pub async fn broadcast_extension_updated(version: String) {
-    use unduhin_core::wire::framing::write_frame;
-    use unduhin_core::wire::Outbound;
-
-    let frame = match serde_json::to_vec(&Outbound::ExtensionUpdated { version }) {
-        Ok(buf) => buf,
-        Err(e) => {
-            tracing::warn!(error = %e, "serialize ExtensionUpdated failed");
-            return;
-        }
-    };
-    let snapshot: Vec<Arc<ClientWriter>> = connected_clients().lock().await.clone();
-    for client in snapshot {
-        let mut writer = client.lock().await;
-        if let Err(e) = write_frame(&mut *writer, &frame).await {
-            tracing::debug!(error = %e, "extension-updated broadcast write failed (client likely gone)");
-        }
-    }
+    broadcast(
+        unduhin_core::wire::Outbound::ExtensionUpdated { version },
+        "ExtensionUpdated",
+    )
+    .await;
 }
 
 #[cfg(not(windows))]
 pub async fn broadcast_extension_updated(_version: String) {}
+
+/// Arm the extension to fold the next matching capture into `download_id`
+/// rather than creating a new row. Sent when the user clicks "Refresh link".
+///
+/// See [`unduhin_core::wire::Outbound::ArmRefresh`] for why the match is on
+/// file name and size rather than tab or page URL.
+#[cfg(windows)]
+pub async fn broadcast_arm_refresh(
+    download_id: i64,
+    filename: Option<String>,
+    size_bytes: Option<u64>,
+    origin: Option<String>,
+    expires_at_ms: i64,
+) {
+    broadcast(
+        unduhin_core::wire::Outbound::ArmRefresh {
+            download_id,
+            filename,
+            size_bytes,
+            origin,
+            expires_at_ms,
+        },
+        "ArmRefresh",
+    )
+    .await;
+}
+
+#[cfg(not(windows))]
+pub async fn broadcast_arm_refresh(
+    _download_id: i64,
+    _filename: Option<String>,
+    _size_bytes: Option<u64>,
+    _origin: Option<String>,
+    _expires_at_ms: i64,
+) {
+}
+
+/// Ask the extension for a fresh cookie header for `url`. The reply arrives
+/// later as an `Inbound::CredentialsRefreshed` carrying the same `token`.
+#[cfg(windows)]
+pub async fn broadcast_refresh_credentials(token: String, download_id: i64, url: String) {
+    broadcast(
+        unduhin_core::wire::Outbound::RefreshCredentials {
+            token,
+            download_id,
+            url,
+        },
+        "RefreshCredentials",
+    )
+    .await;
+}
+
+#[cfg(not(windows))]
+pub async fn broadcast_refresh_credentials(_token: String, _download_id: i64, _url: String) {}
 
 #[cfg(not(windows))]
 pub async fn cached_extension_settings() -> Option<unduhin_core::wire::ExtensionSettings> {
@@ -479,9 +589,7 @@ pub async fn run_server(name: String, core: Core) -> std::io::Result<()> {
     // exponential backoff. A single listener error must not permanently
     // disable the bridge (the previous code propagated the error out of
     // the loop and never respawned), so this never gives up.
-    async fn recreate(
-        make: &impl Fn(bool) -> std::io::Result<NamedPipeServer>,
-    ) -> NamedPipeServer {
+    async fn recreate(make: &impl Fn(bool) -> std::io::Result<NamedPipeServer>) -> NamedPipeServer {
         let mut backoff = Duration::from_millis(100);
         loop {
             match make(false) {
@@ -546,9 +654,7 @@ async fn handle_connection(stream: NamedPipeServer, core: Core) -> std::io::Resu
             .unwrap_or_default();
         if !frame.is_empty() {
             let mut w = writer.lock().await;
-            if let Err(e) =
-                unduhin_core::wire::framing::write_frame(&mut *w, &frame).await
-            {
+            if let Err(e) = unduhin_core::wire::framing::write_frame(&mut *w, &frame).await {
                 tracing::debug!(error = %e, "extension-version greeting write failed");
             }
         }
@@ -635,6 +741,35 @@ async fn dispatch(core: &Core, msg: unduhin_core::wire::Inbound) -> unduhin_core
         Inbound::ProbeMedia { url, referrer } => {
             match handle_probe_media(core, url, referrer).await {
                 Ok(formats) => Outbound::MediaFormats { formats },
+                Err(e) => Outbound::Error { message: e },
+            }
+        }
+        Inbound::RefreshDownload { download_id, job } => {
+            match handle_refresh_download(core, download_id, job).await {
+                // Ack with the SAME id: no new row was created, the
+                // existing one was re-pointed.
+                Ok(()) => Outbound::Ack { id: download_id },
+                Err(e) => Outbound::Error { message: e },
+            }
+        }
+        Inbound::CredentialsRefreshed {
+            token,
+            download_id,
+            cookie_header,
+            user_agent,
+            request_headers,
+        } => {
+            match handle_credentials_refreshed(
+                core,
+                token,
+                download_id,
+                cookie_header,
+                user_agent,
+                request_headers,
+            )
+            .await
+            {
+                Ok(()) => Outbound::Ack { id: download_id },
                 Err(e) => Outbound::Error { message: e },
             }
         }
@@ -734,6 +869,120 @@ async fn handle_download(
     core.add_download(input).await.map_err(|e| format!("{e}"))
 }
 
+/// Fold a re-captured job into an EXISTING row rather than adding one.
+///
+/// The extension only sends this after matching the capture against an armed
+/// refresh, so the correlation has already been made browser-side. Everything
+/// here is still untrusted: `Core::refresh_source` re-parses the URL and
+/// rejects any scheme that is not `http`/`https`.
+///
+/// Deliberately does NOT fall back to creating a new row when the refresh is
+/// rejected. A user who asked to refresh a specific download would otherwise
+/// silently get a duplicate alongside the broken one.
+#[cfg(windows)]
+async fn handle_refresh_download(
+    core: &Core,
+    download_id: unduhin_core::DownloadId,
+    job: unduhin_core::wire::DownloadJob,
+) -> Result<(), String> {
+    let headers = unduhin_core::wire::headers_from_job(&job);
+    let outcome = core
+        .refresh_source(
+            download_id,
+            &job.final_url,
+            if headers.is_empty() {
+                None
+            } else {
+                Some(headers)
+            },
+            false,
+        )
+        .await
+        .map_err(|e| format!("{e}"))?;
+
+    // A size mismatch needs a human decision, so surface it to the frontend
+    // rather than deciding here. The dialog is already open and waiting.
+    //
+    // The URL rides along because a `SourceChanged` outcome committed nothing:
+    // to act on the user's "start again", the dialog has to re-send the very
+    // URL that produced the mismatch, and it never saw this one — the capture
+    // came from the browser, not from its paste field.
+    if let Some(app) = app_handle() {
+        if let Err(e) = app.emit(
+            "unduhin:refresh-outcome",
+            (download_id, &outcome, &job.final_url),
+        ) {
+            tracing::warn!(error = %e, "failed to emit refresh-outcome event");
+        }
+    }
+    Ok(())
+}
+
+/// Apply a fresh cookie header to a row whose session expired, then let the
+/// queue try again. The silent tier: no page, no tab, no user action.
+///
+/// Keeps the row's existing URL — this path exists precisely for the case
+/// where the URL is fine and only the session died.
+#[cfg(windows)]
+async fn handle_credentials_refreshed(
+    core: &Core,
+    token: String,
+    download_id: unduhin_core::DownloadId,
+    cookie_header: Option<String>,
+    user_agent: Option<String>,
+    request_headers: Vec<unduhin_core::wire::RequestHeader>,
+) -> Result<(), String> {
+    if !take_pending_credential_refresh(download_id, &token).await {
+        // A stale reply for an attempt that was superseded or already
+        // resolved. Dropping it is correct: applying it would re-queue a row
+        // the user may have since paused or deleted.
+        tracing::debug!(download_id, token, "ignoring stale credential refresh");
+        return Ok(());
+    }
+
+    let record = core
+        .get_download(download_id)
+        .await
+        .map_err(|e| format!("{e}"))?;
+
+    // Reuse the job header folding so ordering and the Cookie/Referer/UA
+    // precedence match every other capture path exactly.
+    let job = unduhin_core::wire::DownloadJob {
+        final_url: record.url.clone(),
+        original_url: record.url.clone(),
+        // Keep whatever Referer the original capture carried; the extension
+        // has no page context to supply a new one here.
+        referrer: record.headers.as_ref().and_then(|hs| {
+            hs.iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case("referer"))
+                .map(|(_, v)| v.clone())
+        }),
+        filename: None,
+        mime: None,
+        size: None,
+        cookie_header,
+        user_agent,
+        request_headers,
+        tab_id: None,
+        page_url: None,
+    };
+    let headers = unduhin_core::wire::headers_from_job(&job);
+
+    core.refresh_source(
+        download_id,
+        &record.url,
+        if headers.is_empty() {
+            None
+        } else {
+            Some(headers)
+        },
+        false,
+    )
+    .await
+    .map_err(|e| format!("{e}"))?;
+    Ok(())
+}
+
 #[cfg(windows)]
 async fn handle_download_media(
     core: &Core,
@@ -814,7 +1063,10 @@ async fn handle_probe_media(
 fn validate_http_url(raw: &str) -> Result<url::Url, String> {
     let parsed = url::Url::parse(raw).map_err(|e| e.to_string())?;
     if parsed.scheme() != "http" && parsed.scheme() != "https" {
-        return Err(format!("unsupported scheme {:?}, expected http/https", parsed.scheme()));
+        return Err(format!(
+            "unsupported scheme {:?}, expected http/https",
+            parsed.scheme()
+        ));
     }
     Ok(parsed)
 }
