@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-08-15T07:33:37.2740370Z",
+  "generated_at": "2026-08-15T16:57:40.5310405Z",
   "rust": [
     {
       "name": "anyhow",
@@ -56,6 +56,12 @@
       "repository": "https://github.com/console-rs/indicatif"
     },
     {
+      "name": "libc",
+      "version": "0.2.186",
+      "license": "MIT OR Apache-2.0",
+      "repository": "https://github.com/rust-lang/libc"
+    },
+    {
       "name": "librqbit",
       "version": "8.1.1",
       "license": "Apache-2.0",
@@ -66,6 +72,18 @@
       "version": "0.13.3",
       "license": "MIT OR Apache-2.0",
       "repository": "https://github.com/seanmonstar/reqwest"
+    },
+    {
+      "name": "ring",
+      "version": "0.17.14",
+      "license": "Apache-2.0 AND ISC",
+      "repository": "https://github.com/briansmith/ring"
+    },
+    {
+      "name": "security-framework",
+      "version": "3.7.0",
+      "license": "MIT OR Apache-2.0",
+      "repository": "https://github.com/kornelski/rust-security-framework"
     },
     {
       "name": "serde",
