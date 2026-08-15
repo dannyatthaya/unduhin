@@ -1,0 +1,153 @@
+name: Release (macOS)
+
+# The Windows release stays local: `scripts/release.ps1 -Publish` builds,
+# signs, tags, and creates the GitHub release. This workflow adds the macOS
+# half afterwards and attaches it to that same release.
+#
+# Trigger on `release: published`, not on the tag push. `release.ps1` pushes
+# the tag *before* it calls `gh release create`, so a tag trigger would race
+# the release's own creation and could upload into nothing.
+#
+# If this job fails, the release simply ships Windows-only and the updater
+# manifest is left untouched — a safe state. Re-run it with
+# `workflow_dispatch`.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to attach macOS artifacts to"
+        required: true
+      channel:
+        description: "Update channel"
+        required: true
+        default: "stable"
+        type: choice
+        options: [stable, beta]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Universal build
+    runs-on: macos-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || github.event.release.tag_name }}
+      CHANNEL: ${{ github.event.inputs.channel || 'stable' }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout the released tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.event.release.tag_name }}
+          fetch-depth: 0
+
+      - name: Derive version from the tag
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "Releasing $version from tag $TAG"
+
+      # The tagged tree already carries the bumped versions, so rather than
+      # re-running the bump script (which would need cargo-edit and leave an
+      # uncommitted diff) just assert they agree.
+      - name: Verify the tag matches the committed version
+        run: |
+          set -euo pipefail
+          conf=$(jq -r '.version' src-tauri/tauri.conf.json)
+          if [ "$conf" != "$VERSION" ]; then
+            echo "tauri.conf.json is $conf but the tag says $VERSION" >&2
+            exit 1
+          fi
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-directories: target/native-host-stage
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Install dependencies
+        run: |
+          bun install --frozen-lockfile --cwd frontend
+          bun install --frozen-lockfile --cwd extension
+
+      # extension/dist is a declared bundle resource, so the bundler fails
+      # without it.
+      - name: Build the extension
+        run: bun run --cwd extension build
+
+      - name: Test
+        run: cargo test --workspace --target aarch64-apple-darwin
+
+      - name: Build universal bundle
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: cargo tauri build --target universal-apple-darwin --bundles app,dmg
+
+      # A thin binary would build, bundle, and pass every other check, then
+      # fail only on a user's Mac of the other architecture. Assert instead.
+      - name: Verify both architectures are present
+        run: |
+          set -euo pipefail
+          BUNDLE=target/universal-apple-darwin/release/bundle
+          APP="$BUNDLE/macos/Unduhin.app"
+          for bin in "$APP/Contents/MacOS/unduhin-app" src-tauri/native-host/unduhin-native-host; do
+            echo "== $bin"
+            lipo -archs "$bin"
+            lipo -archs "$bin" | grep -q x86_64 || { echo "missing x86_64 slice: $bin" >&2; exit 1; }
+            lipo -archs "$bin" | grep -q arm64  || { echo "missing arm64 slice: $bin"  >&2; exit 1; }
+          done
+          test -x src-tauri/native-host/unduhin-native-host
+          test -f "$APP/Contents/Resources/extension/manifest.json"
+          plutil -lint "$APP/Contents/Info.plist"
+
+      - name: Collect artifacts
+        run: |
+          set -euo pipefail
+          BUNDLE=target/universal-apple-darwin/release/bundle
+          mkdir -p dist
+          cp "$BUNDLE"/dmg/*.dmg dist/
+          cp "$BUNDLE"/macos/*.app.tar.gz dist/
+          cp "$BUNDLE"/macos/*.app.tar.gz.sig dist/
+          # The app is unsigned, so publish a checksum users can verify
+          # instead of a signature.
+          (cd dist && shasum -a 256 *.dmg | tee SHA256SUMS-macos.txt)
+          ls -la dist
+
+      - name: Merge macOS keys into the updater manifest
+        run: |
+          set -euo pipefail
+          manifest="latest-$CHANNEL.json"
+          gh release download "$TAG" -p "$manifest" -D . --clobber
+          sig=$(ls dist/*.app.tar.gz.sig)
+          artifact=$(basename "$(ls dist/*.app.tar.gz)")
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${artifact}"
+          bun scripts/merge-macos-manifest.mjs "$manifest" "$VERSION" "$sig" "$url"
+          cp "$manifest" dist/
+
+      - name: Attach to the release
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" \
+            dist/*.dmg \
+            dist/*.app.tar.gz \
+            dist/*.app.tar.gz.sig \
+            dist/SHA256SUMS-macos.txt \
+            "dist/latest-$CHANNEL.json" \
+            --clobber

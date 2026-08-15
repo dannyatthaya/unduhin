@@ -1,9 +1,18 @@
 <script setup lang="ts">
-// Custom Windows-style title bar. The native `decorations` are disabled
-// in `tauri.conf.json`, so this is the only place the app title and
-// window controls live. Dragging is handled by Tauri via the
-// `data-tauri-drag-region` attribute; double-clicking the drag region
-// also toggles maximize for free.
+// Custom title bar.
+//
+// On Windows `decorations` is false, so this is the only place the app
+// title and the window controls live.
+//
+// On macOS `tauri.macos.conf.json` sets `decorations: true` with
+// `titleBarStyle: "Overlay"` and `hiddenTitle: true`. The system draws its
+// traffic lights floating over this bar, so we hide our own buttons and
+// inset the title to clear them. Overlay requires decorations to be on —
+// with them off macOS draws no traffic lights at all and the window has no
+// close affordance.
+//
+// Dragging is handled by Tauri via the `data-tauri-drag-region` attribute;
+// double-clicking the drag region also toggles maximize for free.
 
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { useRoute } from "vue-router";
@@ -14,6 +23,7 @@ import { Minus, Square, Copy, X } from "lucide-vue-next";
 import { useDetailStore } from "@/stores/detail";
 import { useDownloadsStore } from "@/stores/downloads";
 import { truncateFilename } from "@/lib/format";
+import { isMacOS } from "@/lib/platform";
 
 const { t } = useI18n();
 const downloads = useDownloadsStore();
@@ -50,6 +60,10 @@ const win = getCurrentWindow();
 let unlisten: (() => void) | undefined;
 
 onMounted(async () => {
+  // Only the custom maximize button reads this, and macOS does not render
+  // that button — zoom is not maximize there, and the traffic lights own
+  // it. Skip the listener rather than pay for IPC on every resize.
+  if (isMacOS) return;
   isMaximized.value = await win.isMaximized();
   unlisten = await win.onResized(async () => {
     isMaximized.value = await win.isMaximized();
@@ -79,6 +93,7 @@ function close() {
     <div
       data-tauri-drag-region
       class="flex h-full min-w-0 flex-1 items-center gap-2 px-3"
+      :class="{ 'pl-[78px]': isMacOS }"
     >
       <svg
         class="h-3.5 w-3.5 shrink-0"
@@ -99,7 +114,8 @@ function close() {
       <span class="truncate text-xs text-muted-foreground">— {{ subtitle }}</span>
     </div>
 
-    <div class="flex h-full">
+    <!-- macOS draws its own traffic lights over this bar. -->
+    <div v-if="!isMacOS" class="flex h-full">
       <button
         type="button"
         class="flex h-full w-11 items-center justify-center text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"

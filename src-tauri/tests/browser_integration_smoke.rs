@@ -16,7 +16,7 @@
 //! degrade gracefully when run after `pipe_smoke.rs` has already
 //! claimed the latch.
 
-#![cfg(windows)]
+mod common;
 
 use std::time::Duration;
 
@@ -33,12 +33,7 @@ async fn open_core() -> Core {
 }
 
 fn unique_pipe_name() -> String {
-    let pid = std::process::id();
-    let counter = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!(r"\\.\pipe\unduhin-bi-smoke-{pid}-{counter}")
+    common::unique_endpoint("bi-smoke")
 }
 
 /// Once the listener binds, `pipe_status()` reports `listening: true`.

@@ -117,7 +117,10 @@ async fn handle(
     // lies about it (Range requests get full-body 200s). `SingleUseToken`
     // and `NotFound` are single-stream and deliberately omit
     // `Accept-Ranges`.
-    if !matches!(state.mode, ServerMode::SingleUseToken | ServerMode::NotFound) {
+    if !matches!(
+        state.mode,
+        ServerMode::SingleUseToken | ServerMode::NotFound
+    ) {
         resp = resp.header(ACCEPT_RANGES, "bytes");
     }
 
@@ -164,7 +167,10 @@ async fn handle(
             let r = resp
                 .status(StatusCode::OK)
                 .header(CONTENT_LENGTH, body.len() as u64)
-                .header(CONTENT_DISPOSITION, "attachment; filename=\"real-movie.mkv\"")
+                .header(
+                    CONTENT_DISPOSITION,
+                    "attachment; filename=\"real-movie.mkv\"",
+                )
                 .body(Full::new(body))
                 .unwrap();
             Ok(r)

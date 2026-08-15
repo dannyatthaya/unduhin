@@ -153,7 +153,18 @@ async fn decide_close(core: &Core) -> CloseDecision {
         .ok()
         .flatten()
         .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .unwrap_or_else(|| "ask".into());
+        // Only the default differs by platform, not the machinery. On
+        // macOS the red button hides the window and the app keeps running
+        // in the Dock; quitting is Cmd-Q. Prompting there would fight the
+        // platform convention. `RunEvent::Reopen` in `lib.rs` is what
+        // brings the window back from the Dock.
+        .unwrap_or_else(|| {
+            if cfg!(target_os = "macos") {
+                "minimize".into()
+            } else {
+                "ask".into()
+            }
+        });
 
     if behavior == "minimize" {
         return CloseDecision::Minimize;

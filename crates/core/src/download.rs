@@ -814,20 +814,62 @@ pub(crate) async fn repair_unwritable_output_paths(pool: &SqlitePool) -> Result<
     Ok(())
 }
 
-/// True when `path` could never have been a sane download target: relative
-/// (resolved against whatever directory the process happened to start in)
-/// or rooted under the Windows directory (`%SystemRoot%` — the CWD of an
-/// app autostarted by Windows).
+/// True when `path` could never have been a sane download target.
+///
+/// Two cases. A relative path resolves against whatever directory the
+/// process happened to start in, which for an autostarted app is not the
+/// user's. And a path inside the operating system's own directories is
+/// never somewhere a download belongs, quite apart from being unwritable.
+///
+/// The system directory differs by platform but the reasoning does not:
+/// `%SystemRoot%` is the CWD of an app autostarted by Windows, and `/` is
+/// the CWD of a macOS LaunchAgent.
 fn is_broken_output_path(path: &Path) -> bool {
     if path.is_relative() {
         return true;
     }
-    let windir = std::env::var("SystemRoot")
-        .or_else(|_| std::env::var("WINDIR"))
-        .unwrap_or_else(|_| r"C:\Windows".to_string());
-    let w = windir.trim_end_matches(['\\', '/']).to_ascii_lowercase();
-    let p = path.to_string_lossy().to_ascii_lowercase();
-    p == w || p.starts_with(&format!("{w}\\")) || p.starts_with(&format!("{w}/"))
+
+    #[cfg(target_os = "windows")]
+    {
+        let windir = std::env::var("SystemRoot")
+            .or_else(|_| std::env::var("WINDIR"))
+            .unwrap_or_else(|_| r"C:\Windows".to_string());
+        let w = windir.trim_end_matches(['\\', '/']).to_ascii_lowercase();
+        let p = path.to_string_lossy().to_ascii_lowercase();
+        p == w || p.starts_with(&format!("{w}\\")) || p.starts_with(&format!("{w}/"))
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        // Compare whole components, not string prefixes, so `/System` does
+        // not also reject a legitimate `/SystemDownloads`. `/usr/local` is
+        // carved out because Homebrew owns it and it is user-writable.
+        const SYSTEM_ROOTS: &[&[&str]] = &[
+            &["/", "System"],
+            &["/", "usr"],
+            &["/", "bin"],
+            &["/", "sbin"],
+            &["/", "Library"],
+            &["/", "private", "var", "root"],
+        ];
+        const ALLOWED: &[&[&str]] = &[&["/", "usr", "local"]];
+
+        let parts: Vec<String> = path
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+
+        // The filesystem root itself is never a download target.
+        if parts.len() <= 1 {
+            return true;
+        }
+        let starts_with =
+            |prefix: &[&str]| prefix.len() <= parts.len() && parts[..prefix.len()] == *prefix;
+        if ALLOWED.iter().any(|p| starts_with(p)) {
+            return false;
+        }
+        SYSTEM_ROOTS.iter().any(|p| starts_with(p))
+    }
 }
 
 /// Base folder torrents download into: `torrent_download_dir` setting, else
@@ -902,7 +944,7 @@ pub(crate) async fn reconcile_torrent_filename(
     Ok(Some((new_name, new_category, category_changed)))
 }
 
-/// Make an arbitrary string safe to use as a single Windows filename.
+/// Make an arbitrary string safe to use as a single filename.
 /// Strips path separators (`/` `\`), the drive colon, and other reserved
 /// characters, drops control characters, trims trailing dots/whitespace,
 /// and caps the length. This is the one sanitizer applied to *every*
@@ -910,6 +952,11 @@ pub(crate) async fn reconcile_torrent_filename(
 /// so it must never emit a separator, a `..`, or an empty string. yt-dlp's
 /// own `--restrict-filenames` does similar work but we want consistency
 /// with the rest of our filename derivation.
+///
+/// The reserved set is the Windows one on every platform. `:` and `\` are
+/// legal on APFS, but keeping one rule means a queue database stays
+/// portable between machines, and the cost is only an occasional
+/// underscore.
 pub(crate) fn sanitize_filename(s: &str) -> String {
     let mut out: String = s
         .chars()
@@ -926,7 +973,17 @@ pub(crate) fn sanitize_filename(s: &str) -> String {
         trimmed
     };
     if out.len() > 200 {
-        out.truncate(200);
+        // `len` and `truncate` are both byte-based, and `truncate` panics
+        // unless the index falls on a char boundary. A CJK or accented
+        // title longer than 200 bytes lands mid-sequence and takes the
+        // process down, so step back to the nearest boundary. At most four
+        // iterations, and the cap is high enough that the result is never
+        // empty.
+        let cut = (0..=200)
+            .rev()
+            .find(|&i| out.is_char_boundary(i))
+            .unwrap_or(0);
+        out.truncate(cut);
     }
     out
 }
@@ -2526,6 +2583,29 @@ mod tests {
                 Some(std::ffi::OsStr::new(&out))
             );
         }
+    }
+
+    #[test]
+    fn sanitize_filename_truncates_on_a_char_boundary() {
+        // A multi-byte title longer than the 200-byte cap used to panic:
+        // `String::truncate` rejects an index that splits a UTF-8
+        // sequence, and 200 lands mid-character for 3-byte glyphs.
+        let long_cjk = "字".repeat(100); // 300 bytes
+        let out = sanitize_filename(&long_cjk);
+        assert!(out.len() <= 200, "byte length {} exceeds cap", out.len());
+        assert!(!out.is_empty());
+        // Round-tripping proves no sequence was cut in half.
+        assert_eq!(out, String::from_utf8(out.clone().into_bytes()).unwrap());
+
+        // The same for a 2-byte-per-char Latin-1 supplement string, which
+        // makes 200 an odd offset into the character stream.
+        let long_accented = "é".repeat(150); // 300 bytes
+        let out = sanitize_filename(&long_accented);
+        assert!(out.len() <= 200);
+        assert!(out.chars().all(|c| c == 'é'));
+
+        // ASCII still truncates exactly at the cap.
+        assert_eq!(sanitize_filename(&"a".repeat(300)).len(), 200);
     }
 
     #[test]

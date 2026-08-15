@@ -570,6 +570,15 @@ pub async fn download(
     {
         cmd.creation_flags(0x0800_0000);
     }
+    #[cfg(unix)]
+    {
+        // Make the child the leader of a new process group, so its pid is
+        // also its pgid and `ProcessTreeGuard` can reap the PyInstaller
+        // re-exec and ffmpeg with one `killpg`. This is load-bearing for
+        // safety, not just for completeness: without it the child stays in
+        // *our* group, and the guard would signal the app itself.
+        cmd.process_group(0);
+    }
 
     tracing::debug!(
         url = %job.url,
@@ -791,11 +800,19 @@ pub fn scratch_root() -> PathBuf {
 
 /// Whether two paths live on the same volume.
 ///
-/// Windows-shaped: compares the path prefix (`C:`, `\\server\share`),
-/// which is what decides rename-vs-copy for `shutil.move`. Non-Windows
-/// has no cheap sync equivalent (`st_dev` needs both paths to exist), and
-/// the yt-dlp path is Windows-only in practice, so other targets take the
-/// optimistic answer and use the temp dir.
+/// This decides whether the scratch dir can sit in the system temp dir or
+/// has to live beside the output file. The error costs are deliberately
+/// asymmetric, so both arms below fail to `false`: a wrong `false` costs a
+/// hidden `.unduhin-tmp` directory next to the download, while a wrong
+/// `true` costs a multi-gigabyte cross-device copy at the end of every
+/// download.
+///
+/// Windows compares the path prefix (`C:`, `\\server\share`), which is what
+/// decides rename-vs-copy for `shutil.move`. Unix compares `st_dev`,
+/// walking up to the nearest existing ancestor because neither path is
+/// guaranteed to exist yet. On macOS the optimistic answer would be wrong
+/// often: `/Volumes/*` external disks are routine, and modern APFS puts
+/// `$HOME` on a different device from the read-only system volume.
 fn same_volume(a: &Path, b: &Path) -> bool {
     #[cfg(target_os = "windows")]
     {
@@ -812,10 +829,27 @@ fn same_volume(a: &Path, b: &Path) -> bool {
             _ => false,
         }
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // Neither path need exist yet, so climb to the nearest ancestor
+        // that does. That ancestor is on the same filesystem as the leaf
+        // would be, short of a mount appearing in between.
+        let device_of = |p: &Path| -> Option<u64> {
+            let mut cur = p;
+            loop {
+                if let Ok(meta) = std::fs::metadata(cur) {
+                    return Some(meta.dev());
+                }
+                cur = cur.parent()?;
+            }
+        };
+        matches!((device_of(a), device_of(b)), (Some(x), Some(y)) if x == y)
+    }
+    #[cfg(not(any(target_os = "windows", unix)))]
     {
         let _ = (a, b);
-        true
+        false
     }
 }
 

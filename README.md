@@ -1,11 +1,12 @@
 # Unduhin
 
-A focused, segmented download manager for Windows. Fast on healthy
-servers, polite on small ones.
+A focused, segmented download manager for Windows and macOS. Fast on
+healthy servers, polite on small ones.
 
 > _unduhin_ (verb, Bahasa Indonesia, colloquial): to download.
 
 [![Windows](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-blue)](https://github.com/dannyatthaya/unduhin/releases)
+[![macOS](https://img.shields.io/badge/platform-macOS%2011%2B-lightgrey)](https://github.com/dannyatthaya/unduhin/releases)
 [![Status](https://img.shields.io/badge/status-early%20preview-orange)](https://github.com/dannyatthaya/unduhin/releases)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green)](#license)
 
@@ -17,7 +18,11 @@ organised in a fast UI. Paste a direct link and it streams down in
 parallel segments; paste a YouTube/Twitter/etc. URL and it hands off to
 yt-dlp; paste a magnet or `.torrent` and it grabs that too.
 
-Free, open source, single-developer, and Windows-only by design.
+Free, open source, and single-developer.
+
+Windows is the primary platform and gets the most testing. macOS support
+is new and is built entirely in CI, because the maintainer does not own a
+Mac. Treat the macOS build as a preview and please report what breaks.
 
 ## Features
 
@@ -49,10 +54,34 @@ Unduhin is in early preview — there's no signed installer on
 the first build lands it'll be a per-user installer (no admin) that
 auto-updates in place. For now, [build from source](#build-from-source).
 
+### macOS: getting past Gatekeeper
+
+The macOS build is **not signed or notarized**. Signing needs a paid Apple
+Developer account, which this project does not have. macOS therefore
+refuses to open the app after a browser download, and the message it shows
+("Unduhin is damaged and can't be opened") is misleading — the app is
+fine, it just carries a quarantine flag.
+
+To install:
+
+1. Open the `.dmg` and drag Unduhin to Applications.
+2. Remove the quarantine flag:
+
+   ```sh
+   xattr -dr com.apple.quarantine /Applications/Unduhin.app
+   ```
+
+3. Open the app normally.
+
+Right-click then Open does not work for an unsigned app on recent macOS.
+Verify the `.dmg` against the SHA-256 published in the release notes if
+you want an integrity check in place of a signature.
+
 ## Build from source
 
-You'll need [Rust](https://rustup.rs/) (stable, MSVC toolchain),
-[Bun](https://bun.sh/), and the Tauri v2 CLI.
+You'll need [Rust](https://rustup.rs/) (stable), [Bun](https://bun.sh/),
+and the Tauri v2 CLI. Windows needs the MSVC toolchain. macOS needs the
+Xcode command line tools, which supply `cc`, `cmake`, and `lipo`.
 
 ```powershell
 cargo install tauri-cli --version "^2.0" --locked
@@ -62,37 +91,59 @@ bun run --cwd extension build   # required: extension/dist ships as a bundled re
 cargo tauri dev
 ```
 
-Install the browser extension (once):
+On macOS, build a universal `.dmg` with:
 
-```powershell
-# chrome://extensions → enable Developer mode → Load unpacked →
-#   installed builds: %LOCALAPPDATA%\unduhin\extension
-#   working in this repo: extension/dist
+```sh
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+cargo tauri build --target universal-apple-darwin --bundles app,dmg
 ```
 
-The app maintains `%LOCALAPPDATA%\unduhin\extension` itself: every
-launch syncs the bundled extension into it, and a running extension
-reloads itself when the version changes — load it once and updates are
-automatic from then on. (If you loaded the extension from an older
-release's zip, re-load it from that folder to start getting updates.)
+Both targets are required. The build compiles each architecture and joins
+them with `lipo`, and the native messaging host is built the same way.
+
+Install the browser extension (once). Go to `chrome://extensions`, enable
+Developer mode, then Load unpacked and pick the extension folder:
+
+- installed builds, Windows: `%LOCALAPPDATA%\unduhin\extension`
+- installed builds, macOS: `~/Library/Application Support/unduhin/extension`
+- working in this repo: `extension/dist`
+
+The app maintains that folder itself: every launch syncs the bundled
+extension into it, and a running extension reloads itself when the
+version changes — load it once and updates are automatic from then on.
+(If you loaded the extension from an older release's zip, re-load it from
+that folder to start getting updates.)
+
+On macOS, use Settings → Browser → Open folder and drag the revealed
+folder onto `chrome://extensions`. The Load-unpacked dialog hides
+`~/Library`, so browsing to it by hand does not work.
 
 [`CONTRIBUTING.md`](./CONTRIBUTING.md) covers the architecture, repo
 tour, and the release/packaging scripts.
 
 ## Where things live
 
-- **Downloads** go to your configured folder (per-category and
-  per-download overrides apply).
-- **Queue, history, and settings** live in
-  `%LOCALAPPDATA%\unduhin\unduhin.db`.
-- **Logs** rotate in `%LOCALAPPDATA%\unduhin\logs\`; yt-dlp and ffmpeg
-  install into `%LOCALAPPDATA%\unduhin\binaries\`.
-- **The browser extension** you Load-unpacked lives in
-  `%LOCALAPPDATA%\unduhin\extension\` — managed by the app, refreshed on
-  every launch.
+Everything sits under one app-data root:
 
-Uninstalling leaves `%LOCALAPPDATA%\unduhin\` in place so a reinstall
-resumes where you left off — delete it by hand to start clean.
+- Windows: `%LOCALAPPDATA%\unduhin\`
+- macOS: `~/Library/Application Support/unduhin/`
+
+Inside it:
+
+- **Downloads** go to your configured folder (per-category and
+  per-download overrides apply), not here.
+- **Queue, history, and settings** live in `unduhin.db`.
+- **Logs** rotate in `logs/`; yt-dlp and ffmpeg install into `binaries/`.
+- **The browser extension** you Load-unpacked lives in `extension/` —
+  managed by the app, refreshed on every launch.
+
+Removing the app leaves that folder in place so a reinstall resumes where
+you left off — delete it by hand to start clean.
+
+On macOS the folder is inside `~/Library`, which Finder hides by default.
+Use Settings → Browser → Open folder to reveal it rather than browsing
+there manually. Chrome's Load-unpacked dialog also hides it, so drag the
+revealed folder onto `chrome://extensions` instead.
 
 ## License
 

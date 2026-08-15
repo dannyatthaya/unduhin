@@ -203,10 +203,7 @@ impl TorrentInput {
             }
             TorrentInput::TorrentFile(path) => {
                 let bytes = std::fs::read(path).map_err(|e| {
-                    TorrentError::Backend(format!(
-                        "reading .torrent file {}: {e}",
-                        path.display()
-                    ))
+                    TorrentError::Backend(format!("reading .torrent file {}: {e}", path.display()))
                 })?;
                 Ok(AddTorrent::from_bytes(bytes))
             }
@@ -885,9 +882,7 @@ impl TorrentEngine {
         handle: &Arc<librqbit::ManagedTorrent>,
         info_hash: &str,
     ) -> TorrentMetadata {
-        let name = handle
-            .name()
-            .unwrap_or_else(|| info_hash.to_string());
+        let name = handle.name().unwrap_or_else(|| info_hash.to_string());
         let files = handle
             .with_metadata(|m| {
                 m.info

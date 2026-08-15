@@ -18,6 +18,16 @@
       7. Generate latest-<channel>.json next to the bundle.
       8. (with -Publish) git commit + tag + push, then gh release create.
 
+    This script is Windows-only and stays that way. Publishing the release
+    fires `.github/workflows/release-macos.yml`, which builds the universal
+    macOS bundle on a CI runner and attaches the .dmg, the updater archive,
+    and a checksum file to the same release a few minutes later. That
+    workflow also merges the `darwin-*` keys into `latest-<channel>.json`,
+    so the manifest this script uploads is deliberately Windows-only.
+
+    If the macOS job fails, the release simply ships Windows-only — a safe
+    state. Re-run it from the Actions tab with the tag as input.
+
     Prerequisites for -Publish: `gh auth status` must show you logged in,
     and the working tree must be clean before running (the script will
     add the files it bumped, but won't try to reason about other diffs).

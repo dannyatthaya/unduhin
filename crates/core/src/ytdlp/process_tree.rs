@@ -28,18 +28,34 @@
 //! worker, and the 5-second bounded shutdown in the Tauri shell that ends
 //! in `std::process::exit(0)`.
 //!
-//! On non-Windows targets this is a no-op shim; the yt-dlp path is
-//! Windows-only in practice and POSIX would want process groups instead.
+//! On Unix the same two problems exist for the same two reasons, and the
+//! POSIX counterpart is the process group. The child is spawned with
+//! `process_group(0)`, which makes it the leader of a new group whose PGID
+//! equals its PID; descendants inherit that group unless they call `setsid`
+//! themselves, and neither yt-dlp nor ffmpeg does. One `killpg` then reaps
+//! the tree.
+//!
+//! One difference matters. A job object reaps when its last handle closes,
+//! which happens for free at process death; a process group does not, so
+//! `Drop` has to signal explicitly. That still leaves a gap the Windows
+//! build does not have: `std::process::exit(0)` in the Tauri shell's
+//! bounded shutdown skips destructors, so on Unix the group must be
+//! terminated before that point rather than relied on to unwind.
 
-/// RAII handle to the job object owning a spawned yt-dlp process tree.
+/// RAII handle to the process tree spawned for one yt-dlp run.
 ///
-/// Held alongside the `Child` for the lifetime of the download. Dropping
-/// it closes the job handle, which — thanks to
-/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` — terminates every process still
-/// in the job.
+/// Held alongside the `Child` for the lifetime of the download. Dropping it
+/// terminates every process still in the tree: on Windows by closing the
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` job handle, on Unix by signalling
+/// the process group.
 pub(crate) struct ProcessTreeGuard {
     #[cfg(target_os = "windows")]
     job: Option<windows::Win32::Foundation::HANDLE>,
+    /// Process group id, always equal to the direct child's pid because the
+    /// child was spawned with `process_group(0)`. `None` means "no tree to
+    /// reap" and every operation becomes a no-op.
+    #[cfg(unix)]
+    pgid: Option<i32>,
 }
 
 #[cfg(target_os = "windows")]
@@ -156,15 +172,65 @@ mod imp {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(unix)]
 mod imp {
     use super::ProcessTreeGuard;
 
     impl ProcessTreeGuard {
-        pub(crate) fn adopt(_child: &tokio::process::Child) -> Self {
-            Self {}
+        /// Record the child's process group.
+        ///
+        /// The caller must have spawned `child` with `process_group(0)`, so
+        /// its pid *is* the pgid. We do not re-derive the group with
+        /// `getpgid`: if that call raced the child's exit it could return
+        /// our own group, and signalling that would kill the app.
+        pub(crate) fn adopt(child: &tokio::process::Child) -> Self {
+            // A pid of 0 or a missing id means the child is already gone.
+            // Storing either would be catastrophic: `killpg(0, ...)`
+            // signals *the caller's own* process group, taking down the
+            // whole app. Refuse both.
+            let pgid = match child.id() {
+                Some(id) if id > 0 && i32::try_from(id).is_ok() => Some(id as i32),
+                _ => {
+                    tracing::debug!("ytdlp: no live child pid; tree kill unavailable");
+                    None
+                }
+            };
+            if pgid.is_some() {
+                tracing::debug!("ytdlp: process tree adopted into process group");
+            }
+            Self { pgid }
         }
 
-        pub(crate) fn terminate(&self) {}
+        /// Kill every process in the group, immediately.
+        ///
+        /// Idempotent and safe on an inert guard. SIGKILL rather than
+        /// SIGTERM to match the Windows `TerminateJobObject` semantics: a
+        /// paused or cancelled download must stop writing to the output
+        /// file before the caller drains the pipes, and ffmpeg installs its
+        /// own SIGTERM handler that flushes rather than stopping.
+        pub(crate) fn terminate(&self) {
+            let Some(pgid) = self.pgid else { return };
+            debug_assert!(pgid > 0, "killpg on a non-positive pgid targets our group");
+            // SAFETY: `pgid` is a positive process-group id captured from a
+            // child we spawned as a group leader. `killpg` has no memory
+            // safety requirements; the invariant that matters is that the
+            // value is never 0, which `adopt` guarantees.
+            if unsafe { libc::killpg(pgid, libc::SIGKILL) } != 0 {
+                let err = std::io::Error::last_os_error();
+                // ESRCH just means the group already exited.
+                if err.raw_os_error() != Some(libc::ESRCH) {
+                    tracing::warn!(%err, pgid, "ytdlp: killpg failed");
+                }
+            }
+        }
+    }
+
+    impl Drop for ProcessTreeGuard {
+        fn drop(&mut self) {
+            // A process group has no kill-on-close behavior to inherit, so
+            // the signal has to be explicit here.
+            self.terminate();
+            self.pgid = None;
+        }
     }
 }

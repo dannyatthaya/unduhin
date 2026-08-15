@@ -1152,6 +1152,19 @@ pub fn directories_root() -> Option<PathBuf> {
             return Some(Path::new(&local).join("unduhin"));
         }
     }
+    // macOS keeps per-user app data in `~/Library/Application Support`, not
+    // in the XDG-style `~/.local/share` the Unix arm below assumes.
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            return Some(
+                Path::new(&home)
+                    .join("Library")
+                    .join("Application Support")
+                    .join("unduhin"),
+            );
+        }
+    }
     if let Ok(home) = std::env::var("HOME") {
         return Some(
             Path::new(&home)

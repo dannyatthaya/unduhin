@@ -26,6 +26,12 @@ thiserror = { workspace = true }
 # this MSVC host, so we pin `aws-lc-sys` here only to switch on `prebuilt-nasm`,
 # which links AWS-LC's checked-in pre-assembled objects and needs no NASM.
 # This is a build-only feature toggle; we do not use aws-lc-sys directly.
+#
+# Windows-only on purpose. `prebuilt-nasm` links checked-in **x86-64**
+# pre-assembled objects, so it cannot serve an aarch64 slice. On macOS
+# aws-lc-sys builds from source with cmake and clang, both of which ship with
+# the Xcode command line tools, so no pin is needed there.
+[target.'cfg(windows)'.dependencies]
 aws-lc-sys = { version = "0.41", features = ["prebuilt-nasm"] }
 
 [dev-dependencies]

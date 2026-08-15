@@ -117,26 +117,69 @@ struct ToolRelease {
     /// Descriptive only — the real version is read back from the binary
     /// after install. Shown as `latest_known` in the UI.
     version: &'static str,
-    /// GitHub REST endpoint for the latest release of the asset's repo.
-    api_url: &'static str,
-    /// Exact asset filename to download and verify.
-    asset_name: &'static str,
-    /// Companion checksums asset to fall back on if the API omits a
-    /// per-asset `digest` (yt-dlp publishes `SHA2-256SUMS`).
-    checksums_asset: Option<&'static str>,
+    /// Where the bytes come from and how their SHA-256 is established.
+    source: ToolSource,
     /// Set when the downloaded asset is a zip archive containing the
     /// binary at the path inside it that ends with `binary_name()`.
     is_archive: bool,
 }
 
+/// How a tool's download URL and expected digest are obtained.
+///
+/// Both variants end at the same place — a [`ResolvedAsset`] carrying a URL
+/// and a SHA-256 — so [`install_inner`]'s integrity gate is identical for
+/// every tool on every platform. There is deliberately no "trust TLS"
+/// variant: a source we cannot verify is a source we do not install from.
+enum ToolSource {
+    /// Resolve through GitHub's REST API. The digest comes from the
+    /// per-asset `digest` field, falling back to a companion checksums
+    /// asset. Tracks the latest release, which is what yt-dlp needs.
+    GitHubLatest {
+        /// GitHub REST endpoint for the latest release of the asset's repo.
+        api_url: &'static str,
+        /// Exact asset filename to download and verify.
+        asset_name: &'static str,
+        /// Companion checksums asset to fall back on if the API omits a
+        /// per-asset `digest` (yt-dlp publishes `SHA2-256SUMS`).
+        checksums_asset: Option<&'static str>,
+    },
+    /// A fixed URL whose SHA-256 is pinned in this file.
+    ///
+    /// For hosts that publish no checksums at all. Pinning rather than
+    /// tracking "latest" is what preserves the integrity guarantee: an
+    /// unverifiable moving target would mean trusting TLS alone, which is
+    /// exactly what the digest gate exists to avoid.
+    /// Only macOS ffmpeg uses this today, so the variant is dead code on
+    /// other targets. Kept unconditional so both arms of `resolve_asset`
+    /// compile and stay type-checked everywhere.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    PinnedUrl {
+        url: &'static str,
+        sha256_hex: &'static str,
+    },
+}
+
 /// yt-dlp release. Resolved via the GitHub API so the install button always
 /// pulls the most recent stable release (a pinned version goes stale within
 /// weeks) while still verifying the SHA-256 the API reports for the asset.
+/// Platform asset name inside the yt-dlp release. `yt-dlp_macos` is a
+/// universal2 PyInstaller bundle, so one asset serves both Mac slices. The
+/// installed filename is [`Tool::binary_name`], not this — `install_inner`
+/// renames on the way in.
+#[cfg(target_os = "windows")]
+const YTDLP_ASSET: &str = "yt-dlp.exe";
+#[cfg(target_os = "macos")]
+const YTDLP_ASSET: &str = "yt-dlp_macos";
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+const YTDLP_ASSET: &str = "yt-dlp";
+
 const YTDLP_RELEASE: ToolRelease = ToolRelease {
     version: "latest",
-    api_url: "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest",
-    asset_name: "yt-dlp.exe",
-    checksums_asset: Some("SHA2-256SUMS"),
+    source: ToolSource::GitHubLatest {
+        api_url: "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest",
+        asset_name: YTDLP_ASSET,
+        checksums_asset: Some("SHA2-256SUMS"),
+    },
     is_archive: false,
 };
 
@@ -147,11 +190,70 @@ const YTDLP_RELEASE: ToolRelease = ToolRelease {
 /// `ffmpeg-master-latest-win64-gpl/bin/ffmpeg.exe`; our zip extractor
 /// finds it by filename so the top-folder prefix doesn't matter.
 /// This is also the source yt-dlp itself recommends.
+#[cfg(target_os = "windows")]
 const FFMPEG_RELEASE: ToolRelease = ToolRelease {
     version: "latest win64-gpl (BtbN)",
-    api_url: "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest",
-    asset_name: "ffmpeg-master-latest-win64-gpl.zip",
-    checksums_asset: None,
+    source: ToolSource::GitHubLatest {
+        api_url: "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest",
+        asset_name: "ffmpeg-master-latest-win64-gpl.zip",
+        checksums_asset: None,
+    },
+    is_archive: true,
+};
+
+/// macOS ffmpeg comes from Martin Riedl's build server, because BtbN
+/// publishes no macOS builds.
+///
+/// That host publishes no checksum files of any kind (`.sha256`, `.md5`,
+/// `checksums.txt`, and `SHA256SUMS` all 404), so tracking its
+/// `/redirect/latest/` endpoint would mean installing an executable we
+/// cannot verify. Instead we pin one dated build per architecture and carry
+/// its SHA-256 here, which keeps the same fail-closed guarantee Windows has.
+///
+/// The staleness cost is low. yt-dlp tracks latest because YouTube's
+/// anti-bot changes rot it within weeks; ffmpeg's demux/mux behavior is
+/// stable across years, so this pin needs bumping about once or twice a
+/// year. To bump: resolve
+/// `https://ffmpeg.martin-riedl.de/redirect/latest/macos/<arch>/release/ffmpeg.zip`,
+/// note the dated URL it lands on, and record that file's SHA-256.
+///
+/// Each archive holds exactly one root-level entry named `ffmpeg`, which is
+/// what `extract_binary_from_zip` looks for. The builds are thin Mach-O per
+/// architecture, so a universal app resolves the right one at compile time:
+/// each slice is its own compilation, so `cfg(target_arch)` is the running
+/// architecture.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const FFMPEG_RELEASE: ToolRelease = ToolRelease {
+    version: "9.0 arm64 (martin-riedl)",
+    source: ToolSource::PinnedUrl {
+        url: "https://ffmpeg.martin-riedl.de/download/macos/arm64/1785863997_9.0/ffmpeg.zip",
+        sha256_hex: "5267ef149ee0d208057a1b316aac079b661b0476574dee5da7d225769773c603",
+    },
+    is_archive: true,
+};
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+const FFMPEG_RELEASE: ToolRelease = ToolRelease {
+    version: "9.0 x86_64 (martin-riedl)",
+    source: ToolSource::PinnedUrl {
+        url: "https://ffmpeg.martin-riedl.de/download/macos/amd64/1785871427_9.0/ffmpeg.zip",
+        sha256_hex: "79d14663d8b078dbbc38de18d63a30f8a5bfc860af5dfee7f8cf3e387cf1c02c",
+    },
+    is_archive: true,
+};
+
+/// Unduhin ships on Windows and macOS only. This arm exists so the crate
+/// still compiles on a contributor's Linux box; the tarball BtbN publishes
+/// for Linux is `.tar.xz`, which the zip extractor cannot open, so a Linux
+/// install will fail loudly rather than silently doing the wrong thing.
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+const FFMPEG_RELEASE: ToolRelease = ToolRelease {
+    version: "unsupported platform",
+    source: ToolSource::GitHubLatest {
+        api_url: "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest",
+        asset_name: "ffmpeg-master-latest-linux64-gpl.tar.xz",
+        checksums_asset: None,
+    },
     is_archive: true,
 };
 
@@ -248,8 +350,8 @@ async fn install_inner(
         .build()
         .map_err(|e| ToolingError::Download(e.to_string()))?;
 
-    // Resolve the asset through the GitHub API: this gives an immutable,
-    // version-pinned download URL *and* the SHA-256 the bytes must match.
+    // Resolve the asset: an immutable, version-pinned download URL *and*
+    // the SHA-256 the bytes must match, whatever the source.
     let resolved = resolve_asset(&client, release).await?;
 
     let resp = client
@@ -293,8 +395,8 @@ async fn install_inner(
     out.flush().await?;
     drop(out);
 
-    // Integrity gate: the downloaded bytes must match the digest GitHub
-    // reports for this asset before we extract/rename or ever execute it.
+    // Integrity gate: the downloaded bytes must match the expected digest
+    // before we extract/rename or ever execute them.
     let actual = to_hex(&hasher.finalize());
     if !actual.eq_ignore_ascii_case(&resolved.sha256_hex) {
         let _ = tokio::fs::remove_file(&tmp).await;
@@ -316,6 +418,20 @@ async fn install_inner(
             tokio::fs::remove_file(&target).await.ok();
         }
         tokio::fs::rename(&tmp, &target).await?;
+    }
+
+    // Make it executable. Neither install path does this for us: the
+    // archive path writes extracted bytes with `fs::write` (0644) and the
+    // direct path inherits 0644 from `File::create`. Zips built on Windows
+    // carry no unix mode at all, so set the bit unconditionally rather than
+    // trusting `ZipFile::unix_mode`. Without this every macOS install fails
+    // the `probe_version` gate below with a permission error.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = tokio::fs::metadata(&target).await?.permissions();
+        perms.set_mode(0o755);
+        tokio::fs::set_permissions(&target, perms).await?;
     }
 
     // Verify by running --version (or -version for ffmpeg).
@@ -348,17 +464,34 @@ struct GhAsset {
     digest: Option<String>,
 }
 
-/// Resolve a release asset through the GitHub REST API, returning its
-/// immutable download URL and expected SHA-256. Prefers the per-asset
-/// `digest` field; falls back to a companion `SHA2-256SUMS` asset when the
-/// release predates digests. Fails closed (`NoChecksum`) if neither is
-/// available — we never install a binary we cannot verify.
+/// Resolve a release asset to a download URL and the SHA-256 its bytes must
+/// match.
+///
+/// For a [`ToolSource::PinnedUrl`] both are already known. For a
+/// [`ToolSource::GitHubLatest`] this queries the REST API, preferring the
+/// per-asset `digest` field and falling back to a companion `SHA2-256SUMS`
+/// asset when the release predates digests. Fails closed (`NoChecksum`) if
+/// neither is available — we never install a binary we cannot verify.
 async fn resolve_asset(
     client: &reqwest::Client,
     release: &ToolRelease,
 ) -> Result<ResolvedAsset, ToolingError> {
+    let (api_url, asset_name, checksums_asset) = match release.source {
+        ToolSource::PinnedUrl { url, sha256_hex } => {
+            return Ok(ResolvedAsset {
+                download_url: url.to_string(),
+                sha256_hex: sha256_hex.to_string(),
+            })
+        }
+        ToolSource::GitHubLatest {
+            api_url,
+            asset_name,
+            checksums_asset,
+        } => (api_url, asset_name, checksums_asset),
+    };
+
     let body = client
-        .get(release.api_url)
+        .get(api_url)
         .header("Accept", "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2022-11-28")
         .send()
@@ -376,12 +509,9 @@ async fn resolve_asset(
     let asset = rel
         .assets
         .iter()
-        .find(|a| a.name == release.asset_name)
+        .find(|a| a.name == asset_name)
         .ok_or_else(|| {
-            ToolingError::Download(format!(
-                "asset {} not found in latest release",
-                release.asset_name
-            ))
+            ToolingError::Download(format!("asset {asset_name} not found in latest release"))
         })?;
 
     // Primary: the digest GitHub reports for this asset.
@@ -393,7 +523,7 @@ async fn resolve_asset(
     }
 
     // Fallback: a SHA2-256SUMS companion asset (yt-dlp).
-    if let Some(sums_name) = release.checksums_asset {
+    if let Some(sums_name) = checksums_asset {
         if let Some(sums_asset) = rel.assets.iter().find(|a| a.name == sums_name) {
             let body = client
                 .get(&sums_asset.browser_download_url)
@@ -405,7 +535,7 @@ async fn resolve_asset(
                 .text()
                 .await
                 .map_err(|e| ToolingError::Download(e.to_string()))?;
-            if let Some(hex) = parse_sha256sums(&body, release.asset_name) {
+            if let Some(hex) = parse_sha256sums(&body, asset_name) {
                 return Ok(ResolvedAsset {
                     download_url: asset.browser_download_url.clone(),
                     sha256_hex: hex,
@@ -415,8 +545,7 @@ async fn resolve_asset(
     }
 
     Err(ToolingError::NoChecksum(format!(
-        "no SHA-256 published for {}",
-        release.asset_name
+        "no SHA-256 published for {asset_name}"
     )))
 }
 

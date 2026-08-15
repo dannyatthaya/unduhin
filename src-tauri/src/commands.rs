@@ -184,8 +184,59 @@ pub struct DiskInfo {
     pub total_bytes: u64,
 }
 
-/// Free / total bytes for the drive that hosts the configured
-/// `default_output_path` (or `%USERPROFILE%` as a fallback).
+/// Split a path into components normalized for comparison.
+///
+/// Windows path comparison is case-insensitive, so `C:\` must match a
+/// target of `c:\users\x`. Unix is case-sensitive, and APFS can be
+/// formatted either way, so the exact form is the safe choice there.
+fn normalized_components(path: &std::path::Path) -> Vec<String> {
+    path.components()
+        .map(|c| {
+            let s = c.as_os_str().to_string_lossy().into_owned();
+            if cfg!(windows) {
+                s.to_ascii_lowercase()
+            } else {
+                s
+            }
+        })
+        .collect()
+}
+
+/// Index of the mount point that hosts `target`: the one whose path is the
+/// longest component-wise prefix of it.
+///
+/// Longest wins because mount points nest. On macOS an external disk at
+/// `/Volumes/Media` and the root `/` are both prefixes of
+/// `/Volumes/Media/movies`, and only the deeper one reports the free space
+/// that actually constrains the download. Modern APFS makes this the
+/// common case rather than an edge case: `$HOME` lives on a different
+/// volume from the read-only system root.
+///
+/// Comparison is component-wise, never string-wise, so `/Volumes/Media`
+/// does not match a target under `/Volumes/MediaBackup`.
+///
+/// Pure and free of `sysinfo` so it can be tested without real hardware —
+/// which matters because nobody on this project can run the app on a Mac.
+fn index_of_hosting_mount(
+    target: &std::path::Path,
+    mounts: &[std::path::PathBuf],
+) -> Option<usize> {
+    let target_parts = normalized_components(target);
+    mounts
+        .iter()
+        .enumerate()
+        .filter_map(|(i, mount)| {
+            let mount_parts = normalized_components(mount);
+            let fits = mount_parts.len() <= target_parts.len()
+                && target_parts[..mount_parts.len()] == mount_parts[..];
+            fits.then_some((i, mount_parts.len()))
+        })
+        .max_by_key(|&(_, depth)| depth)
+        .map(|(i, _)| i)
+}
+
+/// Free / total bytes for the volume that hosts the configured
+/// `default_output_path`, falling back to the user's home directory.
 #[tauri::command]
 pub async fn get_disk_info(core: State<'_, Core>) -> CommandResult<DiskInfo> {
     let configured = core
@@ -196,41 +247,35 @@ pub async fn get_disk_info(core: State<'_, Core>) -> CommandResult<DiskInfo> {
         .and_then(|v| v.as_str().map(|s| s.to_string()))
         .filter(|s| !s.is_empty());
 
+    let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    let root = if cfg!(windows) { "C:\\" } else { "/" };
     let target = configured
-        .or_else(|| std::env::var("USERPROFILE").ok())
-        .unwrap_or_else(|| "C:\\".to_string());
-
-    let drive_letter = target
-        .chars()
-        .next()
-        .filter(|c| c.is_ascii_alphabetic())
-        .map(|c| c.to_ascii_uppercase())
-        .unwrap_or('C');
+        .or_else(|| std::env::var(home_var).ok())
+        .unwrap_or_else(|| root.to_string());
+    let target_path = std::path::Path::new(&target);
 
     let disks = sysinfo::Disks::new_with_refreshed_list();
-    let prefix = format!("{}:", drive_letter);
-    for disk in disks.iter() {
-        let mount = disk.mount_point().to_string_lossy();
-        if mount.to_ascii_uppercase().starts_with(&prefix) {
-            return Ok(DiskInfo {
-                drive: format!("{}:\\", drive_letter),
-                free_bytes: disk.available_space(),
-                total_bytes: disk.total_space(),
-            });
-        }
-    }
+    let mounts: Vec<std::path::PathBuf> = disks
+        .iter()
+        .map(|d| d.mount_point().to_path_buf())
+        .collect();
 
-    // Fallback: report the first disk we can see (e.g. on non-Windows)
-    if let Some(disk) = disks.iter().next() {
-        return Ok(DiskInfo {
-            drive: disk.mount_point().to_string_lossy().into_owned(),
-            free_bytes: disk.available_space(),
-            total_bytes: disk.total_space(),
-        });
-    }
+    // No "first disk we can see" fallback. On a machine with several
+    // volumes that reports a confidently wrong number, and a wrong free
+    // -space figure is worse than an absent one.
+    let idx = index_of_hosting_mount(target_path, &mounts).ok_or_else(|| CommandError {
+        message: format!("could not resolve the volume hosting {target}"),
+    })?;
+    let disk = disks.get(idx).ok_or_else(|| CommandError {
+        message: format!("could not resolve the volume hosting {target}"),
+    })?;
 
-    Err(CommandError {
-        message: format!("could not resolve disk for {target}"),
+    Ok(DiskInfo {
+        // On Windows `mount_point()` is already `C:\`, so this reads the
+        // same as the drive-letter form it replaces.
+        drive: disk.mount_point().to_string_lossy().into_owned(),
+        free_bytes: disk.available_space(),
+        total_bytes: disk.total_space(),
     })
 }
 
@@ -831,16 +876,9 @@ pub async fn get_quiet_hours_state(core: State<'_, Core>) -> CommandResult<Quiet
 /// panel can render without waiting for the first push.
 #[tauri::command]
 pub async fn get_extension_settings(_core: State<'_, Core>) -> CommandResult<ExtensionSettings> {
-    #[cfg(windows)]
-    {
-        Ok(crate::pipe::cached_extension_settings()
-            .await
-            .unwrap_or_else(ExtensionSettings::defaults))
-    }
-    #[cfg(not(windows))]
-    {
-        Ok(ExtensionSettings::defaults())
-    }
+    Ok(crate::pipe::cached_extension_settings()
+        .await
+        .unwrap_or_else(ExtensionSettings::defaults))
 }
 
 /// Apply a sparse patch to the cached extension settings and broadcast
@@ -853,24 +891,14 @@ pub async fn apply_extension_settings_patch(
     _core: State<'_, Core>,
     patch: SettingsPatch,
 ) -> CommandResult<ExtensionSettings> {
-    #[cfg(windows)]
-    {
-        let current = crate::pipe::cached_extension_settings()
-            .await
-            .unwrap_or_else(ExtensionSettings::defaults);
-        let mut next = current;
-        next.apply(patch);
-        crate::pipe::store_extension_settings(next.clone()).await;
-        crate::pipe::broadcast_settings_changed(next.clone()).await;
-        Ok(next)
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = patch;
-        Err(CommandError {
-            message: "extension settings round-trip is Windows-only".into(),
-        })
-    }
+    let current = crate::pipe::cached_extension_settings()
+        .await
+        .unwrap_or_else(ExtensionSettings::defaults);
+    let mut next = current;
+    next.apply(patch);
+    crate::pipe::store_extension_settings(next.clone()).await;
+    crate::pipe::broadcast_settings_changed(next.clone()).await;
+    Ok(next)
 }
 
 /// Latest per-rule metrics snapshot the pipe server cached from the
@@ -879,14 +907,7 @@ pub async fn apply_extension_settings_patch(
 /// `CoreEvent::RuleMetricsUpdated`.
 #[tauri::command]
 pub async fn get_rule_metrics(_core: State<'_, Core>) -> CommandResult<Vec<RuleMetric>> {
-    #[cfg(windows)]
-    {
-        Ok(crate::pipe::cached_rule_metrics().await)
-    }
-    #[cfg(not(windows))]
-    {
-        Ok(Vec::new())
-    }
+    Ok(crate::pipe::cached_rule_metrics().await)
 }
 
 /// Absolute path of the app-managed canonical unpacked-extension folder,
@@ -912,18 +933,8 @@ pub async fn respond_handoff(
     id: String,
     decision: HandoffDecision,
 ) -> CommandResult<()> {
-    #[cfg(windows)]
-    {
-        crate::pipe::broadcast_handoff_decision(id, decision).await;
-        Ok(())
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = (id, decision);
-        Err(CommandError {
-            message: "ask-first handoff is Windows-only".into(),
-        })
-    }
+    crate::pipe::broadcast_handoff_decision(id, decision).await;
+    Ok(())
 }
 
 // Browser integration
@@ -987,10 +998,8 @@ pub struct PipeHandoffTest {
 /// page.
 #[tauri::command]
 pub async fn test_pipe_handoff(_core: State<'_, Core>) -> CommandResult<PipeHandoffTest> {
-    #[cfg(windows)]
     {
         use std::time::{Duration, Instant};
-        use tokio::net::windows::named_pipe::ClientOptions;
         use unduhin_core::wire::framing::{read_frame, write_frame};
         use unduhin_core::wire::{Inbound, Outbound};
 
@@ -998,18 +1007,20 @@ pub async fn test_pipe_handoff(_core: State<'_, Core>) -> CommandResult<PipeHand
         let (_, listening) = crate::pipe::listening_snapshot();
         if !listening {
             return Err(CommandError {
-                message: "pipe server is not listening yet".into(),
+                message: "bridge server is not listening yet".into(),
             });
         }
 
-        // The pipe accepts one connection at a time per instance — the
-        // server immediately creates a fresh server handle after
-        // each accept, but on a hot start the client connect can race
-        // that boundary. Retry briefly before giving up.
+        // A named pipe accepts one connection at a time per instance — the
+        // server immediately creates a fresh server handle after each
+        // accept, but on a hot start the client connect can race that
+        // boundary. Retry briefly before giving up. A Unix socket has a
+        // backlog and never hits this race, but one code path is simpler
+        // than two and the retry costs nothing when the first try works.
         let mut client = None;
         let connect_deadline = Instant::now() + Duration::from_millis(500);
         while Instant::now() < connect_deadline {
-            match ClientOptions::new().open(&name) {
+            match unduhin_core::wire::transport::connect(&name).await {
                 Ok(c) => {
                     client = Some(c);
                     break;
@@ -1064,10 +1075,94 @@ pub async fn test_pipe_handoff(_core: State<'_, Core>) -> CommandResult<PipeHand
             pipe: name,
         })
     }
-    #[cfg(not(windows))]
-    {
-        Err(CommandError {
-            message: "pipe handoff is only available on Windows".into(),
-        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::index_of_hosting_mount;
+    use std::path::{Path, PathBuf};
+
+    fn mounts(paths: &[&str]) -> Vec<PathBuf> {
+        paths.iter().map(PathBuf::from).collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn picks_the_deepest_matching_mount() {
+        // The case that matters on macOS: an external volume nested under
+        // the root. The naive "first disk" answer reports the boot volume's
+        // free space for a download headed to the external drive.
+        let m = mounts(&["/", "/Volumes/Media"]);
+        assert_eq!(
+            index_of_hosting_mount(Path::new("/Volumes/Media/movies"), &m),
+            Some(1)
+        );
+        assert_eq!(
+            index_of_hosting_mount(Path::new("/Users/danny/Downloads"), &m),
+            Some(0)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handles_the_apfs_firmlink_layout() {
+        // Modern macOS splits the boot disk into a read-only system volume
+        // and a data volume, so $HOME is genuinely not on `/`.
+        let m = mounts(&["/", "/System/Volumes/Data"]);
+        assert_eq!(
+            index_of_hosting_mount(Path::new("/System/Volumes/Data/Users/danny"), &m),
+            Some(1)
+        );
+        assert_eq!(index_of_hosting_mount(Path::new("/bin"), &m), Some(0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn matches_whole_components_not_string_prefixes() {
+        // `/Volumes/Media` must not claim a path under
+        // `/Volumes/MediaBackup`, which a `starts_with` on strings would.
+        let m = mounts(&["/", "/Volumes/Media", "/Volumes/MediaBackup"]);
+        assert_eq!(
+            index_of_hosting_mount(Path::new("/Volumes/MediaBackup/x"), &m),
+            Some(2)
+        );
+        assert_eq!(
+            index_of_hosting_mount(Path::new("/Volumes/Media/x"), &m),
+            Some(1)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn picks_the_right_drive_letter_ignoring_case() {
+        let m = mounts(&["C:\\", "D:\\"]);
+        assert_eq!(
+            index_of_hosting_mount(Path::new("D:\\Downloads"), &m),
+            Some(1)
+        );
+        assert_eq!(
+            index_of_hosting_mount(Path::new("C:\\Users\\danny"), &m),
+            Some(0)
+        );
+        // Windows paths compare case-insensitively.
+        assert_eq!(
+            index_of_hosting_mount(Path::new("d:\\downloads"), &m),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn reports_nothing_when_no_mount_hosts_the_target() {
+        // A UNC share or an unmounted volume has no local disk to report.
+        // Returning None makes the caller surface an error rather than a
+        // confidently wrong free-space figure.
+        let m = mounts(&[if cfg!(windows) { "C:\\" } else { "/" }]);
+        let orphan = if cfg!(windows) {
+            r"\\server\share\file"
+        } else {
+            "relative/path"
+        };
+        assert_eq!(index_of_hosting_mount(Path::new(orphan), &m), None);
+        assert_eq!(index_of_hosting_mount(Path::new("/x"), &[]), None);
     }
 }

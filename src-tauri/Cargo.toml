@@ -61,6 +61,11 @@ windows = { version = "0.61", features = [
     "Win32_Security_Authorization",
 ] }
 
+[target.'cfg(unix)'.dependencies]
+# `geteuid` / `getpeereid` for the bridge socket: the peer-identity check
+# that replaces the Windows pipe DACL (see `pipe::transport`).
+libc = "0.2"
+
 [features]
 default = []
 # `tauri-plugin-shell` etc. can be slotted in later; kept lean for now.

@@ -148,8 +148,7 @@ pub async fn download_with_control(
     // servers send `Accept-Ranges: bytes` then ignore `Range`). That verify
     // request only ever hits range-capable hosts — which by definition
     // tolerate multiple requests — never one-time-token hosts.
-    let wants_segments =
-        info.accept_ranges && info.content_length.is_some() && opts.segments > 1;
+    let wants_segments = info.accept_ranges && info.content_length.is_some() && opts.segments > 1;
     let truly_segmented = wants_segments && verify_range_support(&client, &opts.url).await?;
 
     if truly_segmented {
@@ -394,8 +393,18 @@ pub async fn resume_at_with_control(
     let content_type = info.content_type.clone();
     let filename_hint = info.filename_hint.clone();
     run_transfer(
-        client, opts, meta, meta_path, cancel, tx, true, control_rx, content_type, filename_hint,
-        None, None,
+        client,
+        opts,
+        meta,
+        meta_path,
+        cancel,
+        tx,
+        true,
+        control_rx,
+        content_type,
+        filename_hint,
+        None,
+        None,
     )
     .await
 }

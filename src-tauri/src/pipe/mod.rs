@@ -1,49 +1,41 @@
-//! In-app named-pipe server. Accepts framed `Inbound` JSON messages
-//! from the native-messaging host (`unduhin-native-host.exe`)
-//! and dispatches them onto the live [`Core`].
+//! In-app bridge server. Accepts framed `Inbound` JSON messages from the
+//! native-messaging host (`unduhin-native-host`) and dispatches them onto
+//! the live [`Core`].
 //!
-//! The pipe runs on the same tokio runtime as the rest of the Tauri
-//! app. Multiple host sessions can be in flight at once — each
-//! accepted connection is handled on its own task. Single-instance
-//! enforcement (already wired in `lib.rs`) guarantees exactly one
-//! pipe server is alive, so the well-known `\\.\pipe\unduhin` name
-//! never collides.
+//! The server runs on the same tokio runtime as the rest of the Tauri app.
+//! Multiple host sessions can be in flight at once — each accepted
+//! connection is handled on its own task. Single-instance enforcement
+//! (wired in `lib.rs`) guarantees exactly one server is alive, so the
+//! well-known endpoint never collides.
 //!
-//! The pipe is Windows-only by design — a Linux / macOS host is not
-//! yet implemented. The
-//! [`install`] function compiles into a no-op on other targets so
-//! the rest of the app continues to build cross-platform.
+//! Everything in this module is platform-neutral. The one thing that is
+//! not — a named pipe on Windows against a Unix domain socket elsewhere —
+//! lives behind [`transport`], which hands back split read/write halves
+//! either way. That is why the dispatch, caching, and broadcast code below
+//! carries no `cfg` at all.
 
-#[cfg(windows)]
+mod transport;
+
 use std::path::PathBuf;
-#[cfg(windows)]
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(windows)]
 use std::sync::{Arc, OnceLock};
 
 use tauri::AppHandle;
-#[cfg(windows)]
 use tokio::io::WriteHalf;
-#[cfg(windows)]
-use tokio::net::windows::named_pipe::NamedPipeServer;
-#[cfg(windows)]
 use tokio::sync::Mutex as AsyncMutex;
-#[cfg(windows)]
 use unduhin_core::wire::ExtensionSettings;
-#[cfg(windows)]
 use unduhin_core::wire::HandoffDecision;
-#[cfg(windows)]
 use unduhin_core::wire::RuleMetric;
 use unduhin_core::Core;
 
-#[cfg(windows)]
 use tauri::Emitter;
+
+use transport::ServerStream;
 
 /// `true` once the in-app named-pipe server has bound the well-known
 /// path and is accepting client connections. Set exactly once per
 /// process; the Settings → Browser status card reads this through
 /// [`crate::browser_integration::pipe_status`].
-#[cfg(windows)]
 static PIPE_LISTENING: AtomicBool = AtomicBool::new(false);
 
 /// Live write halves of every connected pipe client, used by the
@@ -53,12 +45,9 @@ static PIPE_LISTENING: AtomicBool = AtomicBool::new(false);
 ///
 /// Per-process singleton: the accept loop pushes on each new
 /// connection; the per-connection task removes its slot on hang-up.
-#[cfg(windows)]
-type ClientWriter = AsyncMutex<WriteHalf<NamedPipeServer>>;
-#[cfg(windows)]
+type ClientWriter = AsyncMutex<WriteHalf<ServerStream>>;
 static CONNECTED_CLIENTS: OnceLock<AsyncMutex<Vec<Arc<ClientWriter>>>> = OnceLock::new();
 
-#[cfg(windows)]
 fn connected_clients() -> &'static AsyncMutex<Vec<Arc<ClientWriter>>> {
     CONNECTED_CLIENTS.get_or_init(|| AsyncMutex::new(Vec::new()))
 }
@@ -69,10 +58,8 @@ fn connected_clients() -> &'static AsyncMutex<Vec<Arc<ClientWriter>>> {
 /// this; if nothing has been pushed yet the default shape is returned
 /// — it matches the extension's own `DEFAULT_SETTINGS` byte-for-byte
 /// so the panel doesn't lie about the user's choices.
-#[cfg(windows)]
 static SETTINGS_CACHE: OnceLock<AsyncMutex<Option<ExtensionSettings>>> = OnceLock::new();
 
-#[cfg(windows)]
 fn settings_cache() -> &'static AsyncMutex<Option<ExtensionSettings>> {
     SETTINGS_CACHE.get_or_init(|| AsyncMutex::new(None))
 }
@@ -81,10 +68,8 @@ fn settings_cache() -> &'static AsyncMutex<Option<ExtensionSettings>> {
 /// tick (`Inbound::RuleMetrics`). The Tauri panel reads via
 /// `get_rule_metrics`; the cache is replaced (not merged) on every
 /// push so the extension's local store is the source of truth.
-#[cfg(windows)]
 static RULE_METRICS_CACHE: OnceLock<AsyncMutex<Vec<RuleMetric>>> = OnceLock::new();
 
-#[cfg(windows)]
 fn rule_metrics_cache() -> &'static AsyncMutex<Vec<RuleMetric>> {
     RULE_METRICS_CACHE.get_or_init(|| AsyncMutex::new(Vec::new()))
 }
@@ -94,38 +79,25 @@ fn rule_metrics_cache() -> &'static AsyncMutex<Vec<RuleMetric>> {
 /// no-op runs too, because the connection greeting needs it either way.
 /// `None` until the sync has run (or when no bundle ships with this
 /// build, e.g. a dev shell that never built the extension).
-#[cfg(windows)]
 static CANONICAL_EXT_VERSION: OnceLock<AsyncMutex<Option<String>>> = OnceLock::new();
 
-#[cfg(windows)]
 fn canonical_ext_version() -> &'static AsyncMutex<Option<String>> {
     CANONICAL_EXT_VERSION.get_or_init(|| AsyncMutex::new(None))
 }
 
 /// Record the canonical extension version for connection greetings.
-#[cfg(windows)]
 pub async fn set_canonical_extension_version(version: String) {
     *canonical_ext_version().lock().await = Some(version);
 }
 
-#[cfg(not(windows))]
-pub async fn set_canonical_extension_version(_version: String) {}
-
 /// Read-only accessor for the cached rule-metrics snapshot. Returns
 /// an empty vec until the first push arrives.
-#[cfg(windows)]
 pub async fn cached_rule_metrics() -> Vec<RuleMetric> {
     rule_metrics_cache().lock().await.clone()
 }
 
-#[cfg(not(windows))]
-pub async fn cached_rule_metrics() -> Vec<unduhin_core::wire::RuleMetric> {
-    Vec::new()
-}
-
 /// Read the cached settings if any. Used by future Tauri commands
 /// (9e's `apply_extension_settings_patch`) and tests.
-#[cfg(windows)]
 pub async fn cached_extension_settings() -> Option<ExtensionSettings> {
     settings_cache().lock().await.clone()
 }
@@ -134,7 +106,6 @@ pub async fn cached_extension_settings() -> Option<ExtensionSettings> {
 /// `apply_extension_settings_patch` Tauri command so a subsequent
 /// `GetSettings` returns the panel's new shape without waiting for the
 /// extension's `chrome.storage.onChanged` echo.
-#[cfg(windows)]
 pub async fn store_extension_settings(full: ExtensionSettings) {
     *settings_cache().lock().await = Some(full);
 }
@@ -146,7 +117,6 @@ pub async fn store_extension_settings(full: ExtensionSettings) {
 /// have since paused. And its presence marks "already tried", which is what
 /// bounds the silent tier to one attempt: without that, a row whose cookies
 /// are genuinely dead would loop fail → refresh → fail forever.
-#[cfg(windows)]
 fn pending_credential_refresh() -> &'static AsyncMutex<std::collections::HashMap<i64, String>> {
     static PENDING: OnceLock<AsyncMutex<std::collections::HashMap<i64, String>>> = OnceLock::new();
     PENDING.get_or_init(|| AsyncMutex::new(std::collections::HashMap::new()))
@@ -162,7 +132,6 @@ fn pending_credential_refresh() -> &'static AsyncMutex<std::collections::HashMap
 ///
 /// The token only has to be unique among in-flight requests, so a monotonic
 /// counter is enough — it is a correlation tag, not a secret.
-#[cfg(windows)]
 pub async fn begin_credential_refresh(id: i64) -> Option<String> {
     // Nobody to ask. Claiming the slot here would burn the row's one
     // automatic attempt on a request that was never sent.
@@ -184,7 +153,6 @@ pub async fn begin_credential_refresh(id: i64) -> Option<String> {
 
 /// Consume the pending entry for `id` when `token` matches. `false` means the
 /// reply is stale and must be ignored.
-#[cfg(windows)]
 async fn take_pending_credential_refresh(id: i64, token: &str) -> bool {
     let mut guard = pending_credential_refresh().lock().await;
     match guard.get(&id) {
@@ -199,18 +167,9 @@ async fn take_pending_credential_refresh(id: i64, token: &str) -> bool {
 /// Drop any pending entry for `id`, re-allowing a future automatic attempt.
 /// Called when a download completes or is removed — the next failure is a new
 /// situation, not a repeat of the one already tried.
-#[cfg(windows)]
 pub async fn forget_credential_refresh(id: i64) {
     pending_credential_refresh().lock().await.remove(&id);
 }
-
-#[cfg(not(windows))]
-pub async fn begin_credential_refresh(_id: i64) -> Option<String> {
-    None
-}
-
-#[cfg(not(windows))]
-pub async fn forget_credential_refresh(_id: i64) {}
 
 /// Fan one unsolicited frame out to every connected pipe client.
 ///
@@ -223,7 +182,6 @@ pub async fn forget_credential_refresh(_id: i64) {}
 /// dropped, because broken connections are pruned by their own task.
 ///
 /// `label` names the frame in the log lines only.
-#[cfg(windows)]
 async fn broadcast(frame: unduhin_core::wire::Outbound, label: &str) {
     use unduhin_core::wire::framing::write_frame;
 
@@ -245,7 +203,6 @@ async fn broadcast(frame: unduhin_core::wire::Outbound, label: &str) {
 
 /// Broadcast a `SettingsChanged { full }` frame. Public so Tauri commands can
 /// push panel-driven edits back out to the extension.
-#[cfg(windows)]
 pub async fn broadcast_settings_changed(full: ExtensionSettings) {
     broadcast(
         unduhin_core::wire::Outbound::SettingsChanged { full },
@@ -254,12 +211,8 @@ pub async fn broadcast_settings_changed(full: ExtensionSettings) {
     .await;
 }
 
-#[cfg(not(windows))]
-pub async fn broadcast_settings_changed(_full: unduhin_core::wire::ExtensionSettings) {}
-
 /// Broadcast a `HandoffDecision { id, decision }` frame. The extension routes
 /// the unsolicited frame back to the matching `ask-first` waiter by `id`.
-#[cfg(windows)]
 pub async fn broadcast_handoff_decision(id: String, decision: HandoffDecision) {
     broadcast(
         unduhin_core::wire::Outbound::HandoffDecision { id, decision },
@@ -268,17 +221,9 @@ pub async fn broadcast_handoff_decision(id: String, decision: HandoffDecision) {
     .await;
 }
 
-#[cfg(not(windows))]
-pub async fn broadcast_handoff_decision(
-    _id: String,
-    _decision: unduhin_core::wire::HandoffDecision,
-) {
-}
-
 /// Broadcast an `ExtensionUpdated { version }` frame. Sent by the startup sync
 /// after the canonical extension folder was replaced; the extension reloads
 /// itself when its running version is older.
-#[cfg(windows)]
 pub async fn broadcast_extension_updated(version: String) {
     broadcast(
         unduhin_core::wire::Outbound::ExtensionUpdated { version },
@@ -287,15 +232,11 @@ pub async fn broadcast_extension_updated(version: String) {
     .await;
 }
 
-#[cfg(not(windows))]
-pub async fn broadcast_extension_updated(_version: String) {}
-
 /// Arm the extension to fold the next matching capture into `download_id`
 /// rather than creating a new row. Sent when the user clicks "Refresh link".
 ///
 /// See [`unduhin_core::wire::Outbound::ArmRefresh`] for why the match is on
 /// file name and size rather than tab or page URL.
-#[cfg(windows)]
 pub async fn broadcast_arm_refresh(
     download_id: i64,
     filename: Option<String>,
@@ -316,19 +257,8 @@ pub async fn broadcast_arm_refresh(
     .await;
 }
 
-#[cfg(not(windows))]
-pub async fn broadcast_arm_refresh(
-    _download_id: i64,
-    _filename: Option<String>,
-    _size_bytes: Option<u64>,
-    _origin: Option<String>,
-    _expires_at_ms: i64,
-) {
-}
-
 /// Ask the extension for a fresh cookie header for `url`. The reply arrives
 /// later as an `Inbound::CredentialsRefreshed` carrying the same `token`.
-#[cfg(windows)]
 pub async fn broadcast_refresh_credentials(token: String, download_id: i64, url: String) {
     broadcast(
         unduhin_core::wire::Outbound::RefreshCredentials {
@@ -341,19 +271,10 @@ pub async fn broadcast_refresh_credentials(token: String, download_id: i64, url:
     .await;
 }
 
-#[cfg(not(windows))]
-pub async fn broadcast_refresh_credentials(_token: String, _download_id: i64, _url: String) {}
-
-#[cfg(not(windows))]
-pub async fn cached_extension_settings() -> Option<unduhin_core::wire::ExtensionSettings> {
-    None
-}
-
 /// Test-only: wipe the settings cache so integration tests don't
 /// leak state across `#[tokio::test]`s running in the same binary.
 /// The cache is otherwise a per-process singleton (production only
 /// runs one server per process).
-#[cfg(windows)]
 #[doc(hidden)]
 pub async fn reset_settings_cache_for_tests() {
     *settings_cache().lock().await = None;
@@ -363,14 +284,12 @@ pub async fn reset_settings_cache_for_tests() {
 /// [`crate::browser_integration::pipe_status`] so the UI can surface
 /// the real path (handy when `UNDUHIN_PIPE_NAME` is set for a dev
 /// override).
-#[cfg(windows)]
 static BOUND_PIPE_NAME: OnceLock<String> = OnceLock::new();
 
 /// Snapshot of the pipe listener state read by the Settings → Browser
 /// card. Returns `(name, listening)` — the name may still be set even
 /// when `listening` is false on platforms that build with the no-op
 /// stub.
-#[cfg(windows)]
 pub fn listening_snapshot() -> (Option<String>, bool) {
     (
         BOUND_PIPE_NAME.get().cloned(),
@@ -378,29 +297,23 @@ pub fn listening_snapshot() -> (Option<String>, bool) {
     )
 }
 
-/// Cross-platform stub so the non-Windows build keeps linking. The
-/// browser integration commands only exist on Windows but compile on
-/// other targets too.
-#[cfg(not(windows))]
-pub fn listening_snapshot() -> (Option<String>, bool) {
-    (None, false)
-}
-
-/// Resolved pipe path. `UNDUHIN_PIPE_NAME` is honoured so the
-/// integration test can use a per-process random name and avoid
-/// colliding with a real running app.
-#[cfg(windows)]
+/// Resolved bridge endpoint — a pipe name on Windows, a socket path
+/// elsewhere. `UNDUHIN_PIPE_NAME` is honoured so the integration tests can
+/// use a per-process random name and avoid colliding with a real running
+/// app.
+///
+/// Kept as a re-export rather than a second copy: the native host resolves
+/// the same endpoint from the same function, and two definitions that
+/// drifted would break the bridge with no visible error.
 pub fn pipe_name() -> String {
-    std::env::var("UNDUHIN_PIPE_NAME").unwrap_or_else(|_| r"\\.\pipe\unduhin".to_string())
+    unduhin_core::wire::transport::endpoint()
 }
 
 /// AppHandle stash so the `AskHandoff` dispatch can emit a frontend
 /// event without threading the handle through every helper. Set once
 /// in `install`; ignored in tests that drive `run_server` directly.
-#[cfg(windows)]
 static APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
 
-#[cfg(windows)]
 pub(crate) fn app_handle() -> Option<&'static AppHandle> {
     APP_HANDLE.get()
 }
@@ -410,8 +323,11 @@ pub(crate) fn app_handle() -> Option<&'static AppHandle> {
 /// inherits a default descriptor that lets *any* same-user process open
 /// it and inject download jobs — historically combinable with the
 /// filename path-traversal bug into an arbitrary-file-write primitive.
+///
+/// The Unix side achieves the same thing with directory and socket
+/// permissions instead; see [`transport`].
 #[cfg(windows)]
-mod pipe_security {
+pub(super) mod pipe_security {
     use std::io;
 
     use windows::core::{PCWSTR, PWSTR};
@@ -527,7 +443,6 @@ mod pipe_security {
 /// returned because a failing pipe must not prevent the rest of the
 /// app from coming up — the user can still drive downloads from the
 /// UI even if the extension bridge is dead.
-#[cfg(windows)]
 pub fn install(app: AppHandle, core: Core) {
     let _ = APP_HANDLE.set(app);
     let name = pipe_name();
@@ -538,41 +453,28 @@ pub fn install(app: AppHandle, core: Core) {
     });
 }
 
-/// No-op stub so cross-platform builds (CI / Linux dev) still link.
-#[cfg(not(windows))]
-pub fn install(_app: AppHandle, _core: Core) {}
+/// Unbind the bridge endpoint.
+///
+/// Called explicitly from the exit path because `lib.rs` finishes with
+/// `std::process::exit(0)`, which runs no destructors. On Windows this is
+/// a no-op — a named pipe has no filesystem entry outliving the process.
+/// On Unix it unlinks the socket so the next launch does not have to
+/// decide whether a leftover is stale.
+pub fn shutdown() {
+    #[cfg(unix)]
+    if let Some(path) = BOUND_PIPE_NAME.get() {
+        let _ = std::fs::remove_file(path);
+    }
+}
 
 /// The actual accept loop. Exposed `pub` so the integration test in
-/// `src-tauri/tests/pipe_smoke.rs` can drive it with a per-test pipe
-/// name without needing a Tauri `AppHandle`. Production callers go
-/// through [`install`].
-#[cfg(windows)]
+/// `src-tauri/tests/pipe_smoke.rs` can drive it with a per-test endpoint
+/// without needing a Tauri `AppHandle`. Production callers go through
+/// [`install`].
 pub async fn run_server(name: String, core: Core) -> std::io::Result<()> {
-    use std::time::Duration;
-    use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+    let mut listener = transport::Listener::bind(&name).await?;
 
-    // Build a restrictive security descriptor once; every pipe instance is
-    // created with it so no other process — even one running as the same
-    // user — can connect and inject download jobs. Fail closed: if we
-    // cannot build the DACL we do not fall back to a permissive pipe.
-    let security = pipe_security::PipeSecurity::current_user_only()?;
-
-    // Create one pipe instance. The first instance owns the well-known
-    // name; subsequent instances are created without `first_pipe_instance`
-    // so they can co-exist. Each carries the restrictive DACL.
-    let make = |first: bool| -> std::io::Result<NamedPipeServer> {
-        let mut opts = ServerOptions::new();
-        if first {
-            opts.first_pipe_instance(true);
-        }
-        // SAFETY: `security` lives for the whole of `run_server`, so the
-        // attributes pointer is valid for every create call below.
-        unsafe { opts.create_with_security_attributes_raw(&name, security.as_attrs_ptr()) }
-    };
-
-    let mut server = make(true)?;
-
-    tracing::info!(pipe = %name, "pipe server listening");
+    tracing::info!(endpoint = %name, "bridge server listening");
 
     // Latch the listener-ready signal *before* the first accept so the
     // status card can flip to "connected" as soon as the listener is
@@ -585,52 +487,18 @@ pub async fn run_server(name: String, core: Core) -> std::io::Result<()> {
         core.publish_event(unduhin_core::CoreEvent::PipeListening { name: name.clone() });
     }
 
-    // Recreate a pipe instance, retrying transient failures with capped
-    // exponential backoff. A single listener error must not permanently
-    // disable the bridge (the previous code propagated the error out of
-    // the loop and never respawned), so this never gives up.
-    async fn recreate(make: &impl Fn(bool) -> std::io::Result<NamedPipeServer>) -> NamedPipeServer {
-        let mut backoff = Duration::from_millis(100);
-        loop {
-            match make(false) {
-                Ok(server) => return server,
-                Err(e) => {
-                    tracing::warn!(error = %e, backoff_ms = backoff.as_millis(),
-                        "failed to (re)create pipe instance; retrying");
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(5));
-                }
-            }
-        }
-    }
-
     loop {
-        // Block until a client connects on the current server handle. On a
-        // connect error the handle is unusable, so log and rebuild it
-        // rather than tearing down the whole server.
-        if let Err(e) = server.connect().await {
-            tracing::warn!(error = %e, "pipe connect failed; recreating listener");
-            server = recreate(&make).await;
-            continue;
-        }
-
-        // Move the connected handle into the per-connection task and
-        // immediately create a fresh server handle for the next client —
-        // canonical tokio NamedPipeServer accept-loop shape.
-        let connected = server;
-        server = recreate(&make).await;
-
+        let stream = listener.accept().await?;
         let core = core.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(connected, core).await {
-                tracing::debug!(error = %e, "pipe connection closed with error");
+            if let Err(e) = handle_connection(stream, core).await {
+                tracing::debug!(error = %e, "bridge connection closed with error");
             }
         });
     }
 }
 
-#[cfg(windows)]
-async fn handle_connection(stream: NamedPipeServer, core: Core) -> std::io::Result<()> {
+async fn handle_connection(stream: ServerStream, core: Core) -> std::io::Result<()> {
     use unduhin_core::wire::framing::{read_frame, write_frame};
     use unduhin_core::wire::{Inbound, Outbound};
 
@@ -720,7 +588,6 @@ async fn handle_connection(stream: NamedPipeServer, core: Core) -> std::io::Resu
     result
 }
 
-#[cfg(windows)]
 async fn dispatch(core: &Core, msg: unduhin_core::wire::Inbound) -> unduhin_core::wire::Outbound {
     use unduhin_core::wire::{Inbound, Outbound};
 
@@ -841,7 +708,6 @@ async fn dispatch(core: &Core, msg: unduhin_core::wire::Inbound) -> unduhin_core
     }
 }
 
-#[cfg(windows)]
 async fn handle_download(
     core: &Core,
     job: unduhin_core::wire::DownloadJob,
@@ -879,7 +745,6 @@ async fn handle_download(
 /// Deliberately does NOT fall back to creating a new row when the refresh is
 /// rejected. A user who asked to refresh a specific download would otherwise
 /// silently get a duplicate alongside the broken one.
-#[cfg(windows)]
 async fn handle_refresh_download(
     core: &Core,
     download_id: unduhin_core::DownloadId,
@@ -923,7 +788,6 @@ async fn handle_refresh_download(
 ///
 /// Keeps the row's existing URL — this path exists precisely for the case
 /// where the URL is fine and only the session died.
-#[cfg(windows)]
 async fn handle_credentials_refreshed(
     core: &Core,
     token: String,
@@ -983,7 +847,6 @@ async fn handle_credentials_refreshed(
     Ok(())
 }
 
-#[cfg(windows)]
 async fn handle_download_media(
     core: &Core,
     stream: unduhin_core::wire::MediaStream,
@@ -1040,7 +903,6 @@ async fn handle_download_media(
 /// what rules out a string yt-dlp's own arg parser could otherwise
 /// mistake for a flag, on top of ruling out non-network schemes like
 /// `file://` or `javascript:`.
-#[cfg(windows)]
 async fn handle_probe_media(
     core: &Core,
     url: String,
@@ -1059,7 +921,6 @@ async fn handle_probe_media(
 /// Shared validation for [`handle_probe_media`]'s two untrusted-input
 /// fields (`url` and `referrer`) — both get the same treatment since both
 /// end up as yt-dlp CLI arguments.
-#[cfg(windows)]
 fn validate_http_url(raw: &str) -> Result<url::Url, String> {
     let parsed = url::Url::parse(raw).map_err(|e| e.to_string())?;
     if parsed.scheme() != "http" && parsed.scheme() != "https" {
@@ -1080,7 +941,6 @@ fn validate_http_url(raw: &str) -> Result<url::Url, String> {
 /// `Core::add_download`, which de-dups by info-hash and assigns the row id.
 ///
 /// [`wire::TorrentJob`]: unduhin_core::wire::TorrentJob
-#[cfg(windows)]
 async fn handle_download_torrent(
     core: &Core,
     job: unduhin_core::wire::TorrentJob,
@@ -1093,7 +953,6 @@ async fn handle_download_torrent(
     core.add_download(input).await.map_err(|e| format!("{e}"))
 }
 
-#[cfg(windows)]
 async fn handle_status(core: &Core) -> Result<Vec<unduhin_core::wire::StatusEntry>, String> {
     let mut rows = core
         .list_downloads(unduhin_core::DownloadFilter::default())
@@ -1120,7 +979,6 @@ async fn handle_status(core: &Core) -> Result<Vec<unduhin_core::wire::StatusEntr
 // identically; `handle_download` calls it directly via the fully-qualified
 // path. `headers_from_media` stays here — it operates on a `MediaStream`.
 
-#[cfg(windows)]
 fn headers_from_media(stream: &unduhin_core::wire::MediaStream) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     if let Some(c) = stream.cookie_header.as_ref().filter(|s| !s.is_empty()) {
@@ -1385,7 +1243,6 @@ mod tests {
 /// Re-export the pipe path so tests under `src-tauri/tests/` can
 /// build a matching client. Kept module-public; the rest of the
 /// app doesn't need it.
-#[cfg(windows)]
 #[allow(dead_code)]
 pub(crate) fn default_pipe_path() -> PathBuf {
     PathBuf::from(pipe_name())

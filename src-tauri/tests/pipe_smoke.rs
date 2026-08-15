@@ -7,7 +7,7 @@
 //! payload all carry Cookie / Referer / User-Agent + observed
 //! `webRequest` headers verbatim.
 
-#![cfg(windows)]
+mod common;
 
 use std::time::Duration;
 
@@ -25,18 +25,11 @@ async fn open_core() -> Core {
 }
 
 fn unique_pipe_name() -> String {
-    let pid = std::process::id();
-    let counter = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!(r"\\.\pipe\unduhin-pipe-smoke-{pid}-{counter}")
+    common::unique_endpoint("pipe-smoke")
 }
 
 #[tokio::test]
 async fn download_message_lands_with_captured_headers() {
-    use tokio::net::windows::named_pipe::ClientOptions;
-
     let core = open_core().await;
     let mut events = core.subscribe();
 
@@ -55,19 +48,7 @@ async fn download_message_lands_with_captured_headers() {
 
     // Wait for the server to be listening — retry the connect a few
     // times to avoid a race on the create / accept boundary.
-    let mut client = None;
-    for _ in 0..40 {
-        match ClientOptions::new().open(&name) {
-            Ok(c) => {
-                client = Some(c);
-                break;
-            }
-            Err(_) => {
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-        }
-    }
-    let mut client = client.expect("client connected");
+    let mut client = common::connect_client(&name).await;
 
     let job = DownloadJob {
         final_url: "https://example.invalid/test-file.bin".into(),
@@ -150,8 +131,6 @@ async fn download_message_lands_with_captured_headers() {
 
 #[tokio::test]
 async fn ping_pong_over_pipe() {
-    use tokio::net::windows::named_pipe::ClientOptions;
-
     let core = open_core().await;
     let name = unique_pipe_name();
     let server_task = {
@@ -162,15 +141,7 @@ async fn ping_pong_over_pipe() {
         })
     };
 
-    let mut client = None;
-    for _ in 0..40 {
-        if let Ok(c) = ClientOptions::new().open(&name) {
-            client = Some(c);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    let mut client = client.expect("client connected");
+    let mut client = common::connect_client(&name).await;
 
     let ping = serde_json::to_vec(&Inbound::Ping).unwrap();
     write_frame(&mut client, &ping).await.unwrap();

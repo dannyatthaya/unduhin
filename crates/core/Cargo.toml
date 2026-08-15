@@ -55,6 +55,22 @@ windows = { version = "0.61", features = [
     "Win32_System_Threading",
 ] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# Keychain access for the master key that wraps captured browser headers
+# at rest — the macOS counterpart to Windows DPAPI (see `crate::secret`).
+security-framework = "3"
+# AES-256-GCM for the wrapping itself. Already compiled as part of the
+# rustls stack, so this is a direct dependency on something the build
+# produces anyway rather than new supply-chain surface.
+ring = "0.17"
+
+[target.'cfg(unix)'.dependencies]
+# `killpg` for reaping the yt-dlp → ffmpeg process group, the POSIX
+# counterpart to the Windows job object (see `ytdlp::ProcessTreeGuard`).
+# Already in the dependency graph transitively, so this adds no new
+# supply-chain surface.
+libc = "0.2"
+
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = { workspace = true }

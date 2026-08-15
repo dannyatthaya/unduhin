@@ -13,7 +13,7 @@
 //! - Follow-up `Inbound::GetSettings` from a fresh connection returns
 //!   the cached snapshot (proves the cache survives across requests).
 
-#![cfg(windows)]
+mod common;
 
 use std::time::Duration;
 
@@ -32,23 +32,11 @@ async fn open_core() -> Core {
 }
 
 fn unique_pipe_name() -> String {
-    let pid = std::process::id();
-    let counter = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!(r"\\.\pipe\unduhin-settings-rt-{pid}-{counter}")
+    common::unique_endpoint("settings-rt")
 }
 
-async fn connect_client(name: &str) -> tokio::net::windows::named_pipe::NamedPipeClient {
-    use tokio::net::windows::named_pipe::ClientOptions;
-    for _ in 0..40 {
-        if let Ok(c) = ClientOptions::new().open(name) {
-            return c;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    panic!("client failed to connect to {name}");
+async fn connect_client(name: &str) -> unduhin_core::wire::transport::ClientStream {
+    common::connect_client(name).await
 }
 
 #[tokio::test]

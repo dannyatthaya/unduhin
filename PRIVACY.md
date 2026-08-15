@@ -2,8 +2,12 @@
 
 _Last updated: 2026-05-28._
 
-Unduhin is a Windows desktop application. It does as little networking
-as possible, and what it does is listed here.
+Unduhin is a desktop application for Windows and macOS. It does as little
+networking as possible, and what it does is listed here.
+
+Paths below are written in their Windows form. The macOS equivalent of
+`%LOCALAPPDATA%\unduhin\` is `~/Library/Application Support/unduhin/`,
+and every file named under it keeps the same name.
 
 ## What Unduhin always does
 
@@ -16,8 +20,8 @@ as possible, and what it does is listed here.
 - Writes rotating log files to `%LOCALAPPDATA%\unduhin\logs\`. URLs and
   filenames appear in those logs the same way they appear in the UI.
   You can delete the directory at any time.
-- Reads system information (Windows version, architecture, free disk
-  space) for display in the UI. None of it is transmitted.
+- Reads system information (operating system version, architecture, free
+  disk space) for display in the UI. None of it is transmitted.
 
 ## What Unduhin does only when you ask
 
@@ -41,8 +45,9 @@ as possible, and what it does is listed here.
 These two switches in Settings → About are **off by default**. You must
 turn them on for the corresponding network traffic to happen.
 
-- **Send anonymous crash reports.** Sends a stack trace + Windows
-  version when the app crashes. It does **not** send URLs, filenames,
+- **Send anonymous crash reports.** Sends a stack trace and the
+  operating system version when the app crashes. It does **not** send
+  URLs, filenames,
   proxy credentials, or anything from the downloads table.
 - **Send anonymous usage statistics.** Sends feature counts and timing
   (e.g. "the user clicked Add URL 12 times this session") to help
@@ -82,8 +87,11 @@ through the main Unduhin app.
 - Sends the captured job (URL, filename, size, cookies, referer,
   user-agent, observed request headers, tab id, page URL) to the local
   Unduhin app over the `com.unduhin.host` Native Messaging host. The
-  payload travels over stdio and a local Windows named pipe — it never
-  leaves the machine.
+  payload travels over stdio and then a local IPC channel — a named pipe
+  on Windows, a Unix domain socket in the app data folder on macOS. It
+  never leaves the machine. The socket is created private to your user
+  account, and the app checks the connecting process's user id before
+  accepting a connection.
 - Stores a 5-entry ring buffer of recent jobs in
   `chrome.storage.session` so the popup can show "Recent downloads".
   This is in-memory only and clears when the browser is closed.
@@ -102,6 +110,36 @@ under the `headers` column of the corresponding `downloads` row so
 resume / segment requests can replay the same auth context. Delete the
 row to forget the headers.
 
+### How captured headers are protected at rest
+
+Cookies and `Authorization` headers are encrypted before they reach the
+database, so a backup, a synced profile, or another process reading the
+SQLite file does not get them in the clear.
+
+- **Windows** uses DPAPI, scoped to your Windows account on that machine.
+- **macOS** keeps one AES-256-GCM key in your login Keychain and wraps
+  the values with it.
+
+Both degrade rather than fail: if encryption is unavailable the value is
+stored as plain text and the download still works. The macOS build is
+unsigned, and macOS ties a Keychain item to the creating binary's code
+signature, so the system may ask for Keychain access again after an
+update. Granting it restores encryption; declining falls back to plain
+text.
+
+### One difference on macOS: ffmpeg integrity
+
+Downloaded tool binaries are verified against a SHA-256 before they are
+installed or run, which stops a tampered mirror or an intercepting proxy
+from substituting an executable. yt-dlp publishes checksums on both
+platforms, so that check is identical everywhere.
+
+The macOS ffmpeg build server publishes no checksums. Rather than trust
+the transport alone, Unduhin pins one specific dated build per
+architecture and carries its SHA-256 in the source, so the same
+fail-closed check applies. The cost is that macOS ffmpeg updates arrive
+when the pin is bumped rather than automatically.
+
 ## What Unduhin never does
 
 - It does not phone home for licence checks.
@@ -114,15 +152,19 @@ row to forget the headers.
 
 ## Where the data lives
 
-- Database: `%LOCALAPPDATA%\unduhin\unduhin.db`
-- Logs: `%LOCALAPPDATA%\unduhin\logs\unduhin.log.YYYY-MM-DD`
-- Managed tool binaries: `%LOCALAPPDATA%\unduhin\binaries\`
-- Downloaded files: wherever you point them.
+The app data root is `%LOCALAPPDATA%\unduhin\` on Windows and
+`~/Library/Application Support/unduhin/` on macOS. Inside it:
 
-Uninstalling Unduhin removes the application from `%LOCALAPPDATA%\Programs\`
-but **does not delete `%LOCALAPPDATA%\unduhin\`** so your queue history
-and settings survive reinstalls. Delete the folder manually if you want
-to start clean.
+- Database: `unduhin.db`
+- Logs: `logs/unduhin.log.YYYY-MM-DD`
+- Managed tool binaries: `binaries/`
+- Downloaded files: wherever you point them, never here.
+
+Removing the app does **not** delete that folder, so your queue history
+and settings survive a reinstall. On Windows the uninstaller removes the
+program from `%LOCALAPPDATA%\Programs\`; on macOS you drag
+`Unduhin.app` to the Trash. Either way, delete the data folder manually
+if you want to start clean.
 
 ## Questions
 

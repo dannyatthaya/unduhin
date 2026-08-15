@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 pub mod framing;
+pub mod transport;
 
 /// Single captured HTTP request header. Stored as a tuple-of-strings rather
 /// than a [`reqwest::header::HeaderMap`] because the extension can only

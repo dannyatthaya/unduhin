@@ -39,16 +39,26 @@ pub fn canonical_dir() -> anyhow::Result<PathBuf> {
 
 /// Locate the extension payload staged by the installer (or by
 /// `cargo tauri dev`, which copies `bundle.resources` next to the dev exe).
-/// Mirrors the candidate probing in [`crate::manifest`].
+///
+/// The macOS candidate is not optional. Inside `Unduhin.app` the
+/// executable lives in `Contents/MacOS`, so `current_exe().parent()` is
+/// that directory while the resources sit one level up in
+/// `Contents/Resources`. Without the extra candidate the probe silently
+/// finds nothing, the canonical folder is never populated, and the user
+/// Load-unpacks an empty directory.
 fn bundled_dir() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let install_dir = exe.parent()?;
-    [
+    let mut candidates = vec![
         install_dir.join("extension"),
         install_dir.join("resources").join("extension"),
-    ]
-    .into_iter()
-    .find(|p| p.join("manifest.json").is_file())
+    ];
+    if let Some(contents) = install_dir.parent() {
+        candidates.push(contents.join("Resources").join("extension"));
+    }
+    candidates
+        .into_iter()
+        .find(|p| p.join("manifest.json").is_file())
 }
 
 /// Read the `version` field of a Chrome extension `manifest.json` under
@@ -158,7 +168,11 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> anyhow::Result<()> {
     copy_dir_recursive_inner(src, dst, false)
 }
 
-fn copy_dir_recursive_inner(src: &Path, dst: &Path, skip_root_manifest: bool) -> anyhow::Result<()> {
+fn copy_dir_recursive_inner(
+    src: &Path,
+    dst: &Path,
+    skip_root_manifest: bool,
+) -> anyhow::Result<()> {
     fs::create_dir_all(dst).with_context(|| format!("create dir {}", dst.display()))?;
     for entry in fs::read_dir(src).with_context(|| format!("read dir {}", src.display()))? {
         let entry = entry?;

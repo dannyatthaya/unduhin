@@ -100,13 +100,27 @@ HKCU\Software\Microsoft\Edge\NativeMessagingHosts\com.unduhin.host
 HKCU\Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\com.unduhin.host
 ```
 
-### macOS (documented for future port)
+### macOS (shipped)
 
 ```
 ~/Library/Application Support/Google/Chrome/NativeMessagingHosts/com.unduhin.host.json
 ~/Library/Application Support/Microsoft Edge/NativeMessagingHosts/com.unduhin.host.json
 ~/Library/Application Support/BraveSoftware/Brave-Browser/NativeMessagingHosts/com.unduhin.host.json
 ```
+
+macOS has no installer, so the app writes these itself on every launch
+(`src-tauri/src/manifest.rs`). Two consequences worth knowing:
+
+- A manifest is written only for a browser whose profile directory
+  already exists, so Unduhin does not create folders for browsers you do
+  not have. Install a browser later and the next Unduhin launch picks it
+  up.
+- The `"path"` inside points at a copy of the host in
+  `~/Library/Application Support/unduhin/native-host/`, not at the copy
+  inside `Unduhin.app`. That keeps the registration valid when you move
+  the app, guarantees the executable bit, and sheds the
+  `com.apple.quarantine` flag that would otherwise block the browser from
+  spawning it.
 
 ### Linux (documented for future port)
 

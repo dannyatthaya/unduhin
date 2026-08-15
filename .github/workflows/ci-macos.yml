@@ -1,0 +1,178 @@
+name: macOS CI
+
+# macOS is built only here. The maintainer develops on Windows and has no
+# Mac, so this workflow is the entire feedback loop for the macOS port:
+# if it is not checked here, it is not checked at all.
+#
+# Deliberately split into a fast `check` job and a slow `bundle` job.
+# `check` is what you iterate against — it catches compile errors and test
+# failures in a few minutes. `bundle` proves the .dmg actually assembles
+# and is worth running far less often.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "crates/**"
+      - "src-tauri/**"
+      - "frontend/**"
+      - "extension/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/ci-macos.yml"
+
+# A new push to the same branch makes an in-flight run obsolete.
+concurrency:
+  group: macos-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check & test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # Both slices of the universal binary. `x86_64` is a
+          # cross-compile from an arm64 runner, which is the most likely
+          # thing to break here.
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          components: clippy, rustfmt
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          # `build.rs` builds the native host into its own target dir, so
+          # the default cache paths miss it and it would recompile
+          # unduhin-core from scratch on every run — twice, once per arch.
+          cache-directories: target/native-host-stage
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+
+      # The bundler treats extension/dist as a required resource, so it has
+      # to exist before anything invokes tauri_build::build().
+      - name: Install frontend deps
+        run: bun install --frozen-lockfile --cwd frontend
+
+      - name: Install extension deps
+        run: bun install --frozen-lockfile --cwd extension
+
+      - name: Build extension
+        run: bun run --cwd extension build
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy (arm64)
+        run: cargo clippy --workspace --all-targets --target aarch64-apple-darwin -- -D warnings
+
+      # The live-magnet tests are #[ignore]d and gated behind
+      # UNDUHIN_TORRENT_NET_TEST, so this never touches the network.
+      - name: Test (arm64)
+        run: cargo test --workspace --target aarch64-apple-darwin
+
+      # Cheaper canary than a full build for the Intel slice.
+      - name: Check (x86_64 cross)
+        run: cargo check --workspace --target x86_64-apple-darwin
+
+      # `build` runs `vue-tsc --noEmit` before vite, so this covers the
+      # typecheck too. `test` is vitest, and includes the i18n key-parity
+      # gate that keeps en.json and id.json in step.
+      - name: Frontend typecheck & tests
+        run: |
+          bun run --cwd frontend build
+          bun run --cwd frontend test
+
+      # The updater-manifest merge can break the *Windows* updater if it
+      # ever drops a platform key, and nothing downstream would notice.
+      - name: Release script tests
+        run: bun test --cwd scripts
+
+  bundle:
+    name: Universal bundle
+    runs-on: macos-latest
+    # Only on demand: a two-arch build with aws-lc-sys compiled twice is
+    # slow, and the check job catches most failures far sooner.
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-directories: target/native-host-stage
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Install frontend deps
+        run: bun install --frozen-lockfile --cwd frontend
+
+      - name: Install extension deps
+        run: bun install --frozen-lockfile --cwd extension
+
+      - name: Build extension
+        run: bun run --cwd extension build
+
+      - name: Build universal bundle
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: cargo tauri build --target universal-apple-darwin --bundles app,dmg
+
+      # Without these assertions a thin binary sails through CI and only
+      # fails on a user's Intel Mac. `lipo` is the one cheap guard.
+      - name: Verify the bundle is genuinely universal
+        run: |
+          set -euo pipefail
+          APP="target/universal-apple-darwin/release/bundle/macos/Unduhin.app"
+          BIN="$APP/Contents/MacOS/unduhin-app"
+          HOST="src-tauri/native-host/unduhin-native-host"
+
+          echo "== app binary =="
+          lipo -archs "$BIN"
+          lipo -archs "$BIN" | grep -q 'x86_64' || { echo "app is missing the x86_64 slice"; exit 1; }
+          lipo -archs "$BIN" | grep -q 'arm64'  || { echo "app is missing the arm64 slice"; exit 1; }
+
+          echo "== native host =="
+          lipo -archs "$HOST"
+          lipo -archs "$HOST" | grep -q 'x86_64' || { echo "native host is missing the x86_64 slice"; exit 1; }
+          lipo -archs "$HOST" | grep -q 'arm64'  || { echo "native host is missing the arm64 slice"; exit 1; }
+          test -x "$HOST" || { echo "native host lost its executable bit"; exit 1; }
+
+          echo "== info.plist =="
+          plutil -lint "$APP/Contents/Info.plist"
+
+          echo "== bundled extension survived =="
+          test -f "$APP/Contents/Resources/extension/manifest.json"
+
+          echo "== signing state (unsigned is expected) =="
+          codesign -dv --verbose=4 "$APP" 2>&1 || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal
+          # Upload the .dmg rather than the .app: actions/upload-artifact
+          # zips its inputs and drops executable bits, which would corrupt
+          # a bare .app. A .dmg is opaque to the zipper.
+          path: |
+            target/universal-apple-darwin/release/bundle/dmg/*.dmg
+            target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz
+            target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz.sig
+          if-no-files-found: error

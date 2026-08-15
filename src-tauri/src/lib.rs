@@ -226,6 +226,25 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("failed to build tauri app")
         .run(move |_app, event| {
+            // Clicking the Dock icon when every window is hidden. Without
+            // this the app is unreachable: macOS keeps the process alive
+            // and the red button hides rather than quits, so the Dock is
+            // the only way back and it would do nothing.
+            #[cfg(target_os = "macos")]
+            if let RunEvent::Reopen {
+                has_visible_windows,
+                ..
+            } = event
+            {
+                if !has_visible_windows {
+                    if let Some(window) = _app.get_webview_window("main") {
+                        let _ = window.show();
+                        let _ = window.unminimize();
+                        let _ = window.set_focus();
+                    }
+                }
+                return;
+            }
             if let RunEvent::ExitRequested { .. } = event {
                 // Flush state (bounded), then HARD-EXIT. librqbit's session
                 // keeps background tasks alive (DHT, peer sockets, blocking disk
@@ -242,6 +261,11 @@ pub fn run() {
                     )
                     .await
                 });
+                // `process::exit` runs no destructors, so the bridge
+                // endpoint has to be released explicitly. Without this a
+                // Unix socket file survives every quit and the next launch
+                // has to work out whether it is stale.
+                pipe::shutdown();
                 std::process::exit(0);
             }
         });

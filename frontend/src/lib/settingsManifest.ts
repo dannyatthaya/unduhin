@@ -134,7 +134,7 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
     id: "behaviour/autostart",
     label: "Launch at startup",
     description:
-      "Start Unduhin when you sign in to Windows. Required if you want queued downloads to run unattended.",
+      "Start Unduhin when you sign in. Required if you want queued downloads to run unattended.",
     keywords: ["startup", "boot", "login"],
     route: SECTION_ROUTES.behaviour,
   },

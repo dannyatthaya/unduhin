@@ -1,67 +1,70 @@
-//! Windows named-pipe client used by the native messaging host to
-//! forward `Inbound` messages to the long-running Unduhin app.
+//! Bridge client used by the native messaging host to forward `Inbound`
+//! messages to the long-running Unduhin app.
 //!
-//! Strategy: first try to open the pipe (fast path when the app is
-//! already running). On failure, spawn `unduhin-app.exe` detached and
-//! retry the connect with backoff totalling ~5 s before giving up.
-
-#![cfg(windows)]
+//! Strategy: first try to open the endpoint (fast path when the app is
+//! already running). On failure, launch the app detached and retry the
+//! connect with backoff before giving up.
+//!
+//! The transport itself — a named pipe on Windows, a Unix domain socket
+//! elsewhere — lives in `unduhin_core::wire::transport`, shared with the
+//! app so the two ends can never disagree about where to meet.
 
 use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
 use tracing::{debug, info};
+use unduhin_core::wire::transport::{self, ClientStream};
 
-/// Resolved pipe path. Honours `UNDUHIN_PIPE_NAME` so the
-/// integration tests can avoid colliding with a live app instance.
-fn pipe_name() -> String {
-    std::env::var("UNDUHIN_PIPE_NAME").unwrap_or_else(|_| r"\\.\pipe\unduhin".to_string())
-}
-
-/// Backoff schedule for the connect-or-launch path. Totals ~5.1 s — a
-/// fresh `unduhin-app.exe` cold-start on a typical Windows box lands
-/// the pipe well within that budget.
+/// Backoff schedule for the connect-or-launch path.
+///
+/// Windows totals ~5.1 s, which comfortably covers a cold
+/// `unduhin-app.exe` start. macOS gets a longer budget: a cold launch
+/// goes through LaunchServices, WKWebView init, and the SQLite migrations
+/// before the listener binds, and on a cold filesystem cache that can
+/// exceed five seconds.
+#[cfg(windows)]
 const RETRY_DELAYS_MS: &[u64] = &[100, 200, 400, 800, 1600, 2000];
+#[cfg(not(windows))]
+const RETRY_DELAYS_MS: &[u64] = &[200, 400, 800, 1600, 3000, 3000, 3000];
 
-/// Open a pipe to the running Unduhin app, spawning it detached if it
-/// isn't running yet. Returns the raw connected stream so the caller
-/// can split it into independent read/write halves — required by the
-/// 9d bidirectional pump (`pump_pipe_to_stdout` needs to read from the
-/// pipe while `pump_stdin_to_pipe` is busy writing).
-pub async fn connect_or_launch(host_exe: &Path) -> Result<NamedPipeClient> {
-    let name = pipe_name();
+/// Open a connection to the running Unduhin app, launching it detached if
+/// it is not running yet. Returns the raw stream so the caller can split it
+/// into independent read/write halves — required by the bidirectional pump
+/// (`pump_pipe_to_stdout` reads while `pump_stdin_to_pipe` writes).
+pub async fn connect_or_launch(host_exe: &Path) -> Result<ClientStream> {
+    let name = transport::endpoint();
 
     // Fast path — app already alive.
-    match ClientOptions::new().open(&name) {
+    match transport::connect(&name).await {
         Ok(stream) => {
-            debug!(pipe = %name, "connected to existing pipe");
+            debug!(endpoint = %name, "connected to running app");
             return Ok(stream);
         }
         Err(e) => {
-            debug!(error = %e, pipe = %name, "initial pipe connect failed; will spawn app");
+            debug!(error = %e, endpoint = %name, "initial connect failed; will launch app");
         }
     }
 
-    spawn_app(host_exe).context("spawn unduhin-app for native messaging")?;
+    spawn_app(host_exe).context("launch unduhin-app for native messaging")?;
 
     for &delay_ms in RETRY_DELAYS_MS {
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-        if let Ok(stream) = ClientOptions::new().open(&name) {
-            info!(pipe = %name, "pipe connected after spawn");
+        if let Ok(stream) = transport::connect(&name).await {
+            info!(endpoint = %name, "connected after launch");
             return Ok(stream);
         }
     }
 
     Err(anyhow!(
-        "named pipe at {name} did not come up within retry window"
+        "bridge at {name} did not come up within the retry window"
     ))
 }
 
 /// Spawn `unduhin-app.exe` from the same directory as the host binary,
 /// fully detached so the host can exit cleanly when the browser closes
 /// the port without dragging the main app down with it.
+#[cfg(windows)]
 fn spawn_app(host_exe: &Path) -> Result<()> {
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
@@ -99,4 +102,79 @@ fn spawn_app(host_exe: &Path) -> Result<()> {
 
     info!(?target, "spawned unduhin-app for native messaging");
     Ok(())
+}
+
+/// Launch `Unduhin.app` through LaunchServices.
+///
+/// `open` rather than a direct spawn, for three reasons. LaunchServices
+/// becomes the parent, so the app survives this host process exiting when
+/// the browser closes the port — the detachment the Windows creation flags
+/// buy explicitly. Addressing the app by bundle identifier survives the
+/// user moving it, which a sibling-path lookup would not. And `open`
+/// returns a real exit status, so a failure surfaces immediately instead of
+/// wasting the whole retry schedule.
+///
+/// `-g` keeps the app in the background. The user clicked a download link
+/// in their browser; stealing focus would be wrong, and it matches the
+/// window's `visible: false` start.
+#[cfg(target_os = "macos")]
+fn spawn_app(host_exe: &Path) -> Result<()> {
+    use std::process::{Command, Stdio};
+
+    const BUNDLE_ID: &str = "com.unduhin.app";
+
+    let by_id = Command::new("/usr/bin/open")
+        .args(["-g", "-b", BUNDLE_ID])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("run /usr/bin/open")?;
+    if by_id.success() {
+        info!(bundle = BUNDLE_ID, "launched Unduhin for native messaging");
+        return Ok(());
+    }
+
+    // LaunchServices only knows a bundle id it has seen registered, which
+    // does not happen until the app is first launched from Finder. The
+    // app records its own location on every run for exactly this case.
+    let recorded = unduhin_core::directories_root()
+        .map(|root| root.join("native-host").join("app-path.txt"))
+        .filter(|p| p.exists())
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    if let Some(path) = recorded {
+        let by_path = Command::new("/usr/bin/open")
+            .args(["-g", "-a", &path])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .context("run /usr/bin/open with a recorded path")?;
+        if by_path.success() {
+            info!(path, "launched Unduhin from its recorded location");
+            return Ok(());
+        }
+        return Err(anyhow!(
+            "could not launch Unduhin by bundle id {BUNDLE_ID} or by path {path}"
+        ));
+    }
+
+    let _ = host_exe;
+    Err(anyhow!(
+        "could not launch Unduhin by bundle id {BUNDLE_ID}, and no recorded \
+         app path exists yet — open Unduhin once so it can register itself"
+    ))
+}
+
+/// Unduhin ships on Windows and macOS. This arm keeps a contributor's
+/// Linux build compiling; the bridge still works there if the app is
+/// already running, it just cannot cold-start it.
+#[cfg(not(any(windows, target_os = "macos")))]
+fn spawn_app(_host_exe: &Path) -> Result<()> {
+    Err(anyhow!(
+        "launching the app is not implemented on this platform; start Unduhin first"
+    ))
 }

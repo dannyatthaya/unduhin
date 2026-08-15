@@ -77,13 +77,29 @@ unduhin/
 
 You'll need:
 
-- **Windows 10 or 11.** Unduhin is Windows-only by design.
+- **Windows 10 or 11**, or **macOS 11+**. Windows is the primary
+  platform.
 - **Rust** 1.75+ via [rustup](https://rustup.rs/). The MSVC toolchain
-  is what Tauri builds against.
-- **Node.js** 20+.
+  is what Tauri builds against on Windows.
+- **Bun** — the package manager for `frontend/` and `extension/`.
 - **The Tauri CLI**: `cargo install tauri-cli --version "^2.0" --locked`.
-- **WebView2 Runtime** — bundled with Windows 11; install separately on
-  fresh Windows 10 images.
+- **WebView2 Runtime** on Windows — bundled with Windows 11; install
+  separately on fresh Windows 10 images. macOS uses the built-in
+  WKWebView and needs nothing.
+
+On macOS, additionally:
+
+- **Xcode command line tools** (`xcode-select --install`). These supply
+  `cc` and `cmake`, which `aws-lc-sys` and `libsqlite3-sys` build
+  through, plus `lipo` for joining the two architecture slices.
+- **Both Apple targets**:
+  `rustup target add aarch64-apple-darwin x86_64-apple-darwin`. The
+  universal build needs both, and so does `src-tauri/build.rs` when it
+  stages the native messaging host.
+
+macOS builds normally run in CI (`.github/workflows/ci-macos.yml`)
+because the maintainer develops on Windows. That workflow is the only
+gate the macOS port has, so keep it green.
 
 Optional, but useful:
 

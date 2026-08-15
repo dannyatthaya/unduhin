@@ -28,12 +28,13 @@
 //! All stdout writes funnel through a single mpsc-backed writer task so
 //! the two pumps can't interleave bytes mid-frame.
 //!
-//! Cross-platform note: Native Messaging on Chrome/Edge is Windows-only
-//! in our target matrix. The binary still compiles on other targets so
-//! the workspace stays portable; on non-Windows it serves one `Ping`
+//! Cross-platform note: the bridge runs on Windows and macOS, over a
+//! named pipe and a Unix domain socket respectively (see
+//! `unduhin_core::wire::transport`). The binary still compiles elsewhere
+//! so the workspace stays portable; on those targets it serves one `Ping`
 //! and exits.
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 mod pipe_client;
 
 use std::io::IsTerminal;
@@ -70,10 +71,10 @@ async fn main() -> anyhow::Result<()> {
 
     info!("unduhin-native-host starting");
 
-    #[cfg(windows)]
-    return run_windows().await;
+    #[cfg(any(windows, target_os = "macos"))]
+    return run_bridge().await;
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     return run_stub().await;
 }
 
@@ -81,11 +82,11 @@ async fn main() -> anyhow::Result<()> {
 /// burst of `SettingsChanged` pushes while a slow stdout consumer
 /// catches up; back-pressure naturally throttles the upstream pumps
 /// past that.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 const STDOUT_QUEUE_CAPACITY: usize = 32;
 
-#[cfg(windows)]
-async fn run_windows() -> anyhow::Result<()> {
+#[cfg(any(windows, target_os = "macos"))]
+async fn run_bridge() -> anyhow::Result<()> {
     use std::sync::Arc;
     use tokio::sync::{mpsc, Mutex};
 
@@ -109,7 +110,7 @@ async fn run_windows() -> anyhow::Result<()> {
     // Shared because the lazy-connect path also spawns the
     // pipe→stdout pump, which holds the matching read half.
     let pipe_writer: Arc<
-        Mutex<Option<tokio::io::WriteHalf<tokio::net::windows::named_pipe::NamedPipeClient>>>,
+        Mutex<Option<tokio::io::WriteHalf<unduhin_core::wire::transport::ClientStream>>>,
     > = Arc::new(Mutex::new(None));
 
     // Handle to the pipe→stdout pump (None until first lazy connect).
@@ -138,13 +139,13 @@ async fn run_windows() -> anyhow::Result<()> {
     result
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 async fn pump_stdin_to_pipe<R>(
     mut stdin_reader: R,
     stdout_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     pipe_writer: std::sync::Arc<
         tokio::sync::Mutex<
-            Option<tokio::io::WriteHalf<tokio::net::windows::named_pipe::NamedPipeClient>>,
+            Option<tokio::io::WriteHalf<unduhin_core::wire::transport::ClientStream>>,
         >,
     >,
     pipe_pump: std::sync::Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
@@ -256,9 +257,9 @@ where
 /// Exits cleanly on EOF (the main app closed the connection) or on a
 /// read error; the next `pump_stdin_to_pipe` write will reconnect and
 /// respawn this task.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 async fn pump_pipe_to_stdout(
-    mut read_half: tokio::io::ReadHalf<tokio::net::windows::named_pipe::NamedPipeClient>,
+    mut read_half: tokio::io::ReadHalf<unduhin_core::wire::transport::ClientStream>,
     stdout_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 ) {
     loop {
@@ -281,7 +282,7 @@ async fn pump_pipe_to_stdout(
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 async fn send_outbound(stdout_tx: &tokio::sync::mpsc::Sender<Vec<u8>>, msg: &Outbound) {
     match serde_json::to_vec(msg) {
         Ok(buf) => {
@@ -293,7 +294,7 @@ async fn send_outbound(stdout_tx: &tokio::sync::mpsc::Sender<Vec<u8>>, msg: &Out
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 async fn run_stub() -> anyhow::Result<()> {
     let mut stdin = stdin();
     let mut stdout = stdout();
@@ -319,7 +320,7 @@ async fn run_stub() -> anyhow::Result<()> {
             Outbound::Pong
         } else {
             Outbound::Error {
-                message: "native host is Windows-only in this build".into(),
+                message: "the native host bridge is available on Windows and macOS only".into(),
             }
         };
         let _ = write_frame(&mut stdout, &serde_json::to_vec(&response)?).await;

@@ -1,0 +1,34 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Unduhin",
+        "width": 1320,
+        "height": 820,
+        "minWidth": 1240,
+        "minHeight": 600,
+        "resizable": true,
+        "decorations": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "transparent": false,
+        "visible": false
+      }
+    ]
+  },
+  "bundle": {
+    "targets": ["app", "dmg"],
+    "icon": ["icons/icon.icns", "icons/icon.png"],
+    "shortDescription": "A focused, segmented downloader.",
+    "longDescription": "Unduhin is a download manager with reliable multi-segment downloading and a polished UI.",
+    "resources": {
+      "native-host/unduhin-native-host.exe": null,
+      "native-host/unduhin-native-host": "native-host/unduhin-native-host"
+    },
+    "macOS": {
+      "minimumSystemVersion": "11.0"
+    }
+  }
+}
