@@ -42,6 +42,55 @@ use base64::Engine as _;
 const TAG: &str = "dpapi:v1:";
 const KEYCHAIN_TAG: &str = "keychain:v1:";
 
+/// Time budget for the one Keychain round-trip per process.
+///
+/// Long enough that a user can read and answer a prompt on a real Mac,
+/// short enough that a machine which will never answer gets on with its
+/// life.
+#[cfg(target_os = "macos")]
+const KEYCHAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Run `f` on a throwaway thread and give up after `timeout`.
+///
+/// This exists because the two platforms fail differently. `CryptProtectData`
+/// is called with `CRYPTPROTECT_UI_FORBIDDEN`, so Windows *returns an error*
+/// when it would otherwise need the user. macOS has no equivalent flag here:
+/// `SecItem*` against a locked login Keychain blocks on the unlock prompt,
+/// and where no one can answer — a headless CI runner, an app autostarted
+/// before first unlock — it blocks forever. `unprotect`'s degrade-to-plaintext
+/// path only runs if the call *returns*, so without this bound it never runs.
+///
+/// On timeout the worker is abandoned, still parked in the syscall. That is
+/// deliberate: it owns no lock the caller needs, and the process is free to
+/// exit around it.
+///
+/// Lives outside the `macos` module, and takes a closure rather than naming
+/// the Keychain, so the part with the reasoning in it compiles and is tested
+/// on every platform — not only the one that can't be built from the
+/// maintainer's machine.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn with_timeout<T>(
+    timeout: std::time::Duration,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Option<T>
+where
+    T: Send + 'static,
+{
+    // Capacity 1 so a worker that finishes late can still hand its answer
+    // over and exit, instead of blocking forever on a send nobody reads.
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    if std::thread::Builder::new()
+        .name("keychain-probe".to_string())
+        .spawn(move || {
+            let _ = tx.send(f());
+        })
+        .is_err()
+    {
+        return None;
+    }
+    rx.recv_timeout(timeout).ok()
+}
+
 /// Encrypt `plaintext` for storage.
 ///
 /// On success returns `<scheme>:v1:<base64>`; if encryption is unavailable
@@ -129,7 +178,22 @@ mod keychain {
         MASTER_KEY.get_or_init(load_or_create).as_ref()
     }
 
+    /// Bounded wrapper around [`keychain_io`]. See [`super::with_timeout`]
+    /// for why the call has to be bounded at all.
     fn load_or_create() -> Option<[u8; KEY_LEN]> {
+        match super::with_timeout(super::KEYCHAIN_TIMEOUT, keychain_io) {
+            Some(key) => key,
+            None => {
+                tracing::warn!(
+                    timeout_s = super::KEYCHAIN_TIMEOUT.as_secs(),
+                    "keychain did not answer; headers will be stored unencrypted"
+                );
+                None
+            }
+        }
+    }
+
+    fn keychain_io() -> Option<[u8; KEY_LEN]> {
         use security_framework::passwords::{get_generic_password, set_generic_password};
 
         if let Ok(existing) = get_generic_password(SERVICE, ACCOUNT) {
@@ -294,6 +358,35 @@ mod tests {
         let secret = r#"[["Cookie","sid=abc; auth=xyz"],["Referer","https://x/"]]"#;
         let stored = protect(secret);
         assert_eq!(unprotect(&stored), secret);
+    }
+
+    /// A worker that answers in time hands its value straight back.
+    #[test]
+    fn with_timeout_returns_a_prompt_answer() {
+        let got = with_timeout(std::time::Duration::from_secs(30), || 7u8);
+        assert_eq!(got, Some(7));
+    }
+
+    /// The case that wedged macOS CI: a call that never returns must not
+    /// wedge the caller. This is the whole point of the helper — on macOS the
+    /// blocked call is `SecItem*` waiting on an unlock prompt that no one can
+    /// answer, and every later caller piles up behind it on the `OnceLock`.
+    #[test]
+    fn with_timeout_gives_up_on_a_worker_that_never_answers() {
+        let started = std::time::Instant::now();
+        let got = with_timeout(std::time::Duration::from_millis(200), || {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            7u8
+        });
+        assert_eq!(
+            got, None,
+            "a worker that never answers must not be waited on"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "gave up too late: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
