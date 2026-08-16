@@ -1,10 +1,14 @@
 // Right-click context menu.
 //
-// Three deterministic menu items so an `onInstalled` re-create doesn't
-// duplicate them — `chrome.contextMenus.create` is idempotent against a
-// known id, but we still call `removeAll` first so the IDs are
-// guaranteed clean even if the user installed a previous version with
+// Three deterministic menu items, rebuilt by way of `removeAll` so the
+// IDs are clean even if the user installed a previous version with
 // different titles.
+//
+// `chrome.contextMenus.create` is NOT idempotent against a known id:
+// creating an id that already exists fails with "Cannot create item with
+// duplicate id". That, plus the fact that `removeAll` and `create` are
+// both callback-async, is why every reconcile goes through the queue in
+// `applyMenuToggle` rather than being called directly.
 
 import { log } from "../shared/log.js";
 import type { DownloadJob, RequestHeader } from "../shared/types.js";
@@ -25,39 +29,82 @@ export interface ContextMenuDeps {
   readonly settings: SettingsReader;
 }
 
-function buildMenus(): void {
-  chrome.contextMenus.removeAll(() => {
-    chrome.contextMenus.create({
-      id: MENU_LINK,
-      title: "Download link with Unduhin",
-      contexts: ["link"],
-    });
-    chrome.contextMenus.create({
-      id: MENU_IMAGE,
-      title: "Download image with Unduhin",
-      contexts: ["image"],
-    });
-    chrome.contextMenus.create({
-      id: MENU_MEDIA,
-      title: "Download with Unduhin",
-      contexts: ["video", "audio"],
+/** Promise wrapper so a reconcile can await the clear before creating. */
+function removeAllMenus(): Promise<void> {
+  return new Promise((resolve) => {
+    chrome.contextMenus.removeAll(() => {
+      void chrome.runtime.lastError;
+      resolve();
     });
   });
 }
 
-function teardownMenus(): void {
-  chrome.contextMenus.removeAll(() => {
-    void chrome.runtime.lastError;
+/**
+ * Create one item, treating a duplicate id as survivable.
+ *
+ * Reading `lastError` is what marks it handled; leaving it unread is what
+ * turns it into an `Unchecked runtime.lastError` line in the user's
+ * console. The queue below should make duplicates unreachable — this is
+ * the belt to its braces.
+ */
+function createMenu(props: chrome.contextMenus.CreateProperties): Promise<void> {
+  return new Promise((resolve) => {
+    chrome.contextMenus.create(props, () => {
+      const err = chrome.runtime.lastError;
+      if (err) log.warn("context-menu: create failed", props.id, err.message);
+      resolve();
+    });
   });
 }
+
+async function buildMenus(): Promise<void> {
+  await removeAllMenus();
+  await createMenu({
+    id: MENU_LINK,
+    title: "Download link with Unduhin",
+    contexts: ["link"],
+  });
+  await createMenu({
+    id: MENU_IMAGE,
+    title: "Download image with Unduhin",
+    contexts: ["image"],
+  });
+  await createMenu({
+    id: MENU_MEDIA,
+    title: "Download with Unduhin",
+    contexts: ["video", "audio"],
+  });
+}
+
+function teardownMenus(): Promise<void> {
+  return removeAllMenus();
+}
+
+/**
+ * Serializes reconciles. Without it two overlapping calls interleave:
+ * both issue `removeAll` before either has created anything, so the
+ * second one clears nothing and its creates collide with the first's —
+ * three duplicate-id errors, one per item.
+ *
+ * That is not hypothetical. On a fresh install `onInstalled` and the
+ * `settings.ready` reconcile both fire, which is exactly the race. It
+ * stays quiet on later service-worker wakes only because `onInstalled`
+ * does not fire then.
+ */
+let reconcile: Promise<void> = Promise.resolve();
 
 /**
  * Reconcile menu presence with the `installContextMenu` setting.
  * Idempotent — safe to call on every `chrome.storage.onChanged`.
  */
 function applyMenuToggle(install: boolean): void {
-  if (install) buildMenus();
-  else teardownMenus();
+  // The `catch` keeps the chain usable: a rejection left unhandled here
+  // would poison every later reconcile, not just this one.
+  reconcile = reconcile
+    .then(() => (install ? buildMenus() : teardownMenus()))
+    .catch((e: unknown) => {
+      log.warn("context-menu: reconcile failed", e);
+    });
 }
 
 export function installContextMenu(deps: ContextMenuDeps): void {
