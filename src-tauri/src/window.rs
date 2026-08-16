@@ -238,7 +238,9 @@ pub fn ensure_popover_window(app: &AppHandle) -> tauri::Result<()> {
     .focused(false)
     .visible(false)
     .shadow(true)
-    .transparent(false)
+    // No `.transparent(false)`: tauri gates that builder method behind
+    // `macos-private-api`, so it does not exist on macOS builds. Opaque is
+    // the builder default anyway — the window stays identical everywhere.
     .build()?;
     Ok(())
 }
