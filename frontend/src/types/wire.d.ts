@@ -9,7 +9,29 @@ export type MediaKind = "hls" | "dash";
 
 export type MediaStream = { kind: MediaKind, manifestUrl: string, pageUrl: string | null, tabId: number | null, suggestedFilename: string | null, referrer: string | null, userAgent: string | null, cookieHeader: string | null, requestHeaders: Array<RequestHeader>, };
 
-export type MediaFormat = { url: string, height: number | null, resolution: string | null, bandwidth: number | null, };
+export type MediaFormat = { url: string, height: number | null, resolution: string | null, bandwidth: number | null, 
+/**
+ * Transfer size in bytes. yt-dlp's exact `filesize` when it has one,
+ * otherwise its own `filesize_approx` estimate. `None` when yt-dlp
+ * reported neither — common for HLS, where no size is knowable
+ * without walking every segment.
+ */
+filesizeBytes: number | null, 
+/**
+ * Length of the media in seconds, from yt-dlp's top-level
+ * `duration`. The same value on every format of one probe: the
+ * renditions of an adaptive stream are the same content at
+ * different bitrates.
+ */
+durationSecs: number | null, fps: number | null, 
+/**
+ * Raw codec identifiers, exactly as yt-dlp reports them (e.g.
+ * `avc1.640028`, `mp4a.40.2`). The extension maps these to short
+ * names such as "H.264" — a mapping that must stay in one place,
+ * and that place is the extension, because its own manifest parser
+ * produces the same identifiers from an HLS `CODECS` attribute.
+ */
+vcodec: string | null, acodec: string | null, };
 
 export type DownloadJob = { 
 /**

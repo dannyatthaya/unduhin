@@ -10,9 +10,20 @@
 // open, and re-fetching every manifest each time would be wasteful (and
 // the bodies rarely change within a session).
 
+import { splitCodecs } from "../shared/format.js";
 import type { MediaVariant } from "../shared/types.js";
 
 const STREAM_INF = "#EXT-X-STREAM-INF:";
+// A media playlist states its own length one segment at a time. Summing
+// `#EXTINF` is the only way to learn a stream's duration — no HLS tag
+// carries a total.
+const EXTINF = "#EXTINF:";
+// A playlist that has ended states so. Without one of these the segment
+// list is still growing (a live stream, or a recording in progress), so
+// the sum of what is there now is a floor, not a duration — reporting it
+// would show "12:03" for a broadcast that has been running all day.
+const ENDLIST = "#EXT-X-ENDLIST";
+const VOD_TYPE = "#EXT-X-PLAYLIST-TYPE:VOD";
 const CACHE_TTL_MS = 60_000;
 // Per-attempt cap for each of the two cheap fetch tiers (in-page, SW) — see
 // TOTAL_BUDGET_MS below for how this combines with the third (app-probe)
@@ -58,10 +69,34 @@ const MAX_MANIFEST_LENGTH_CHARS = 256_000;
 // pathological "everything is hanging" case burned the entire budget on
 // the fetches and starved the probe to zero; now the probe always gets a
 // real slice to work with.
-const TOTAL_BUDGET_MS = FETCH_TIMEOUT_MS + EXEC_IPC_OVERHEAD_MS + FETCH_TIMEOUT_MS;
+// One more `FETCH_TIMEOUT_MS` on top of the two halves above, for the
+// duration probe (see `probeDuration`). It runs after the master has
+// parsed, so it cannot overlap with the tiers that fetched the master.
+const TOTAL_BUDGET_MS =
+  FETCH_TIMEOUT_MS + EXEC_IPC_OVERHEAD_MS + FETCH_TIMEOUT_MS + FETCH_TIMEOUT_MS;
+
+/**
+ * What resolution learned about one manifest URL.
+ *
+ * `variants` is empty for a media playlist — a stream with no alternate
+ * renditions to choose between. `durationSecs` is still populated in that
+ * case, which is the point of this being a record rather than a bare
+ * variant list: a plain stream row has no variant to hang a duration on,
+ * but the user still wants to know how long the video runs before
+ * starting it.
+ */
+export interface ManifestInfo {
+  readonly variants: readonly MediaVariant[];
+  /** Length of the media in seconds, or null when it is not known —
+   *  a live stream, or a manifest no tier could fetch. */
+  readonly durationSecs: number | null;
+}
+
+/** The value cached for a manifest nothing could be learned about. */
+const UNKNOWN: ManifestInfo = { variants: [], durationSecs: null };
 
 interface CacheEntry {
-  readonly variants: readonly MediaVariant[];
+  readonly info: ManifestInfo;
   readonly expiresAt: number;
 }
 
@@ -74,7 +109,7 @@ const cache = new Map<string, CacheEntry>();
 // warms the cache the moment a manifest is seen (`onStreamDetected` in the
 // service worker) and the popup's background resolve can start while that
 // warm-up is still in flight.
-const inFlight = new Map<string, Promise<readonly MediaVariant[]>>();
+const inFlight = new Map<string, Promise<ManifestInfo>>();
 
 /**
  * Last-resort variant source, injected by the caller rather than imported —
@@ -115,10 +150,25 @@ export function parseMasterPlaylist(text: string, baseUrl: string): MediaVariant
     // Match attributes directly rather than comma-splitting — quoted
     // values (e.g. CODECS="avc1.4d401f,mp4a.40.2") contain commas.
     const res = /RESOLUTION=(\d+)x(\d+)/i.exec(attrs);
-    const bw = /BANDWIDTH=(\d+)/i.exec(attrs);
+    // AVERAGE-BANDWIDTH is the rendition's mean bit rate; BANDWIDTH is
+    // its peak. Prefer the mean: this number drives the size estimate,
+    // and a peak-driven estimate overstates a variable-bitrate encode by
+    // a wide margin. The `(?<!AVERAGE-)` guard stops the BANDWIDTH
+    // pattern from matching the tail of AVERAGE-BANDWIDTH.
+    const avgBw = /AVERAGE-BANDWIDTH=(\d+)/i.exec(attrs);
+    const bw = /(?<!AVERAGE-)BANDWIDTH=(\d+)/i.exec(attrs);
+    const codecs = /CODECS="([^"]*)"/i.exec(attrs);
+    const frameRateMatch = /FRAME-RATE=([\d.]+)/i.exec(attrs);
     const height = res ? Number.parseInt(res[2]!, 10) : null;
     const resolution = res ? `${res[1]}x${res[2]}` : null;
-    const bandwidth = bw ? Number.parseInt(bw[1]!, 10) : null;
+    const bandwidth = avgBw
+      ? Number.parseInt(avgBw[1]!, 10)
+      : bw
+        ? Number.parseInt(bw[1]!, 10)
+        : null;
+    const { video: videoCodec, audio: audioCodec } = splitCodecs(codecs?.[1] ?? null);
+    const parsedRate = frameRateMatch ? Number.parseFloat(frameRateMatch[1]!) : NaN;
+    const frameRate = Number.isFinite(parsedRate) && parsedRate > 0 ? parsedRate : null;
 
     // The variant URI is the next non-blank, non-comment line.
     let uri: string | null = null;
@@ -144,6 +194,13 @@ export function parseMasterPlaylist(text: string, baseUrl: string): MediaVariant
       resolution,
       bandwidth,
       label: labelFor(height, bandwidth, resolution),
+      videoCodec,
+      audioCodec,
+      frameRate,
+      // A master playlist states neither. `withDuration` fills both in
+      // once the duration probe has run.
+      durationSecs: null,
+      estimatedBytes: null,
     });
   }
 
@@ -151,6 +208,105 @@ export function parseMasterPlaylist(text: string, baseUrl: string): MediaVariant
   return variants
     .filter((v) => (seen.has(v.url) ? false : (seen.add(v.url), true)))
     .sort((a, b) => (b.height ?? 0) - (a.height ?? 0) || (b.bandwidth ?? 0) - (a.bandwidth ?? 0));
+}
+
+/**
+ * Total length in seconds of a *media* playlist, by adding up its
+ * `#EXTINF` segment durations.
+ *
+ * Returns null when the playlist has not ended. A live stream has no
+ * total length, and its segment list is a rolling window, so the sum of
+ * what the manifest lists right now is not the duration of anything.
+ * Also returns null for a playlist with no segments, and for a master
+ * playlist (which has no `#EXTINF` lines at all).
+ *
+ * The `#EXTINF` value is a decimal number, then an optional comma and an
+ * optional title: `#EXTINF:9.009,` or `#EXTINF:10,Segment 3`.
+ */
+export function parseMediaPlaylistDuration(text: string): number | null {
+  if (!text.includes(ENDLIST) && !text.includes(VOD_TYPE)) return null;
+
+  let total = 0;
+  let segments = 0;
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line.startsWith(EXTINF)) continue;
+    const value = line.slice(EXTINF.length).split(",")[0]?.trim() ?? "";
+    const secs = Number.parseFloat(value);
+    // A malformed `#EXTINF` skips that segment rather than failing the
+    // whole playlist: one bad line should not cost the other 900.
+    if (!Number.isFinite(secs) || secs < 0) continue;
+    total += secs;
+    segments += 1;
+  }
+  return segments > 0 && total > 0 ? total : null;
+}
+
+/**
+ * Transfer size implied by holding `bandwidth` bits per second for
+ * `durationSecs`.
+ *
+ * An estimate, and the popup says so. HLS states a bit rate and never a
+ * size, and a real encode varies around its advertised rate. Mirrors
+ * `estimate_bytes` in `crates/core/src/ytdlp/wire.rs` so the two
+ * discovery paths produce the same number for the same stream.
+ */
+function estimateBytes(
+  bandwidth: number | null,
+  durationSecs: number | null,
+): number | null {
+  if (!bandwidth || bandwidth <= 0) return null;
+  if (!durationSecs || durationSecs <= 0) return null;
+  return Math.round((bandwidth * durationSecs) / 8);
+}
+
+/** Copy of `variant` carrying `durationSecs` and the size that follows
+ *  from it. A null duration leaves both fields null. */
+function withDuration(variant: MediaVariant, durationSecs: number | null): MediaVariant {
+  return {
+    ...variant,
+    durationSecs,
+    estimatedBytes: estimateBytes(variant.bandwidth, durationSecs),
+  };
+}
+
+/**
+ * Learn a master playlist's duration by fetching exactly ONE of its
+ * renditions and summing that media playlist's segments.
+ *
+ * One fetch, not one per rendition: every rendition of an adaptive
+ * stream is the same content at a different bit rate, so they all report
+ * the same duration. Fetching six playlists to read the same number six
+ * times would add five requests per captured stream for nothing.
+ *
+ * The rendition picked is the lowest-bandwidth one. That is a tie-break
+ * and not an optimization — the playlists are the same length in lines
+ * whatever the bit rate — but it does ask the CDN for its cheapest
+ * object, and it makes the choice deterministic for the tests.
+ *
+ * Returns null on any failure. A missing duration costs the row two
+ * chips. It must never cost the row itself, so no error escapes here.
+ */
+async function probeDuration(
+  variants: readonly MediaVariant[],
+  tabId: number | null,
+  deadline: number,
+): Promise<number | null> {
+  const cheapest = variants.reduce<MediaVariant | null>((best, v) => {
+    if (!best) return v;
+    return (v.bandwidth ?? Number.MAX_SAFE_INTEGER) <
+      (best.bandwidth ?? Number.MAX_SAFE_INTEGER)
+      ? v
+      : best;
+  }, null);
+  if (!cheapest) return null;
+
+  try {
+    const body = await fetchManifest(cheapest.url, tabId, deadline);
+    return body == null ? null : parseMediaPlaylistDuration(body);
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -162,12 +318,15 @@ export function parseMasterPlaylist(text: string, baseUrl: string): MediaVariant
  * and {@link fetchAppProbe}. `probeViaApp` omitted behaves exactly as the
  * two-tier fetch chain did before it existed.
  *
- * Concurrent calls for the same URL share one run; use {@link peekVariants}
+ * Concurrent calls for the same URL share one run; use {@link peekManifest}
  * for a non-blocking read of what's already resolved.
  *
- * Returns an empty array for media playlists, an app probe that answered
- * "no variants", or (once every available tier has failed/timed out) as
- * the fallback — callers treat "no variants" as "plain stream" either way.
+ * `variants` comes back empty for media playlists, for an app probe that
+ * answered "no variants", and (once every available tier has failed or
+ * timed out) as the fallback — callers treat "no variants" as "plain
+ * stream" either way. `durationSecs` is populated whenever some tier
+ * could read it, INCLUDING for a media playlist with no variants at all.
+ *
  * Cached for {@link CACHE_TTL_MS} on an actual answer, {@link
  * NEGATIVE_CACHE_TTL_MS} when nothing could answer at all.
  */
@@ -175,8 +334,8 @@ export async function loadVariants(
   manifestUrl: string,
   tabId: number | null,
   probeViaApp?: ProbeViaApp,
-): Promise<readonly MediaVariant[]> {
-  const cached = peekVariants(manifestUrl);
+): Promise<ManifestInfo> {
+  const cached = peekManifest(manifestUrl);
   if (cached) return cached;
 
   const existing = inFlight.get(manifestUrl);
@@ -193,25 +352,25 @@ export async function loadVariants(
 }
 
 /**
- * The cached variants for `manifestUrl`, or `undefined` when nothing has
- * been resolved (or the entry has expired). Pure cache read — never
+ * What is already known about `manifestUrl`, or `undefined` when nothing
+ * has been resolved (or the entry has expired). Pure cache read — never
  * fetches, never spawns a probe, never awaits.
  *
- * `undefined` ("not resolved yet") is deliberately distinct from `[]`
- * ("resolved: not a master playlist"): the popup's fast path renders the
- * former as a plain row that may still regroup into quality rows, and the
- * latter as a plain row that is final.
+ * `undefined` ("not resolved yet") is deliberately distinct from an empty
+ * `variants` ("resolved: not a master playlist"): the popup's fast path
+ * renders the former as a plain row that may still regroup into quality
+ * rows, and the latter as a plain row that is final.
  */
-export function peekVariants(manifestUrl: string): readonly MediaVariant[] | undefined {
+export function peekManifest(manifestUrl: string): ManifestInfo | undefined {
   const hit = cache.get(manifestUrl);
-  return hit && hit.expiresAt > Date.now() ? hit.variants : undefined;
+  return hit && hit.expiresAt > Date.now() ? hit.info : undefined;
 }
 
 async function resolveVariants(
   manifestUrl: string,
   tabId: number | null,
   probeViaApp?: ProbeViaApp,
-): Promise<readonly MediaVariant[]> {
+): Promise<ManifestInfo> {
   const deadline = Date.now() + TOTAL_BUDGET_MS;
 
   const text = await fetchManifest(manifestUrl, tabId, deadline);
@@ -219,12 +378,27 @@ async function resolveVariants(
     // An oversized body is treated as "not a master" rather than an error
     // — it's almost certainly a media playlist, and the popup already
     // renders "no variants" as a plain stream row either way.
-    const variants =
-      text.length <= MAX_MANIFEST_LENGTH_CHARS && isMasterPlaylist(text)
-        ? parseMasterPlaylist(text, manifestUrl)
-        : [];
-    cache.set(manifestUrl, { variants, expiresAt: Date.now() + CACHE_TTL_MS });
-    return variants;
+    const isMaster = text.length <= MAX_MANIFEST_LENGTH_CHARS && isMasterPlaylist(text);
+    let info: ManifestInfo;
+    if (isMaster) {
+      const variants = parseMasterPlaylist(text, manifestUrl);
+      // One extra fetch, and only when there is something to attach the
+      // answer to: a master with no parsable renditions gains nothing
+      // from knowing how long it runs.
+      const durationSecs =
+        variants.length > 0 ? await probeDuration(variants, tabId, deadline) : null;
+      info = {
+        variants: variants.map((v) => withDuration(v, durationSecs)),
+        durationSecs,
+      };
+    } else {
+      // A media playlist. Its duration is free — the body in hand IS the
+      // segment list, so no probe fetch is needed. This is the case the
+      // popup used to render as a bare URL with no facts at all.
+      info = { variants: [], durationSecs: parseMediaPlaylistDuration(text) };
+    }
+    cache.set(manifestUrl, { info, expiresAt: Date.now() + CACHE_TTL_MS });
+    return info;
   }
 
   // Both fetch tiers failed (or the budget ran out before they could
@@ -234,16 +408,23 @@ async function resolveVariants(
     ? await fetchAppProbe(probeViaApp, manifestUrl, deadline - Date.now())
     : null;
   if (probed != null) {
-    cache.set(manifestUrl, { variants: probed, expiresAt: Date.now() + CACHE_TTL_MS });
-    return probed;
+    // yt-dlp reports the duration on every format it returns, so no
+    // probe fetch is needed on this path either. Read it off the first
+    // format that states one.
+    const info: ManifestInfo = {
+      variants: probed,
+      durationSecs: probed.find((v) => v.durationSecs != null)?.durationSecs ?? null,
+    };
+    cache.set(manifestUrl, { info, expiresAt: Date.now() + CACHE_TTL_MS });
+    return info;
   }
 
   // Negative-cache the failure — see NEGATIVE_CACHE_TTL_MS. The next popup
   // open past that window retries (the page may not have been ready, a
   // Referer-gated request transiently 403'd, or the bridge was briefly
   // down for the probe).
-  cache.set(manifestUrl, { variants: [], expiresAt: Date.now() + NEGATIVE_CACHE_TTL_MS });
-  return [];
+  cache.set(manifestUrl, { info: UNKNOWN, expiresAt: Date.now() + NEGATIVE_CACHE_TTL_MS });
+  return UNKNOWN;
 }
 
 /**

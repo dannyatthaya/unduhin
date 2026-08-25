@@ -16,7 +16,6 @@ import type {
   Inbound,
   MediaStream,
   MediaStreamsMessage,
-  MediaVariant,
   Outbound,
   PopupDownloadMediaResponse,
   PopupMediaStream,
@@ -37,12 +36,21 @@ import { createNativeBridge } from "./native-bridge.js";
 import type { NativeBridge } from "./native-bridge.js";
 import { installDownloadInterceptor } from "./download-interceptor.js";
 import { installMediaSniffer } from "./media-sniffer.js";
-import { labelFor, loadVariants, peekVariants } from "./hls-master.js";
+import {
+  labelFor,
+  loadVariants,
+  peekManifest,
+  type ManifestInfo,
+} from "./hls-master.js";
 import type { ProbeViaApp } from "./hls-master.js";
 import { assembleStreams, sameStreams } from "./stream-view.js";
 import { installContextMenu } from "./context-menu.js";
 import { mergeStatus, readRecentJobs, recordAck } from "./recent-jobs.js";
 import { pruneTo, snapshotForWire } from "./rule-metrics.js";
+
+/** Placeholder for a manifest nothing has resolved yet. Renders as a
+ *  plain row with no size and no duration. */
+const NOTHING_KNOWN: ManifestInfo = { variants: [], durationSecs: null };
 
 // Hot-applied settings reader. Consumers call `.current()` at the moment
 // they need the value so options-page edits reach the next decision
@@ -377,6 +385,15 @@ function makeAppProber(referrer: string | null): ProbeViaApp {
         resolution: f.resolution,
         bandwidth: f.bandwidth,
         label: labelFor(f.height, f.bandwidth, f.resolution),
+        videoCodec: f.vcodec,
+        audioCodec: f.acodec,
+        frameRate: f.fps,
+        durationSecs: f.durationSecs,
+        // yt-dlp's own size, when it had one, is no more exact than the
+        // manifest-derived estimate for HLS — it computes the same way.
+        // The field is named `estimatedBytes` on both paths so the popup
+        // cannot present one as exact and the other as a guess.
+        estimatedBytes: f.filesizeBytes,
       }));
     } catch (err) {
       log.debug("probeMedia failed (expected when the host is down):", err);
@@ -420,7 +437,7 @@ async function buildSnapshot(
 /** Media rows for `tabId` from cache alone — no fetch, no probe, no await. */
 function assembleCachedStreams(tabId: number | null): PopupMediaStream[] {
   const sniffed = tabId == null ? [] : mediaSniffer.getStreamsForTab(tabId);
-  return assembleStreams(sniffed, tabId, (url) => peekVariants(url) ?? []);
+  return assembleStreams(sniffed, tabId, (url) => peekManifest(url) ?? NOTHING_KNOWN);
 }
 
 /**
@@ -439,22 +456,22 @@ async function resolveVariantsForTab(
 ): Promise<void> {
   const sniffed = mediaSniffer.getStreamsForTab(tabId);
   const hls = sniffed.filter((s) => s.kind === "hls");
-  if (hls.every((s) => peekVariants(s.manifestUrl) != null)) return;
+  if (hls.every((s) => peekManifest(s.manifestUrl) != null)) return;
 
-  const resolved = new Map<string, readonly MediaVariant[]>();
+  const resolved = new Map<string, ManifestInfo>();
   await Promise.all(
     hls.map(async (s) => {
       // Each tier is bounded and cached inside `loadVariants`; a non-master
       // (or a failed lookup) yields no variants and renders as a plain row.
-      const variants = await loadVariants(
+      const info = await loadVariants(
         s.manifestUrl,
         tabId,
         makeAppProber(s.pageUrl),
       ).catch((err) => {
         log.debug("loadVariants failed:", err);
-        return [] as readonly MediaVariant[];
+        return NOTHING_KNOWN;
       });
-      resolved.set(s.manifestUrl, variants);
+      resolved.set(s.manifestUrl, info);
     }),
   );
 
@@ -463,7 +480,7 @@ async function resolveVariantsForTab(
   const streams = assembleStreams(
     mediaSniffer.getStreamsForTab(tabId),
     tabId,
-    (url) => resolved.get(url) ?? peekVariants(url) ?? [],
+    (url) => resolved.get(url) ?? peekManifest(url) ?? NOTHING_KNOWN,
   );
   if (sameStreams(streams, alreadySent)) return;
 

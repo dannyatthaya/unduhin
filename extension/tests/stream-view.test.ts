@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { assembleStreams, sameStreams } from "../src/background/stream-view";
+import type { ManifestInfo } from "../src/background/hls-master";
 import type { MediaStream, MediaVariant, PopupMediaStream } from "../src/shared/types";
 
 const TAB_ID = 7;
@@ -24,17 +25,34 @@ function sniffed(manifestUrl: string, over: Partial<MediaStream> = {}): MediaStr
 }
 
 function variant(url: string, height: number): MediaVariant {
-  return { url, height, resolution: `x${height}`, bandwidth: null, label: `${height}p` };
+  return {
+    url,
+    height,
+    resolution: `x${height}`,
+    bandwidth: null,
+    label: `${height}p`,
+    videoCodec: null,
+    audioCodec: null,
+    frameRate: null,
+    durationSecs: null,
+    estimatedBytes: null,
+  };
 }
 
 const MASTER_VARIANTS = [variant(VARIANT_720_URL, 720), variant(VARIANT_480_URL, 480)];
 
+const NOTHING_KNOWN: ManifestInfo = { variants: [], durationSecs: null };
+
 /** Stand-in for the resolved state: the master knows its qualities. */
-const resolved = (url: string): readonly MediaVariant[] =>
-  url === MASTER_URL ? MASTER_VARIANTS : [];
+const resolved = (url: string): ManifestInfo =>
+  url === MASTER_URL ? { variants: MASTER_VARIANTS, durationSecs: null } : NOTHING_KNOWN;
 
 /** Stand-in for the cold cache: nothing has resolved yet. */
-const unresolved = (): readonly MediaVariant[] => [];
+const unresolved = (): ManifestInfo => NOTHING_KNOWN;
+
+/** A media playlist that resolved: no renditions to choose between, but
+ *  a real length. This is the plain row that used to carry no facts. */
+const plainWithDuration = (): ManifestInfo => ({ variants: [], durationSecs: 754 });
 
 describe("assembleStreams", () => {
   it("attaches a master's qualities and drops the twin row for its rendition", () => {
@@ -80,6 +98,19 @@ describe("assembleStreams", () => {
     expect(streams.map((s) => s.manifestUrl)).toEqual([url]);
   });
 
+  it("carries a media playlist's duration onto its plain row", () => {
+    const [stream] = assembleStreams([sniffed(MASTER_URL)], TAB_ID, plainWithDuration);
+
+    expect(stream).not.toHaveProperty("variants");
+    expect(stream!.durationSecs).toBe(754);
+  });
+
+  it("omits `durationSecs` entirely when no duration is known", () => {
+    const [stream] = assembleStreams([sniffed(MASTER_URL)], TAB_ID, unresolved);
+
+    expect(stream).not.toHaveProperty("durationSecs");
+  });
+
   it("falls back to the supplied tabId when the stream carries none", () => {
     const [stream] = assembleStreams(
       [sniffed(MASTER_URL, { tabId: null })],
@@ -106,5 +137,14 @@ describe("sameStreams", () => {
 
   it("separates lists of different length", () => {
     expect(sameStreams(grouped, [])).toBe(false);
+  });
+
+  it("separates a plain row that learned a duration from one that has none", () => {
+    // Both lists hold one row with no variants. Only the duration
+    // differs, and suppressing that broadcast would leave the row blank
+    // for as long as the popup stays open.
+    const withDuration = assembleStreams([sniffed(MASTER_URL)], TAB_ID, plainWithDuration);
+
+    expect(sameStreams(plain, withDuration)).toBe(false);
   });
 });

@@ -25,6 +25,7 @@ import type {
   BridgeStatus,
   BridgeStatusMessage,
   MediaStreamsMessage,
+  MediaVariant,
   PopupDownloadMediaRequest,
   PopupDownloadMediaResponse,
   PopupMediaStream,
@@ -34,6 +35,13 @@ import type {
   PopupSnapshotResponse,
 } from "../shared/types.js";
 import { RECENT_JOBS_KEY } from "../background/recent-jobs.js";
+import {
+  codecName,
+  formatBitrate,
+  formatBytes,
+  formatDuration,
+  formatFrameRate,
+} from "../shared/format.js";
 
 const STATUS_LABEL: Record<BridgeStatus, string> = {
   connected: "Connected to Unduhin",
@@ -135,9 +143,13 @@ function renderMedia(streams: readonly PopupMediaStream[]): void {
       els.mediaList.appendChild(buildGroupHeader(stream));
       for (const v of variants) {
         els.mediaList.appendChild(
-          buildDownloadRow(v.label, v.resolution ?? stream.kind.toUpperCase(), v.url, {
-            manifestUrl: v.url,
-            masterUrl: stream.manifestUrl,
+          buildDownloadRow({
+            name: v.label,
+            titleAttr: v.url,
+            chips: variantChips(v, stream),
+            size: v.estimatedBytes,
+            durationSecs: v.durationSecs,
+            req: { manifestUrl: v.url, masterUrl: stream.manifestUrl },
           }),
         );
       }
@@ -147,12 +159,42 @@ function renderMedia(streams: readonly PopupMediaStream[]): void {
           ? stream.suggestedFilename
           : stream.manifestUrl;
       els.mediaList.appendChild(
-        buildDownloadRow(name, stream.kind.toUpperCase(), stream.manifestUrl, {
-          manifestUrl: stream.manifestUrl,
+        buildDownloadRow({
+          name,
+          titleAttr: stream.manifestUrl,
+          chips: [stream.kind.toUpperCase()],
+          // A plain stream has no bit rate to estimate a size from, so
+          // only the duration is ever known here.
+          size: null,
+          durationSecs: stream.durationSecs ?? null,
+          req: { manifestUrl: stream.manifestUrl },
         }),
       );
     }
   }
+}
+
+/**
+ * The facts shown under one quality's name, in order of how often the
+ * user needs them: pixel size, then frame rate, then bit rate, then the
+ * two codecs.
+ *
+ * Each fact is its own chip. There is no separator glyph between them —
+ * the gap does that job, and a chip that is not known is simply absent
+ * rather than a dash the user has to read past.
+ */
+function variantChips(
+  variant: MediaVariant,
+  stream: PopupMediaStream,
+): string[] {
+  const chips = [
+    variant.resolution ?? stream.kind.toUpperCase(),
+    formatFrameRate(variant.frameRate),
+    formatBitrate(variant.bandwidth),
+    codecName(variant.videoCodec),
+    codecName(variant.audioCodec),
+  ];
+  return chips.filter((c): c is string => c != null && c.length > 0);
 }
 
 function buildGroupHeader(stream: PopupMediaStream): HTMLLIElement {
@@ -162,43 +204,75 @@ function buildGroupHeader(stream: PopupMediaStream): HTMLLIElement {
     stream.suggestedFilename && stream.suggestedFilename.length > 0
       ? stream.suggestedFilename
       : "Adaptive stream";
-  li.textContent = `${label} · ${stream.kind.toUpperCase()}`;
+  li.append(
+    textSpan("media-list__group-name", label),
+    textSpan("media-list__group-kind", stream.kind.toUpperCase()),
+  );
+  li.title = stream.manifestUrl;
   return li;
 }
 
-function buildDownloadRow(
-  name: string,
-  meta: string,
-  titleAttr: string,
-  req: { manifestUrl: string; masterUrl?: string },
-): HTMLLIElement {
+interface RowSpec {
+  readonly name: string;
+  readonly titleAttr: string;
+  readonly chips: readonly string[];
+  /** Estimated bytes, or null when no estimate is possible. */
+  readonly size: number | null;
+  readonly durationSecs: number | null;
+  readonly req: { manifestUrl: string; masterUrl?: string };
+}
+
+function buildDownloadRow(spec: RowSpec): HTMLLIElement {
   const li = document.createElement("li");
   li.className = "media-list__item";
 
   const main = document.createElement("div");
   main.className = "media-list__main";
 
-  const nameEl = document.createElement("span");
-  nameEl.className = "media-list__name";
-  nameEl.textContent = name;
-  nameEl.title = titleAttr;
+  const nameEl = textSpan("media-list__name", spec.name);
+  nameEl.title = spec.titleAttr;
 
   const metaEl = document.createElement("span");
   metaEl.className = "media-list__meta";
-  metaEl.textContent = meta;
+  for (const chip of spec.chips) {
+    metaEl.appendChild(textSpan("media-list__chip", chip));
+  }
 
   main.append(nameEl, metaEl);
+
+  // Size and length sit in their own column, right-aligned, because they
+  // are the two numbers the user compares between rows. Lining them up
+  // makes "which of these is the small one" a glance instead of a read.
+  const figures = document.createElement("div");
+  figures.className = "media-list__figures";
+  const size = formatBytes(spec.size);
+  if (size) {
+    const sizeEl = textSpan("media-list__size", `~${size}`);
+    // The tilde is easy to miss, so say it in full for anyone hovering
+    // or using a screen reader.
+    sizeEl.title = "Estimated from the stream bit rate. The real size can differ.";
+    figures.appendChild(sizeEl);
+  }
+  const duration = formatDuration(spec.durationSecs);
+  if (duration) figures.appendChild(textSpan("media-list__duration", duration));
 
   const button = document.createElement("button");
   button.type = "button";
   button.className = "button";
   button.textContent = "Download";
   button.addEventListener("click", () => {
-    void requestDownloadMedia(req, button);
+    void requestDownloadMedia(spec.req, button);
   });
 
-  li.append(main, button);
+  li.append(main, figures, button);
   return li;
+}
+
+function textSpan(className: string, text: string): HTMLSpanElement {
+  const el = document.createElement("span");
+  el.className = className;
+  el.textContent = text;
+  return el;
 }
 
 function renderRecent(jobs: readonly PopupRecentJob[]): void {

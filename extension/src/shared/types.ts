@@ -86,8 +86,36 @@ export interface MediaVariant {
   readonly url: string;
   readonly height: number | null;
   readonly resolution: string | null;
+  /** Bits per second. From an HLS `AVERAGE-BANDWIDTH` when the manifest
+   *  states one, else its `BANDWIDTH` peak, else yt-dlp's `tbr`. */
   readonly bandwidth: number | null;
   readonly label: string;
+  /** Raw codec identifiers (`avc1.640028`, `mp4a.40.2`). Mapped to short
+   *  names by `codecName` at render time, not here — the popup is the
+   *  only reader, and holding the raw value keeps the row honest when the
+   *  name table does not know a codec yet. */
+  readonly videoCodec: string | null;
+  readonly audioCodec: string | null;
+  readonly frameRate: number | null;
+  /**
+   * Length of the media in seconds, or null when it is not known.
+   *
+   * A master playlist never states this. The extension learns it by
+   * fetching one rendition's media playlist and adding up its `#EXTINF`
+   * segment durations — see `probeDuration` in `hls-master.ts`. A live
+   * stream has no end and so keeps this null.
+   */
+  readonly durationSecs: number | null;
+  /**
+   * Transfer size in bytes, or null when it is not known.
+   *
+   * This is an ESTIMATE for anything that came from a manifest: HLS
+   * states a bit rate, not a size, so the value is bandwidth times
+   * duration. The popup labels it with a "~" for that reason. Real
+   * encodes vary around their advertised bit rate, so treat it as the
+   * right order of magnitude and not as an exact byte count.
+   */
+  readonly estimatedBytes: number | null;
 }
 
 /** A media stream surfaced to the popup. Mirrors the wire `MediaStream` but
@@ -102,6 +130,16 @@ export interface PopupMediaStream {
    * the popup offers as individual rows. Absent/empty for a plain media
    * playlist. */
   readonly variants?: readonly MediaVariant[];
+  /**
+   * Length of the media in seconds. Present when resolution learned one.
+   *
+   * This exists for the PLAIN row — a media playlist with no alternate
+   * renditions, which has a real duration but no variant to carry it. A
+   * row built from `variants` reads the duration off the variant it
+   * renders, because that variant also carries the size estimate that
+   * goes with it.
+   */
+  readonly durationSecs?: number;
 }
 
 /** A recent download/downloadMedia job remembered for the popup. The ring

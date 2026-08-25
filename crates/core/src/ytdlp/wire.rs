@@ -131,7 +131,10 @@ impl RawInfo {
     ///
     /// [`into_probe`]: RawInfo::into_probe
     pub(super) fn into_media_formats(self) -> Vec<MediaFormat> {
-        media_formats_from_raw(&self.formats)
+        // `duration` is top-level, not per-format, so it has to be read
+        // here and pushed down onto every row.
+        let duration_secs = self.duration.filter(|d| *d > 0.0).map(|d| d as u32);
+        media_formats_from_raw(&self.formats, duration_secs)
     }
 }
 
@@ -183,7 +186,7 @@ fn derive_resolution(raw: &RawFormat) -> Option<String> {
 ///   standalone audio-extraction surface.
 /// - Duplicate URLs are deduped, keeping the first-seen entry (yt-dlp's
 ///   own array ordering).
-fn media_formats_from_raw(formats: &[RawFormat]) -> Vec<MediaFormat> {
+fn media_formats_from_raw(formats: &[RawFormat], duration_secs: Option<u32>) -> Vec<MediaFormat> {
     let mut seen_urls = std::collections::HashSet::new();
     let mut out: Vec<MediaFormat> = formats
         .iter()
@@ -193,17 +196,33 @@ fn media_formats_from_raw(formats: &[RawFormat]) -> Vec<MediaFormat> {
             if !seen_urls.insert(url.clone()) {
                 return None;
             }
+            // yt-dlp's `tbr` is total bitrate in kbps; `bandwidth`
+            // mirrors the bits/sec unit of an HLS manifest's
+            // `EXT-X-STREAM-INF:BANDWIDTH` attribute, which is what
+            // the extension's own sniffed formats carry — keeping the
+            // unit consistent is what makes the descending sort below
+            // actually comparable across the two discovery paths.
+            let bandwidth = f.tbr.map(|kbps| (kbps.max(0.0) * 1000.0).round() as u64);
+            // yt-dlp leaves both size fields empty on most HLS formats.
+            // Fall back to the same bitrate x duration estimate the
+            // extension's own manifest parser uses, so the two discovery
+            // paths agree instead of one showing a size and the other a
+            // blank. Both are estimates either way — `filesize_approx` is
+            // itself derived from the bitrate.
+            let filesize_bytes = f
+                .filesize
+                .or(f.filesize_approx)
+                .or_else(|| estimate_bytes(bandwidth, duration_secs));
             Some(MediaFormat {
                 url,
                 height: f.height,
                 resolution: derive_resolution(f),
-                // yt-dlp's `tbr` is total bitrate in kbps; `bandwidth`
-                // mirrors the bits/sec unit of an HLS manifest's
-                // `EXT-X-STREAM-INF:BANDWIDTH` attribute, which is what
-                // the extension's own sniffed formats carry — keeping the
-                // unit consistent is what makes the descending sort below
-                // actually comparable across the two discovery paths.
-                bandwidth: f.tbr.map(|kbps| (kbps.max(0.0) * 1000.0).round() as u64),
+                bandwidth,
+                filesize_bytes,
+                duration_secs,
+                fps: f.fps.filter(|v| *v > 0.0).map(|v| v.round() as u32),
+                vcodec: f.vcodec.clone().filter(|c| c != "none"),
+                acodec: f.acodec.clone().filter(|c| c != "none"),
             })
         })
         .collect();
@@ -215,6 +234,20 @@ fn media_formats_from_raw(formats: &[RawFormat]) -> Vec<MediaFormat> {
             .then(b.bandwidth.unwrap_or(0).cmp(&a.bandwidth.unwrap_or(0)))
     });
     out
+}
+
+/// Transfer size implied by a constant `bandwidth` (bits/sec) held for
+/// `duration_secs`. Used only when yt-dlp reported no size of its own.
+/// The result is an estimate: a real encode's bitrate varies around its
+/// advertised value, so the caller must present it as approximate.
+///
+/// Saturating arithmetic, not a plain multiply: `bandwidth` comes from
+/// yt-dlp's parse of a manifest the site controls, so a malformed or
+/// hostile value must clamp rather than overflow.
+fn estimate_bytes(bandwidth: Option<u64>, duration_secs: Option<u32>) -> Option<u64> {
+    let bits_per_sec = bandwidth.filter(|b| *b > 0)?;
+    let secs = duration_secs.filter(|d| *d > 0)?;
+    Some(bits_per_sec.saturating_mul(u64::from(secs)) / 8)
 }
 
 fn is_video_only(f: &RawFormat) -> bool {
@@ -493,6 +526,82 @@ mod tests {
         );
         // tbr (kbps) is converted to bandwidth (bits/sec): 6000 kbps -> 6_000_000.
         assert_eq!(formats[0].bandwidth, Some(6_000_000));
+    }
+
+    #[test]
+    fn media_formats_carry_size_duration_fps_and_codecs() {
+        let json = r#"{
+            "extractor": "generic",
+            "title": "t",
+            "duration": 3600.0,
+            "formats": [
+                {"format_id": "v", "vcodec": "avc1.640028", "acodec": "mp4a.40.2",
+                 "height": 1080, "fps": 29.97, "tbr": 6000.0, "filesize": 4500000000,
+                 "url": "https://cdn.example.com/1080.m3u8"}
+            ]
+        }"#;
+        let raw: RawInfo = serde_json::from_str(json).unwrap();
+        let formats = raw.into_media_formats();
+        assert_eq!(formats[0].filesize_bytes, Some(4_500_000_000));
+        assert_eq!(formats[0].duration_secs, Some(3600));
+        assert_eq!(formats[0].fps, Some(30));
+        assert_eq!(formats[0].vcodec.as_deref(), Some("avc1.640028"));
+        assert_eq!(formats[0].acodec.as_deref(), Some("mp4a.40.2"));
+    }
+
+    #[test]
+    fn media_formats_estimate_size_when_ytdlp_reports_none() {
+        // The HLS norm: yt-dlp knows the bitrate and the duration but not
+        // the size. 6000 kbps for 3600 s is 6_000_000 * 3600 / 8 bytes.
+        let json = r#"{
+            "extractor": "generic",
+            "title": "t",
+            "duration": 3600.0,
+            "formats": [
+                {"format_id": "v", "vcodec": "avc1", "acodec": "aac", "height": 1080,
+                 "tbr": 6000.0, "url": "https://cdn.example.com/1080.m3u8"}
+            ]
+        }"#;
+        let raw: RawInfo = serde_json::from_str(json).unwrap();
+        let formats = raw.into_media_formats();
+        assert_eq!(formats[0].filesize_bytes, Some(2_700_000_000));
+    }
+
+    #[test]
+    fn media_formats_leave_size_unknown_without_a_duration() {
+        // A live stream, or an extractor that reports no duration: an
+        // estimate is impossible, so the field stays empty rather than
+        // showing a wrong number.
+        let json = r#"{
+            "extractor": "generic",
+            "title": "t",
+            "formats": [
+                {"format_id": "v", "vcodec": "avc1", "acodec": "aac", "height": 1080,
+                 "tbr": 6000.0, "url": "https://cdn.example.com/1080.m3u8"}
+            ]
+        }"#;
+        let raw: RawInfo = serde_json::from_str(json).unwrap();
+        let formats = raw.into_media_formats();
+        assert_eq!(formats[0].filesize_bytes, None);
+        assert_eq!(formats[0].duration_secs, None);
+    }
+
+    #[test]
+    fn media_formats_drop_the_none_codec_sentinel() {
+        // yt-dlp writes the string "none", not null, for a missing track.
+        // Passing that through would print "none" as a codec name.
+        let json = r#"{
+            "extractor": "generic",
+            "title": "t",
+            "formats": [
+                {"format_id": "v", "vcodec": "avc1", "acodec": "none", "height": 720,
+                 "url": "https://cdn.example.com/720.m3u8"}
+            ]
+        }"#;
+        let raw: RawInfo = serde_json::from_str(json).unwrap();
+        let formats = raw.into_media_formats();
+        assert_eq!(formats[0].vcodec.as_deref(), Some("avc1"));
+        assert_eq!(formats[0].acodec, None);
     }
 
     #[test]

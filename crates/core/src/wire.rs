@@ -147,9 +147,19 @@ pub struct MediaStream {
 /// `wire.d.ts` type wholesale, so a same-named export here would collide
 /// as a duplicate TS identifier and break the extension's typecheck.
 ///
-/// No `label` field on purpose — computing a display label (e.g. "1080p ·
-/// 4.2 Mbps") from `height`/`bandwidth` stays single-sourced in the
-/// extension's TS, not duplicated here.
+/// No `label` field on purpose — computing a display label (e.g. "1080p"
+/// plus "4.2 Mbps") from `height`/`bandwidth` stays single-sourced in the
+/// extension's TS, not duplicated here. The same applies to the size and
+/// duration fields below: this type carries the numbers, the extension
+/// formats them.
+///
+/// The size/duration/codec fields exist so a format discovered through
+/// this probe carries the same facts as one the extension parsed out of
+/// an HLS master playlist itself. Without them a stream that only the
+/// probe can reach (hotlink-protected CDN) would render a row with no
+/// size and no length, while the same stream on a permissive CDN renders
+/// a full one — the same picker showing two different amounts of detail
+/// for no reason the user can see.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-rs-export", derive(TS))]
 #[cfg_attr(feature = "ts-rs-export", ts(export, export_to = "wire.d.ts"))]
@@ -161,6 +171,27 @@ pub struct MediaFormat {
     pub resolution: Option<String>,
     #[cfg_attr(feature = "ts-rs-export", ts(type = "number | null"))]
     pub bandwidth: Option<u64>,
+    /// Transfer size in bytes. yt-dlp's exact `filesize` when it has one,
+    /// otherwise its own `filesize_approx` estimate. `None` when yt-dlp
+    /// reported neither — common for HLS, where no size is knowable
+    /// without walking every segment.
+    #[cfg_attr(feature = "ts-rs-export", ts(type = "number | null"))]
+    pub filesize_bytes: Option<u64>,
+    /// Length of the media in seconds, from yt-dlp's top-level
+    /// `duration`. The same value on every format of one probe: the
+    /// renditions of an adaptive stream are the same content at
+    /// different bitrates.
+    #[cfg_attr(feature = "ts-rs-export", ts(type = "number | null"))]
+    pub duration_secs: Option<u32>,
+    #[cfg_attr(feature = "ts-rs-export", ts(type = "number | null"))]
+    pub fps: Option<u32>,
+    /// Raw codec identifiers, exactly as yt-dlp reports them (e.g.
+    /// `avc1.640028`, `mp4a.40.2`). The extension maps these to short
+    /// names such as "H.264" — a mapping that must stay in one place,
+    /// and that place is the extension, because its own manifest parser
+    /// produces the same identifiers from an HLS `CODECS` attribute.
+    pub vcodec: Option<String>,
+    pub acodec: Option<String>,
 }
 
 /// A BitTorrent download captured by the extension — a clicked
@@ -797,12 +828,21 @@ mod tests {
                 height: Some(1080),
                 resolution: Some("1920x1080".into()),
                 bandwidth: Some(6_000_000),
+                filesize_bytes: Some(4_500_000_000),
+                duration_secs: Some(6_000),
+                fps: Some(30),
+                vcodec: Some("avc1.640028".into()),
+                acodec: Some("mp4a.40.2".into()),
             }],
         };
         let s = roundtrip(&msg);
         assert!(s.contains("\"type\": \"mediaFormats\""));
         assert!(s.contains("\"height\": 1080"));
         assert!(s.contains("\"bandwidth\": 6000000"));
+        assert!(s.contains("\"filesizeBytes\": 4500000000"));
+        assert!(s.contains("\"durationSecs\": 6000"));
+        assert!(s.contains("\"fps\": 30"));
+        assert!(s.contains("\"vcodec\": \"avc1.640028\""));
         // No `label` field — that stays computed on the TS side.
         assert!(!s.contains("\"label\""));
     }

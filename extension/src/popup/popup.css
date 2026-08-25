@@ -153,13 +153,32 @@ body {
 }
 
 .media-list__group {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
   padding: 6px 4px 0;
   font-size: 11px;
   font-weight: 600;
   color: hsl(var(--muted-foreground));
+}
+
+.media-list__group-name {
+  min-width: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* The container format sits in a pill so it reads as a tag on the group
+   rather than as part of the file name. Replaces the "name · HLS" run,
+   which needed a separator glyph to keep the two apart. */
+.media-list__group-kind {
+  flex: none;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: hsl(var(--muted));
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
 }
 
 .media-list__name,
@@ -179,6 +198,38 @@ body {
   color: hsl(var(--muted-foreground));
   text-transform: uppercase;
   letter-spacing: 0.04em;
+}
+
+/* Facts about one quality — pixel size, frame rate, bit rate, codecs.
+   The gap separates them, so no separator glyph is drawn between them.
+   They wrap rather than truncate: a row that hid its codec behind an
+   ellipsis would defeat the point of showing it. */
+.media-list__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 7px;
+}
+
+.media-list__chip {
+  white-space: nowrap;
+}
+
+/* Size and length, right-aligned in their own column so the numbers line
+   up between rows and can be compared at a glance. */
+.media-list__figures {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 1px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: hsl(var(--muted-foreground));
+}
+
+.media-list__size {
+  font-weight: 600;
+  color: hsl(var(--foreground));
 }
 
 .recent-list__status {
