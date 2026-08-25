@@ -1082,6 +1082,37 @@ async fn run_worker(
                 }
             };
             if let Some(from) = from {
+                // Last check before the row goes green: is the file actually
+                // in its category's folder? Everything above relocates only
+                // as a side effect of learning a better NAME, so a row whose
+                // category changed while it downloaded — the user
+                // recategorized an active row, or a mid-flight reroute never
+                // got its move — finishes with the label naming one folder
+                // and the bytes sitting in another. This is the one step
+                // that checks the folder on its own.
+                //
+                // Inside the `from` guard, so a cancel that landed in the
+                // last moment does not get its partial file moved. Before
+                // `mark_completed`, so the row is never briefly visible as
+                // completed at a path it is about to leave. Torrents opt out
+                // inside the function (their output path is a directory
+                // tree), as does any file the user placed at an explicit
+                // path.
+                match download::reconcile_category_folder(&pool, id).await {
+                    Ok(Some((filename, path))) => {
+                        let _ = events.send(CoreEvent::PathsChanged {
+                            id,
+                            filename,
+                            output_path: path.to_string_lossy().into_owned(),
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!(
+                        id, error = %e,
+                        "queue: failed to reconcile the download's category folder"
+                    ),
+                }
+
                 tracing::info!(id, ?from, bytes = summary.bytes, "queue: marking completed");
                 if let Err(e) = download::mark_completed(&pool, id, summary.bytes).await {
                     tracing::warn!(id, error = %e, "queue: mark_completed failed");

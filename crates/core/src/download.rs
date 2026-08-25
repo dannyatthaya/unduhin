@@ -1234,7 +1234,9 @@ pub(crate) async fn transition_status(
 ///  - the download is a **torrent** — `output_path` is a content DIRECTORY (a
 ///    whole tree), and relocating that on a recategorize is out of scope;
 ///  - it is **active / muxing** — the worker owns a live file handle and moving
-///    it underneath would corrupt the transfer;
+///    it underneath would corrupt the transfer. The move is deferred, not
+///    dropped: [`reconcile_category_folder`] runs on every completion and
+///    performs it once the worker has let go;
 ///  - **no file exists on disk yet** (a fresh `queued` row) — nothing to move;
 ///  - the file is **already in the target folder**.
 pub(crate) async fn set_category(
@@ -1596,6 +1598,118 @@ pub(crate) async fn apply_engine_filename(
         category_id: new_category,
         category_changed: new_category != current_category,
     }))
+}
+
+/// Move a finished download into its category's folder when it is not
+/// already there, and report what moved.
+///
+/// This is the backstop for every way a row's category can stop agreeing
+/// with the file's location while the download is running:
+///
+///  - The user recategorized an active row. [`set_category`] updates the
+///    label but deliberately does NOT move a file the worker still holds
+///    open, so the move has to happen later — here.
+///  - [`mark_learned_filename`] rerouted the row mid-flight and the
+///    completion-time [`apply_engine_filename`] then found nothing to
+///    rename, so it never reached its own relocate step.
+///  - The engine reported no filename hint at all, so the whole
+///    learned-name path (the only other thing that relocates) never ran.
+///
+/// It runs on every completed non-torrent download, so it must not move a
+/// file the user placed somewhere deliberately. The test for that is the
+/// folder the file is in right now: [`is_app_managed_folder`] recognizes
+/// the folders this app routes into on its own. A file in one of those got
+/// there by our routing and is ours to correct. A file anywhere else was
+/// put there by an explicit output path, and stays put.
+///
+/// Returns `Some((filename, new_path))` when the file moved, `None` when
+/// nothing needed to change or the move failed. Never an error for an IO
+/// failure: a download that finished must not be reported as failed
+/// because a tidy-up move did not work.
+pub(crate) async fn reconcile_category_folder(
+    pool: &SqlitePool,
+    id: DownloadId,
+) -> Result<Option<(String, PathBuf)>> {
+    let record = get(pool, id).await?;
+    // A torrent's `output_path` is a content DIRECTORY, not a file.
+    // Relocating a whole tree on a recategorize is out of scope here, the
+    // same as it is in `set_category`.
+    if record.kind == DownloadKind::Torrent {
+        return Ok(None);
+    }
+
+    let current_path = record.output_path.clone();
+    if tokio::fs::metadata(&current_path).await.is_err() {
+        return Ok(None);
+    }
+    let Some(current_folder) = current_path.parent() else {
+        return Ok(None);
+    };
+
+    let target_folder = category_target_folder(pool, record.category_id).await?;
+    if current_folder == target_folder.as_path() {
+        return Ok(None);
+    }
+    if !is_app_managed_folder(pool, current_folder).await? {
+        return Ok(None);
+    }
+
+    let new_path = move_into_folder(&current_path, &target_folder).await;
+    if new_path == current_path {
+        // No-op or an IO failure. `move_into_folder` returns the source
+        // path on failure, so the row still points at the real file.
+        return Ok(None);
+    }
+
+    // Carry the sidecar so a resumable row survives the move. Best-effort:
+    // a completed file usually has none.
+    let old_sidecar = engine::Meta::sidecar_path(&current_path);
+    if tokio::fs::metadata(&old_sidecar).await.is_ok() {
+        let _ = tokio::fs::rename(&old_sidecar, &engine::Meta::sidecar_path(&new_path)).await;
+    }
+
+    let final_name = new_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| record.filename.clone());
+    sqlx::query("UPDATE downloads SET output_path = ?, filename = ? WHERE id = ?")
+        .bind(new_path.to_string_lossy().as_ref())
+        .bind(&final_name)
+        .bind(id)
+        .execute(pool)
+        .await?;
+
+    tracing::info!(
+        id,
+        from = %current_path.display(),
+        to = %new_path.display(),
+        "moved completed download into its category folder"
+    );
+    Ok(Some((final_name, new_path)))
+}
+
+/// True when `folder` is one this app routes downloads into by itself: a
+/// category's configured folder, the global `default_output_path`, or the
+/// user's Downloads folder.
+///
+/// This is what separates "the app put the file here" from "the user asked
+/// for the file here". Only the first is safe to correct automatically.
+async fn is_app_managed_folder(pool: &SqlitePool, folder: &Path) -> Result<bool> {
+    for cat in crate::category::list(pool).await? {
+        if let Some(configured) = cat.default_output_path {
+            if !configured.as_os_str().is_empty() && configured == folder {
+                return Ok(true);
+            }
+        }
+    }
+    let global = crate::settings::get(pool, "default_output_path")
+        .await?
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .filter(|s| !s.is_empty());
+    if global.is_some_and(|g| Path::new(&g) == folder) {
+        return Ok(true);
+    }
+    Ok(crate::fallback_download_dir() == folder)
 }
 
 /// Resolve the folder a download in `category_id` should live in: the
@@ -4025,5 +4139,190 @@ mod tests {
                 .await
                 .unwrap();
         assert!(torrent.is_none(), "no torrent blob fabricated");
+    }
+
+    // --- reconcile_category_folder -------------------------------------
+
+    /// Point a category at `folder` and return its id.
+    async fn category_in(pool: &SqlitePool, name: &str, folder: &Path) -> i64 {
+        let cat = crate::category::find_by_name(pool, name)
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query("UPDATE categories SET default_output_path = ? WHERE id = ?")
+            .bind(folder.to_string_lossy().as_ref())
+            .bind(cat.id)
+            .execute(pool)
+            .await
+            .unwrap();
+        cat.id
+    }
+
+    #[tokio::test]
+    async fn reconcile_moves_a_row_recategorized_while_it_downloaded() {
+        // The reported symptom. The user recategorized the row from Video to
+        // Music while it was still active, so `set_category` updated the
+        // label and left the file alone — the worker still held it open.
+        // Nothing else ever moved it, so the row said Music and the bytes
+        // sat in the Video folder forever.
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let video_dir = tmp.path().join("Video");
+        let music_dir = tmp.path().join("Music");
+        tokio::fs::create_dir_all(&video_dir).await.unwrap();
+        let _video = category_in(&pool, "Video", &video_dir).await;
+        let music = category_in(&pool, "Music", &music_dir).await;
+
+        let on_disk = video_dir.join("track.mp3");
+        tokio::fs::write(&on_disk, b"bytes").await.unwrap();
+        let id = seed_row_with_url(
+            &pool,
+            "https://example.com/track.mp3",
+            "track.mp3",
+            on_disk.to_str().unwrap(),
+            Some(music),
+        )
+        .await;
+
+        let (name, path) = reconcile_category_folder(&pool, id)
+            .await
+            .unwrap()
+            .expect("the file is not in the Music folder, so it must move");
+
+        assert_eq!(name, "track.mp3");
+        assert_eq!(path, music_dir.join("track.mp3"));
+        assert!(tokio::fs::metadata(&path).await.is_ok());
+        assert!(tokio::fs::metadata(&on_disk).await.is_err());
+
+        let stored: String = sqlx::query_scalar("SELECT output_path FROM downloads WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(PathBuf::from(stored), path);
+    }
+
+    #[tokio::test]
+    async fn reconcile_leaves_a_file_at_a_user_chosen_path_alone() {
+        // The row was added with an explicit output path outside every
+        // managed folder. The category label is only a label here — moving
+        // the file would override what the user asked for.
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let video_dir = tmp.path().join("Video");
+        let elsewhere = tmp.path().join("Projects").join("raw");
+        tokio::fs::create_dir_all(&elsewhere).await.unwrap();
+        let video = category_in(&pool, "Video", &video_dir).await;
+
+        let on_disk = elsewhere.join("clip.mp4");
+        tokio::fs::write(&on_disk, b"bytes").await.unwrap();
+        let id = seed_row_with_url(
+            &pool,
+            "https://example.com/clip.mp4",
+            "clip.mp4",
+            on_disk.to_str().unwrap(),
+            Some(video),
+        )
+        .await;
+
+        assert!(reconcile_category_folder(&pool, id).await.unwrap().is_none());
+        assert!(tokio::fs::metadata(&on_disk).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn reconcile_is_a_no_op_when_the_file_is_already_in_place() {
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let video_dir = tmp.path().join("Video");
+        tokio::fs::create_dir_all(&video_dir).await.unwrap();
+        let video = category_in(&pool, "Video", &video_dir).await;
+
+        let on_disk = video_dir.join("clip.mp4");
+        tokio::fs::write(&on_disk, b"bytes").await.unwrap();
+        let id = seed_row_with_url(
+            &pool,
+            "https://example.com/clip.mp4",
+            "clip.mp4",
+            on_disk.to_str().unwrap(),
+            Some(video),
+        )
+        .await;
+
+        assert!(reconcile_category_folder(&pool, id).await.unwrap().is_none());
+        assert!(tokio::fs::metadata(&on_disk).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn reconcile_dedupes_against_a_file_already_in_the_target() {
+        // The target folder already holds a `clip.mp4` from an unrelated
+        // download. The move must not overwrite it, and the row's display
+        // name must follow the name that actually landed on disk.
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let other_dir = tmp.path().join("Other");
+        let video_dir = tmp.path().join("Video");
+        tokio::fs::create_dir_all(&other_dir).await.unwrap();
+        tokio::fs::create_dir_all(&video_dir).await.unwrap();
+        let _other = category_in(&pool, "Other", &other_dir).await;
+        let video = category_in(&pool, "Video", &video_dir).await;
+
+        tokio::fs::write(video_dir.join("clip.mp4"), b"existing")
+            .await
+            .unwrap();
+        let on_disk = other_dir.join("clip.mp4");
+        tokio::fs::write(&on_disk, b"new bytes").await.unwrap();
+        let id = seed_row_with_url(
+            &pool,
+            "https://example.com/clip.mp4",
+            "clip.mp4",
+            on_disk.to_str().unwrap(),
+            Some(video),
+        )
+        .await;
+
+        let (name, path) = reconcile_category_folder(&pool, id)
+            .await
+            .unwrap()
+            .expect("must move into the Video folder");
+
+        assert_eq!(name, "clip (1).mp4");
+        assert_eq!(path, video_dir.join("clip (1).mp4"));
+        assert_eq!(
+            tokio::fs::read_to_string(video_dir.join("clip.mp4"))
+                .await
+                .unwrap(),
+            "existing",
+            "the file already in the target folder must survive untouched"
+        );
+
+        let name_in_db: String = sqlx::query_scalar("SELECT filename FROM downloads WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(name_in_db, "clip (1).mp4");
+    }
+
+    #[tokio::test]
+    async fn reconcile_ignores_a_row_whose_file_is_gone() {
+        // A failed or externally-deleted download has nothing to move, and
+        // must not be reported as an error.
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let video_dir = tmp.path().join("Video");
+        let other_dir = tmp.path().join("Other");
+        let video = category_in(&pool, "Video", &video_dir).await;
+        let _other = category_in(&pool, "Other", &other_dir).await;
+
+        let id = seed_row_with_url(
+            &pool,
+            "https://example.com/gone.mp4",
+            "gone.mp4",
+            other_dir.join("gone.mp4").to_str().unwrap(),
+            Some(video),
+        )
+        .await;
+
+        assert!(reconcile_category_folder(&pool, id).await.unwrap().is_none());
     }
 }
