@@ -199,16 +199,57 @@ function findHeader(
   return undefined;
 }
 
-function deriveFilename(url: string, kind: MediaKind): string | null {
+/**
+ * Manifest basenames that identify nothing. Nearly every adaptive stream
+ * on the internet names its media playlists one of these, so two
+ * renditions of one video arrive with the same name.
+ */
+const GENERIC_BASENAMES = new Set([
+  "video",
+  "index",
+  "playlist",
+  "master",
+  "media",
+  "stream",
+  "chunklist",
+  "manifest",
+  "audio",
+]);
+
+/**
+ * A path segment that reads as a quality label — `720p`, `1080P`,
+ * `1280x720`.
+ *
+ * Deliberately narrow. The folder above a manifest is only worth
+ * borrowing a name from when it actually describes the rendition; the
+ * common alternative is an opaque id (`/db3324d5-6caa-.../playlist.m3u8`),
+ * and a UUID on a row is worse than the generic word it replaced.
+ */
+const QUALITY_SEGMENT = /^(\d{2,4}p|\d{2,5}x\d{2,5})$/i;
+
+export function deriveFilename(url: string, kind: MediaKind): string | null {
   try {
     const u = new URL(url);
-    const tail = u.pathname.split("/").filter(Boolean).pop();
+    const segments = u.pathname.split("/").filter(Boolean);
+    const tail = segments.pop();
     if (!tail) return null;
     const decoded = decodeURIComponent(tail);
     // Strip the manifest extension so yt-dlp / the engine pick something
     // sensible. Keep the basename so the user recognises it.
     const base = decoded.replace(/\.(m3u8|mpd)(\?.*)?$/i, "");
-    return base.length > 0 ? base : kind;
+    if (base.length === 0) return kind;
+    // `…/720p/video.m3u8` and `…/480p/video.m3u8` both reduce to "video",
+    // so a master whose renditions could not be resolved renders as two
+    // identical rows. Take the name from the folder when the folder is a
+    // quality label, which is the case that produces the collision.
+    if (GENERIC_BASENAMES.has(base.toLowerCase())) {
+      const parent = segments.pop();
+      if (parent) {
+        const decodedParent = decodeURIComponent(parent);
+        if (QUALITY_SEGMENT.test(decodedParent)) return decodedParent;
+      }
+    }
+    return base;
   } catch {
     return null;
   }
