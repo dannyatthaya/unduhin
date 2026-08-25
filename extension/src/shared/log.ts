@@ -11,19 +11,30 @@
 
 let verbose = false;
 
-function refresh(): void {
-  chrome.storage.local.get({ verboseLogging: false }, (items) => {
-    verbose = items.verboseLogging === true;
-  });
+// Reading the flag runs at import time, and this module is imported by
+// modules that a unit test loads outside an extension — where there is no
+// `chrome` at all. Bind against it defensively so importing a module that
+// merely logs cannot throw. In the service worker `chrome` is always
+// present, so this costs nothing there.
+function bindToStorage(): void {
+  const api = (globalThis as { chrome?: typeof chrome }).chrome;
+  if (!api?.storage?.local) return;
+  try {
+    api.storage.local.get({ verboseLogging: false }, (items) => {
+      verbose = items.verboseLogging === true;
+    });
+    api.storage.onChanged?.addListener((changes, area) => {
+      if (area === "local" && changes.verboseLogging) {
+        verbose = changes.verboseLogging.newValue === true;
+      }
+    });
+  } catch {
+    // A stubbed or partial `chrome` in a test. Logging still works; only
+    // the verbose toggle is inert.
+  }
 }
 
-refresh();
-
-chrome.storage.onChanged.addListener((changes, area) => {
-  if (area === "local" && changes.verboseLogging) {
-    verbose = changes.verboseLogging.newValue === true;
-  }
-});
+bindToStorage();
 
 function prefix(): string {
   return `[unduhin ${new Date().toISOString().slice(11, 23)}]`;

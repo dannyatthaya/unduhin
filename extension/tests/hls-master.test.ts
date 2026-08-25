@@ -5,6 +5,7 @@ import {
   loadVariants,
   parseMasterPlaylist,
   parseMediaPlaylistDuration,
+  isResolved,
   peekManifest,
   type ProbeViaApp,
 } from "../src/background/hls-master";
@@ -236,7 +237,7 @@ describe("loadVariants", () => {
 
   it("uses the in-page body even though the SW tier races alongside it", async () => {
     const url = "https://example.com/loadv/success.m3u8";
-    executeScript.mockResolvedValue([{ result: MASTER }]);
+    executeScript.mockResolvedValue([{ result: { body: MASTER, reason: "ok" } }]);
     // The case the in-page tier exists for: a hotlink-protected CDN 403s
     // the SW fetch. A `null` can never win the race, so the in-page body
     // is still what comes back.
@@ -249,7 +250,7 @@ describe("loadVariants", () => {
 
   it("falls back to the SW fetch when the in-page fetch fails", async () => {
     const url = "https://example.com/loadv/fallback.m3u8";
-    executeScript.mockResolvedValue([{ result: null }]);
+    executeScript.mockResolvedValue([{ result: { body: null, reason: "http 403" } }]);
     fetchSpy.mockResolvedValue(fakeResponse(true, MASTER));
 
     const { variants } = await loadVariants(url, TAB_ID);
@@ -260,7 +261,7 @@ describe("loadVariants", () => {
 
   it("returns no variants when both the in-page and SW fetch fail", async () => {
     const url = "https://example.com/loadv/both-fail.m3u8";
-    executeScript.mockResolvedValue([{ result: null }]);
+    executeScript.mockResolvedValue([{ result: { body: null, reason: "http 403" } }]);
     fetchSpy.mockResolvedValue(fakeResponse(false, ""));
 
     const info = await loadVariants(url, TAB_ID);
@@ -291,7 +292,7 @@ describe("loadVariants", () => {
   it("negative-caches a full failure, then retries after the short TTL", async () => {
     vi.useFakeTimers();
     const url = "https://example.com/loadv/negative-cache.m3u8";
-    executeScript.mockResolvedValue([{ result: null }]);
+    executeScript.mockResolvedValue([{ result: { body: null, reason: "http 403" } }]);
     fetchSpy.mockResolvedValue(fakeResponse(false, ""));
 
     await loadVariants(url, TAB_ID);
@@ -316,7 +317,7 @@ describe("loadVariants", () => {
     const oversized =
       "#EXTM3U\n" +
       "#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360\n640x360/video.m3u8\n".repeat(5000);
-    executeScript.mockResolvedValue([{ result: oversized }]);
+    executeScript.mockResolvedValue([{ result: { body: oversized, reason: "ok" } }]);
 
     const { variants } = await loadVariants(url, TAB_ID);
     expect(variants).toEqual([]);
@@ -332,7 +333,7 @@ describe("loadVariants", () => {
 
   it("behaves exactly as before when probeViaApp is omitted", async () => {
     const url = "https://example.com/loadv/no-probe.m3u8";
-    executeScript.mockResolvedValue([{ result: null }]);
+    executeScript.mockResolvedValue([{ result: { body: null, reason: "http 403" } }]);
     fetchSpy.mockResolvedValue(fakeResponse(false, ""));
 
     const { variants } = await loadVariants(url, TAB_ID);
@@ -342,7 +343,7 @@ describe("loadVariants", () => {
 
   it("falls back to the app probe once both fetches fail", async () => {
     const url = "https://example.com/loadv/probe-success.m3u8";
-    executeScript.mockResolvedValue([{ result: null }]);
+    executeScript.mockResolvedValue([{ result: { body: null, reason: "http 403" } }]);
     fetchSpy.mockResolvedValue(fakeResponse(false, ""));
     const probeViaApp: ProbeViaApp = vi.fn().mockResolvedValue(PROBED_VARIANTS);
 
@@ -357,7 +358,7 @@ describe("loadVariants", () => {
     // yt-dlp already reports a duration on every format, so this path
     // must not spend the extra probe fetch a manifest parse needs.
     const url = "https://example.com/loadv/probe-duration.m3u8";
-    executeScript.mockResolvedValue([{ result: null }]);
+    executeScript.mockResolvedValue([{ result: { body: null, reason: "http 403" } }]);
     fetchSpy.mockResolvedValue(fakeResponse(false, ""));
     const probed = PROBED_VARIANTS.map((v) => ({ ...v, durationSecs: 3600 }));
     const probeViaApp: ProbeViaApp = vi.fn().mockResolvedValue(probed);
@@ -371,7 +372,7 @@ describe("loadVariants", () => {
 
   it("does not call the app probe when the in-page fetch succeeds", async () => {
     const url = "https://example.com/loadv/probe-skip-inpage.m3u8";
-    executeScript.mockResolvedValue([{ result: MASTER }]);
+    executeScript.mockResolvedValue([{ result: { body: MASTER, reason: "ok" } }]);
     const probeViaApp: ProbeViaApp = vi.fn();
 
     await loadVariants(url, TAB_ID, probeViaApp);
@@ -381,7 +382,7 @@ describe("loadVariants", () => {
 
   it("does not call the app probe when the SW fetch succeeds", async () => {
     const url = "https://example.com/loadv/probe-skip-sw.m3u8";
-    executeScript.mockResolvedValue([{ result: null }]);
+    executeScript.mockResolvedValue([{ result: { body: null, reason: "http 403" } }]);
     fetchSpy.mockResolvedValue(fakeResponse(true, MASTER));
     const probeViaApp: ProbeViaApp = vi.fn();
 
@@ -393,7 +394,7 @@ describe("loadVariants", () => {
   it("does not cache a null probe answer as success — a later call retries", async () => {
     vi.useFakeTimers();
     const url = "https://example.com/loadv/probe-null.m3u8";
-    executeScript.mockResolvedValue([{ result: null }]);
+    executeScript.mockResolvedValue([{ result: { body: null, reason: "http 403" } }]);
     fetchSpy.mockResolvedValue(fakeResponse(false, ""));
     const probeViaApp: ProbeViaApp = vi.fn().mockResolvedValue(null);
 
@@ -410,7 +411,7 @@ describe("loadVariants", () => {
   it("caches an empty-array probe answer as a real success", async () => {
     vi.useFakeTimers();
     const url = "https://example.com/loadv/probe-empty.m3u8";
-    executeScript.mockResolvedValue([{ result: null }]);
+    executeScript.mockResolvedValue([{ result: { body: null, reason: "http 403" } }]);
     fetchSpy.mockResolvedValue(fakeResponse(false, ""));
     const probeViaApp: ProbeViaApp = vi.fn().mockResolvedValue([]);
 
@@ -449,7 +450,7 @@ describe("loadVariants", () => {
 
   it("shares one run between concurrent calls for the same manifest", async () => {
     const url = "https://example.com/loadv/in-flight.m3u8";
-    executeScript.mockResolvedValue([{ result: null }]);
+    executeScript.mockResolvedValue([{ result: { body: null, reason: "http 403" } }]);
     fetchSpy.mockResolvedValue(fakeResponse(false, ""));
     const probeViaApp: ProbeViaApp = vi.fn().mockResolvedValue(PROBED_VARIANTS);
 
@@ -500,8 +501,8 @@ describe("loadVariants duration probe", () => {
    *  anything else, so the probe round gets a real segment list. */
   function serveMasterThenMedia(masterUrl: string, media = MEDIA): void {
     executeScript.mockImplementation(
-      (args: { args: [string, number] }): Promise<{ result: string }[]> =>
-        Promise.resolve([{ result: args.args[0] === masterUrl ? MASTER : media }]),
+      (args: { args: [string, number] }): Promise<{ result: { body: string; reason: string } }[]> =>
+        Promise.resolve([{ result: { body: args.args[0] === masterUrl ? MASTER : media, reason: "ok" } }]),
     );
   }
 
@@ -564,8 +565,8 @@ s44.ts
   it("still returns the variants when the duration probe fails", async () => {
     const url = "https://example.com/dur/probe-fails.m3u8";
     executeScript.mockImplementation(
-      (args: { args: [string, number] }): Promise<{ result: string | null }[]> =>
-        Promise.resolve([{ result: args.args[0] === url ? MASTER : null }]),
+      (args: { args: [string, number] }): Promise<{ result: { body: string | null; reason: string } }[]> =>
+        Promise.resolve([{ result: { body: args.args[0] === url ? MASTER : null, reason: "x" } }]),
     );
 
     const info = await loadVariants(url, TAB_ID);
@@ -579,12 +580,74 @@ s44.ts
     // body is already in hand, so no probe round is needed — this is the
     // stream that used to render as a bare URL with no facts at all.
     const url = "https://example.com/dur/plain.m3u8";
-    executeScript.mockResolvedValue([{ result: MEDIA }]);
+    executeScript.mockResolvedValue([{ result: { body: MEDIA, reason: "ok" } }]);
 
     const info = await loadVariants(url, TAB_ID);
 
     expect(info.variants).toEqual([]);
     expect(info.durationSecs).toBeCloseTo(12);
+    expect(executeScript).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("retrying a failed resolve", () => {
+  let executeScript: ReturnType<typeof vi.fn>;
+  let fetchSpy: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    ({ executeScript } = installFakeChrome());
+    fetchSpy = vi.fn();
+    vi.stubGlobal("fetch", fetchSpy);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("retries a cached FAILURE when the caller asks", async () => {
+    // The reported symptom. The sniffer's warm-up runs the instant the
+    // manifest response starts, while the page is still loading, and it
+    // failed. Opening the popup a moment later must try again rather than
+    // render a plain row off the poisoned cache entry.
+    const url = "https://example.com/retry/warm-up-failed.m3u8";
+    executeScript.mockResolvedValue([{ result: { body: null, reason: "http 403" } }]);
+    fetchSpy.mockResolvedValue(fakeResponse(false, ""));
+
+    const first = await loadVariants(url, TAB_ID);
+    expect(first.variants).toEqual([]);
+    expect(isResolved(url)).toBe(false);
+
+    // The page has settled; the same fetch now succeeds.
+    executeScript.mockResolvedValue([{ result: { body: MASTER, reason: "ok" } }]);
+    const second = await loadVariants(url, TAB_ID, undefined, { retryFailed: true });
+
+    expect(second.variants.map((v) => v.label)).toEqual(["720p", "480p", "360p"]);
+    expect(isResolved(url)).toBe(true);
+  });
+
+  it("does NOT re-fetch a real answer, even with retryFailed", async () => {
+    // A media playlist is a real answer that happens to hold no variants.
+    // Retrying it on every popup open would be pure hammering.
+    const url = "https://example.com/retry/real-answer.m3u8";
+    executeScript.mockResolvedValue([{ result: { body: MEDIA, reason: "ok" } }]);
+
+    await loadVariants(url, TAB_ID);
+    expect(isResolved(url)).toBe(true);
+
+    await loadVariants(url, TAB_ID, undefined, { retryFailed: true });
+    expect(executeScript).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves the warm-up path caching failures as before", async () => {
+    // Without `retryFailed` the negative cache still absorbs repeat
+    // calls, so a dead CDN is not hammered once per sniffed manifest.
+    const url = "https://example.com/retry/no-flag.m3u8";
+    executeScript.mockResolvedValue([{ result: { body: null, reason: "http 403" } }]);
+    fetchSpy.mockResolvedValue(fakeResponse(false, ""));
+
+    await loadVariants(url, TAB_ID);
+    await loadVariants(url, TAB_ID);
+
     expect(executeScript).toHaveBeenCalledTimes(1);
   });
 });
@@ -606,7 +669,7 @@ describe("peekManifest", () => {
   it("returns the cached info once it has resolved", async () => {
     const url = "https://example.com/peek/resolved.m3u8";
     const { executeScript } = installFakeChrome();
-    executeScript.mockResolvedValue([{ result: MASTER }]);
+    executeScript.mockResolvedValue([{ result: { body: MASTER, reason: "ok" } }]);
 
     expect(peekManifest(url)).toBeUndefined();
     const loaded = await loadVariants(url, TAB_ID);
@@ -617,7 +680,7 @@ describe("peekManifest", () => {
   it("distinguishes an unresolved manifest from one resolved as a plain playlist", async () => {
     const url = "https://example.com/peek/media-playlist.m3u8";
     const { executeScript } = installFakeChrome();
-    executeScript.mockResolvedValue([{ result: MEDIA }]);
+    executeScript.mockResolvedValue([{ result: { body: MEDIA, reason: "ok" } }]);
 
     await loadVariants(url, TAB_ID);
 

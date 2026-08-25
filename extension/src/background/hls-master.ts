@@ -10,6 +10,7 @@
 // open, and re-fetching every manifest each time would be wasteful (and
 // the bodies rarely change within a session).
 
+import { log } from "../shared/log.js";
 import { splitCodecs } from "../shared/format.js";
 import type { MediaVariant } from "../shared/types.js";
 
@@ -98,6 +99,23 @@ const UNKNOWN: ManifestInfo = { variants: [], durationSecs: null };
 interface CacheEntry {
   readonly info: ManifestInfo;
   readonly expiresAt: number;
+  /**
+   * True when NOTHING could answer — every tier failed or timed out.
+   *
+   * Deliberately distinct from a real answer that happens to hold no
+   * variants. The two look identical in `info`, but they must not behave
+   * identically: a real answer is final, while a failure is worth trying
+   * again the moment a user actually looks.
+   *
+   * This matters because the warm-up runs at the worst possible time.
+   * `onStreamDetected` fires from a `webRequest` listener the instant the
+   * manifest response starts, when the page is still committing and the
+   * tab may not accept an injected script yet. A failure captured at that
+   * moment used to be cached like any other answer, so a popup opened
+   * seconds later rendered a plain row and never retried — the manifest
+   * was perfectly fetchable by then.
+   */
+  readonly failed: boolean;
 }
 
 const cache = new Map<string, CacheEntry>();
@@ -329,14 +347,20 @@ async function probeDuration(
  *
  * Cached for {@link CACHE_TTL_MS} on an actual answer, {@link
  * NEGATIVE_CACHE_TTL_MS} when nothing could answer at all.
+ *
+ * `retryFailed` re-runs the tier chain even when a cached entry exists,
+ * as long as that entry is a recorded FAILURE rather than a real answer.
+ * The popup passes it; the sniffer's warm-up does not. A real answer is
+ * never re-fetched either way, so this cannot turn into hammering.
  */
 export async function loadVariants(
   manifestUrl: string,
   tabId: number | null,
   probeViaApp?: ProbeViaApp,
+  opts?: { readonly retryFailed?: boolean },
 ): Promise<ManifestInfo> {
-  const cached = peekManifest(manifestUrl);
-  if (cached) return cached;
+  const hit = liveEntry(manifestUrl);
+  if (hit && !(opts?.retryFailed && hit.failed)) return hit.info;
 
   const existing = inFlight.get(manifestUrl);
   if (existing) return existing;
@@ -362,8 +386,26 @@ export async function loadVariants(
  * rows, and the latter as a plain row that is final.
  */
 export function peekManifest(manifestUrl: string): ManifestInfo | undefined {
+  return liveEntry(manifestUrl)?.info;
+}
+
+/**
+ * True when `manifestUrl` holds a cached entry that is a real ANSWER, not
+ * a recorded failure.
+ *
+ * The service worker uses this to decide whether a tab still has work to
+ * do. Asking "is anything cached" instead treats a failed warm-up as
+ * finished work and skips the retry the user is waiting on.
+ */
+export function isResolved(manifestUrl: string): boolean {
+  const hit = liveEntry(manifestUrl);
+  return hit != null && !hit.failed;
+}
+
+/** The unexpired cache entry for `manifestUrl`, or undefined. */
+function liveEntry(manifestUrl: string): CacheEntry | undefined {
   const hit = cache.get(manifestUrl);
-  return hit && hit.expiresAt > Date.now() ? hit.info : undefined;
+  return hit && hit.expiresAt > Date.now() ? hit : undefined;
 }
 
 async function resolveVariants(
@@ -397,7 +439,13 @@ async function resolveVariants(
       // popup used to render as a bare URL with no facts at all.
       info = { variants: [], durationSecs: parseMediaPlaylistDuration(text) };
     }
-    cache.set(manifestUrl, { info, expiresAt: Date.now() + CACHE_TTL_MS });
+    cache.set(manifestUrl, { info, expiresAt: Date.now() + CACHE_TTL_MS, failed: false });
+    log.debug(
+      "hls resolved:",
+      isMaster ? `master, ${info.variants.length} variant(s)` : "media playlist",
+      `duration=${info.durationSecs ?? "unknown"}`,
+      manifestUrl,
+    );
     return info;
   }
 
@@ -415,7 +463,7 @@ async function resolveVariants(
       variants: probed,
       durationSecs: probed.find((v) => v.durationSecs != null)?.durationSecs ?? null,
     };
-    cache.set(manifestUrl, { info, expiresAt: Date.now() + CACHE_TTL_MS });
+    cache.set(manifestUrl, { info, expiresAt: Date.now() + CACHE_TTL_MS, failed: false });
     return info;
   }
 
@@ -423,7 +471,12 @@ async function resolveVariants(
   // open past that window retries (the page may not have been ready, a
   // Referer-gated request transiently 403'd, or the bridge was briefly
   // down for the probe).
-  cache.set(manifestUrl, { info: UNKNOWN, expiresAt: Date.now() + NEGATIVE_CACHE_TTL_MS });
+  log.debug("hls resolve FAILED — every tier came up empty:", manifestUrl);
+  cache.set(manifestUrl, {
+    info: UNKNOWN,
+    expiresAt: Date.now() + NEGATIVE_CACHE_TTL_MS,
+    failed: true,
+  });
   return UNKNOWN;
 }
 
@@ -496,15 +549,23 @@ async function fetchInPage(tabId: number, url: string, budgetMs: number): Promis
     // travel through `args`.
     const execution = chrome.scripting.executeScript({
       target: { tabId },
-      func: async (manifestUrl: string, timeoutMs: number): Promise<string | null> => {
+      // Returns a reason string on failure rather than a bare null. The
+      // injected world is the one place we cannot observe directly, and
+      // "the in-page tier returned nothing" was impossible to tell apart
+      // from "the CDN said 403" without it.
+      func: async (
+        manifestUrl: string,
+        timeoutMs: number,
+      ): Promise<{ body: string | null; reason: string }> => {
         try {
           const res = await fetch(manifestUrl, {
             credentials: "include",
             signal: AbortSignal.timeout(timeoutMs),
           });
-          return res.ok ? await res.text() : null;
-        } catch {
-          return null;
+          if (!res.ok) return { body: null, reason: `http ${res.status}` };
+          return { body: await res.text(), reason: "ok" };
+        } catch (err) {
+          return { body: null, reason: String(err) };
         }
       },
       args: [url, budgetMs],
@@ -518,11 +579,16 @@ async function fetchInPage(tabId: number, url: string, budgetMs: number): Promis
     // `injection.error` and leaves `result` undefined. Our injected
     // function never throws (it catches internally), but guard the shape
     // anyway rather than trust it.
-    const text = injection?.result;
-    return typeof text === "string" ? text : null;
-  } catch {
+    const out = injection?.result as { body?: unknown; reason?: unknown } | undefined;
+    const body = typeof out?.body === "string" ? out.body : null;
+    if (body == null) {
+      log.debug("hls in-page fetch failed:", String(out?.reason ?? "no result"), url);
+    }
+    return body;
+  } catch (err) {
     // Restricted page (chrome://), no host access, tab gone, or the
     // outer timeout guard above fired.
+    log.debug("hls in-page tier unavailable:", err, url);
     return null;
   }
 }
@@ -571,11 +637,16 @@ async function fetchInServiceWorker(url: string, budgetMs: number): Promise<stri
     const timer = setTimeout(() => ctrl.abort(), budgetMs);
     try {
       const res = await fetch(url, { credentials: "include", signal: ctrl.signal });
-      return res.ok ? await res.text() : null;
+      if (!res.ok) {
+        log.debug("hls SW fetch failed: http", res.status, url);
+        return null;
+      }
+      return await res.text();
     } finally {
       clearTimeout(timer);
     }
-  } catch {
+  } catch (err) {
+    log.debug("hls SW fetch failed:", err, url);
     return null;
   }
 }

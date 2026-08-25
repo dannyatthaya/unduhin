@@ -39,6 +39,7 @@ import { installMediaSniffer } from "./media-sniffer.js";
 import {
   labelFor,
   loadVariants,
+  isResolved,
   peekManifest,
   type ManifestInfo,
 } from "./hls-master.js";
@@ -456,7 +457,10 @@ async function resolveVariantsForTab(
 ): Promise<void> {
   const sniffed = mediaSniffer.getStreamsForTab(tabId);
   const hls = sniffed.filter((s) => s.kind === "hls");
-  if (hls.every((s) => peekManifest(s.manifestUrl) != null)) return;
+  // `isResolved`, not "is anything cached": a failed warm-up caches an
+  // entry too, and treating that as finished work skips the retry the
+  // user just asked for by opening the popup.
+  if (hls.every((s) => isResolved(s.manifestUrl))) return;
 
   const resolved = new Map<string, ManifestInfo>();
   await Promise.all(
@@ -467,6 +471,9 @@ async function resolveVariantsForTab(
         s.manifestUrl,
         tabId,
         makeAppProber(s.pageUrl),
+        // The popup is open and waiting. A warm-up that failed while the
+        // page was still loading gets one more chance now.
+        { retryFailed: true },
       ).catch((err) => {
         log.debug("loadVariants failed:", err);
         return NOTHING_KNOWN;

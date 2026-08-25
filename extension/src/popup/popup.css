@@ -203,11 +203,20 @@ body {
 /* Facts about one quality — pixel size, frame rate, bit rate, codecs.
    The gap separates them, so no separator glyph is drawn between them.
    They wrap rather than truncate: a row that hid its codec behind an
-   ellipsis would defeat the point of showing it. */
+   ellipsis would defeat the point of showing it.
+
+   The shared rule above uppercases its text, which is right for a status
+   word and wrong for every value here: it renders "8.0 Mbps" as
+   "8.0 MBPS" and "1920x1080" as "1920X1080". These are units and
+   identifiers with their own casing, so the transform is dropped — which
+   also buys back enough width to keep the codecs on one line. */
 .media-list__meta {
   display: flex;
   flex-wrap: wrap;
-  gap: 2px 7px;
+  gap: 1px 6px;
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 10.5px;
 }
 
 .media-list__chip {
