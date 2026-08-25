@@ -557,15 +557,42 @@ async function fetchInPage(tabId: number, url: string, budgetMs: number): Promis
         manifestUrl: string,
         timeoutMs: number,
       ): Promise<{ body: string | null; reason: string }> => {
-        try {
+        const attempt = async (
+          credentials: RequestCredentials,
+        ): Promise<{ body: string | null; reason: string }> => {
           const res = await fetch(manifestUrl, {
-            credentials: "include",
+            credentials,
             signal: AbortSignal.timeout(timeoutMs),
           });
-          if (!res.ok) return { body: null, reason: `http ${res.status}` };
-          return { body: await res.text(), reason: "ok" };
-        } catch (err) {
-          return { body: null, reason: String(err) };
+          if (!res.ok) return { body: null, reason: `http ${res.status} (${credentials})` };
+          return { body: await res.text(), reason: `ok (${credentials})` };
+        };
+        // Cookies first: a session-gated CDN needs them, and it answers
+        // with a specific `Access-Control-Allow-Origin`, so CORS allows
+        // the credentialed request.
+        try {
+          return await attempt("include");
+        } catch (includeErr) {
+          // The other, more common shape: the CDN answers
+          // `Access-Control-Allow-Origin: *` and no
+          // `Access-Control-Allow-Credentials`. CORS rejects a wildcard
+          // origin for a credentialed request, so the fetch dies inside
+          // the browser before a request is ever sent — the failure looks
+          // like a bare `TypeError: Failed to fetch`, not an HTTP status.
+          //
+          // A wildcard origin is exactly what lets hls.js read the same
+          // manifest, because a media element fetches it without
+          // credentials. Retrying without them is what makes this tier
+          // work on the CDNs it was written for. Nothing is lost: a
+          // manifest that truly needs cookies already succeeded above.
+          try {
+            return await attempt("omit");
+          } catch (omitErr) {
+            return {
+              body: null,
+              reason: `include: ${includeErr}; omit: ${omitErr}`,
+            };
+          }
         }
       },
       args: [url, budgetMs],

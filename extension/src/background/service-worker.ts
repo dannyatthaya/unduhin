@@ -372,14 +372,26 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
  *  `labelFor`. */
 function makeAppProber(referrer: string | null): ProbeViaApp {
   return async (manifestUrl) => {
-    if (!bridge.isHealthy()) return null;
+    if (!bridge.isHealthy()) {
+      log.debug("probeMedia skipped: the app bridge is not connected");
+      return null;
+    }
     try {
+      log.debug("probeMedia -> asking the app about", manifestUrl);
       const reply = await bridge.send({
         type: "probeMedia",
         url: manifestUrl,
         referrer,
       });
-      if (reply.type !== "mediaFormats") return null;
+      if (reply.type !== "mediaFormats") {
+        log.debug(
+          "probeMedia answered with",
+          reply.type,
+          (reply as { message?: string }).message ?? "",
+        );
+        return null;
+      }
+      log.debug("probeMedia returned", reply.formats.length, "format(s) for", manifestUrl);
       return reply.formats.map((f) => ({
         url: f.url,
         height: f.height,
