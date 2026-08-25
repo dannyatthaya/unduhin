@@ -1285,6 +1285,67 @@ async fn run_torrent(
     })
 }
 
+/// Extensions [`ytdlp_output_stem`] strips off a stored file name.
+///
+/// yt-dlp appends the real extension itself through `%(ext)s`, so a name
+/// that already carries one has to lose it or the file lands as
+/// `clip.mp4.mp4`. The list is an allowlist on purpose — see
+/// [`ytdlp_output_stem`] for why anything looser breaks real titles.
+/// Container and audio formats yt-dlp can produce, plus the two manifest
+/// extensions a captured stream arrives with.
+const STRIPPABLE_EXTENSIONS: &[&str] = &[
+    // Video containers.
+    "mp4", "m4v", "mkv", "webm", "mov", "avi", "flv", "ts", "m2ts", "mpg", "mpeg", "wmv", "ogv",
+    "3gp", // Audio.
+    "mp3", "m4a", "aac", "opus", "ogg", "oga", "flac", "wav", "wma", "alac",
+    // Streaming manifests — what a captured stream's name is derived from.
+    "m3u8", "mpd",
+];
+
+/// Turn a download row's stored file name into the stem half of a yt-dlp
+/// `--output` template.
+///
+/// Two things have to happen to it.
+///
+/// **Drop a real extension, keep a title.** yt-dlp picks the extension
+/// once it knows the chosen format, so one already on the name is
+/// removed. `Path::file_stem` is the obvious tool and the wrong one: it
+/// cuts everything after the LAST dot whatever that is. A title like
+/// `"Ep. 5 - The Finale"` became the template `Ep.%(ext)s` and the file
+/// landed on disk as `Ep.mp4`. Media titles carry dots all the time —
+/// `"Part 2.5"`, `"Show S01.E05"`, `"Vol. 3"` — and every one of them
+/// lost its tail.
+///
+/// A length-and-shape heuristic does not save it either: the tail of
+/// `"Part 2.5"` is short and alphanumeric, and the tail of
+/// `"Show S01.E05"` is short, alphanumeric, and has a letter. Only an
+/// allowlist separates the two cases cleanly, so only an extension in
+/// [`STRIPPABLE_EXTENSIONS`] is dropped. Stripping repeats, which is
+/// what reduces the `name.mp4.m3u8` an HLS capture produces down to
+/// `name`. The loop ends on its own — the string shrinks each pass, and
+/// an empty base stops it.
+///
+/// Being wrong in the safe direction matters here: a kept extension
+/// costs a doubled suffix the user can see and rename, while a wrongly
+/// cut one silently truncates the file name.
+///
+/// **Escape percent signs.** yt-dlp reads `%(field)s` in an output
+/// template, and `sanitize_filename` does not remove `%` — it only
+/// strips the characters Windows rejects in a path. A title holding a
+/// literal `%` would be read as the start of a field. `%%` is yt-dlp's
+/// escape for one literal percent sign. Escaping the stem before it is
+/// formatted leaves the `%(ext)s` the caller appends untouched.
+fn ytdlp_output_stem(name: &str) -> String {
+    let mut stem = name;
+    while let Some((base, ext)) = stem.rsplit_once('.') {
+        if base.is_empty() || !STRIPPABLE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()) {
+            break;
+        }
+        stem = base;
+    }
+    stem.replace('%', "%%")
+}
+
 /// Drive a yt-dlp child process for a media-info-tagged download. Wraps
 /// the result in [`engine::EngineError`] so the caller's match arms work
 /// uniformly across engine and yt-dlp paths.
@@ -1324,15 +1385,7 @@ async fn run_ytdlp(
     let output_template = record
         .output_path
         .file_name()
-        .map(|n| {
-            // The frontend supplies a stem; let yt-dlp pick the final
-            // extension based on the chosen format.
-            let stem = std::path::Path::new(n)
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| "download".to_string());
-            format!("{stem}.%(ext)s")
-        })
+        .map(|n| format!("{}.%(ext)s", ytdlp_output_stem(&n.to_string_lossy())))
         .unwrap_or_else(|| "%(title)s.%(ext)s".to_string());
 
     // Browser impersonation toggle. Defaults to `true` when the row is
@@ -1729,6 +1782,60 @@ fn _path_marker() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_stem_keeps_a_title_that_contains_dots() {
+        // The reported bug. `Path::file_stem` cut at the last dot, so the
+        // template became `Ep.%(ext)s` and the file landed as `Ep.mp4`.
+        assert_eq!(
+            ytdlp_output_stem("Ep. 5 - The Finale"),
+            "Ep. 5 - The Finale"
+        );
+        // A short, purely numeric tail — a length heuristic would have
+        // eaten this one.
+        assert_eq!(ytdlp_output_stem("Part 2.5"), "Part 2.5");
+        // Short, alphanumeric, and carrying a letter — an "looks like an
+        // extension" heuristic would have eaten this one too.
+        assert_eq!(ytdlp_output_stem("Show S01.E05"), "Show S01.E05");
+        assert_eq!(ytdlp_output_stem("Vol. 3"), "Vol. 3");
+    }
+
+    #[test]
+    fn output_stem_drops_a_real_extension() {
+        // yt-dlp appends the extension itself, so one already on the name
+        // has to go or the file lands as `clip.mp4.mp4`.
+        assert_eq!(ytdlp_output_stem("clip.mp4"), "clip");
+        assert_eq!(ytdlp_output_stem("song.flac"), "song");
+        assert_eq!(ytdlp_output_stem("movie.MKV"), "movie");
+    }
+
+    #[test]
+    fn output_stem_strips_a_stacked_manifest_extension() {
+        // What an HLS capture's name looks like when the URL tail carried
+        // both — one pass would leave `name.mp4` and yield `name.mp4.mp4`.
+        assert_eq!(ytdlp_output_stem("name.mp4.m3u8"), "name");
+    }
+
+    #[test]
+    fn output_stem_stops_before_eating_the_whole_name() {
+        // A name that is nothing but extensions must not reduce to "".
+        assert_eq!(ytdlp_output_stem(".mp4"), ".mp4");
+        assert_eq!(ytdlp_output_stem("mp4"), "mp4");
+        // A title whose own words happen to be an extension keeps them:
+        // stripping stops as soon as the base would be empty.
+        assert_eq!(ytdlp_output_stem(".ts.ts"), ".ts");
+    }
+
+    #[test]
+    fn output_stem_escapes_percent_signs() {
+        // yt-dlp reads `%(field)s` in an output template, and
+        // `sanitize_filename` does not remove `%`. Unescaped, this title
+        // hands yt-dlp a field spec built from the user's video title.
+        assert_eq!(ytdlp_output_stem("Save 50%(off) now"), "Save 50%%(off) now");
+        assert_eq!(ytdlp_output_stem("100% real"), "100%% real");
+        // The escape survives alongside an extension strip.
+        assert_eq!(ytdlp_output_stem("50% off.mp4"), "50%% off");
+    }
 
     #[test]
     fn downsample_trims_trailing_zeros() {
