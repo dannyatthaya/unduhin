@@ -190,6 +190,13 @@ pub struct TorrentMeta {
     /// Last swarm snapshot; survives relaunch so the UI can render
     /// peers/seeds before the session re-attaches.
     pub swarm: Option<SwarmStats>,
+    /// `true` when the row's `output_path` is a per-torrent folder this app
+    /// created, and so is safe to delete wholesale. Set by [`insert`], never
+    /// trusted from the caller. `false` for an explicit content folder and for
+    /// rows predating the field — [`remove`] then deletes only the torrent's
+    /// own files, never the folder around them.
+    #[serde(default)]
+    pub owns_content_dir: bool,
 }
 
 /// Where a torrent came from. The `.torrent` bytes are copied into the
@@ -364,9 +371,15 @@ pub struct AddDownload {
     /// HEAD-probe filename hint is applied at transfer time when it
     /// supplies a better value (Content-Disposition).
     pub filename: Option<String>,
-    /// Final output path. If `None`, joined from the category's
-    /// `default_output_path` (or the global `default_output_path`).
+    /// Exact output path: the file itself for HTTP / media rows, the content
+    /// folder for a torrent. Used verbatim. If `None`, see `output_dir`.
     pub output_path: Option<PathBuf>,
+    /// Folder to download into, as picked in the UI. The file name is still
+    /// derived and de-duplicated as usual, and a torrent still gets its own
+    /// subfolder inside it. Falls back to the category's
+    /// `default_output_path` (or the global `default_output_path`) when
+    /// `None`. Ignored when `output_path` is set.
+    pub output_dir: Option<PathBuf>,
     pub category: Option<CategorySelector>,
     pub priority: i64,
     pub segments: Option<u32>,
@@ -435,6 +448,7 @@ pub(crate) async fn insert(pool: &SqlitePool, input: AddDownload) -> Result<Down
         url,
         filename,
         output_path,
+        output_dir,
         category,
         priority,
         segments,
@@ -539,10 +553,32 @@ pub(crate) async fn insert(pool: &SqlitePool, input: AddDownload) -> Result<Down
     // (download::remove) can delete the whole tree.
     let resolved_output = match kind {
         DownloadKind::Torrent => {
-            resolve_torrent_output_dir(pool, &filename, &output_path, torrent.as_ref()).await?
+            resolve_torrent_output_dir(
+                pool,
+                &filename,
+                &output_path,
+                output_dir.as_deref(),
+                torrent.as_ref(),
+            )
+            .await?
         }
-        _ => resolve_output_path(pool, &filename, &output_path, category_id).await?,
+        _ => {
+            resolve_output_path(
+                pool,
+                &filename,
+                &output_path,
+                output_dir.as_deref(),
+                category_id,
+            )
+            .await?
+        }
     };
+    // Only a folder we minted ourselves may later be deleted wholesale. An
+    // explicit `output_path` is somebody else's folder, whatever it holds.
+    let torrent = torrent.map(|mut meta| {
+        meta.owns_content_dir = output_path.is_none();
+        meta
+    });
     // When we chose the path ourselves (no caller-supplied `output_path`), the
     // unique-path resolver may have appended " (n)" to dodge another in-flight
     // download's path — e.g. two `drive.google.com/uc?id=…` links both reduce
@@ -744,36 +780,68 @@ async fn resolve_torrent_output_dir(
     pool: &SqlitePool,
     filename: &str,
     explicit: &Option<PathBuf>,
+    folder: Option<&Path>,
     torrent: Option<&TorrentMeta>,
 ) -> Result<PathBuf> {
     // An explicit path wins verbatim (the add-dialog / extension may target a
     // chosen folder); make it absolute the same way `resolve_output_path` does.
     if let Some(path) = explicit {
-        return Ok(if path.is_absolute() || path.has_root() {
-            path.clone()
-        } else {
-            std::env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join(path)
-        });
+        return Ok(absolutize(path));
     }
 
-    // Base folder: the torrent-specific download dir, else the global default,
-    // else the user's Downloads folder — mirroring `category_target_folder`'s
-    // fallback chain but rooted at the `torrent_download_dir` setting
-    // (design §3.G).
-    let base = torrent_base_dir(pool).await?;
+    // Base folder: the folder picked in the UI, else the torrent-specific
+    // download dir, else the global default, else the user's Downloads folder
+    // — mirroring `category_target_folder`'s fallback chain but rooted at the
+    // `torrent_download_dir` setting (design §3.G). A picked folder is only
+    // the base: the torrent still gets its own subfolder inside it, because
+    // librqbit writes a multi-file torrent's files straight into the folder
+    // it is given, and that folder is what "delete data" removes.
+    let base = match folder.filter(|f| !f.as_os_str().is_empty()) {
+        Some(f) => absolutize(f),
+        None => torrent_base_dir(pool).await?,
+    };
     // Per-download subdir name: the sanitized provisional/real name, suffixed
     // with the infohash so distinct torrents that happen to share a name stay
     // separate. Fall back to just the infohash when there's no usable name.
     let hash = torrent.map(|t| t.info_hash.as_str()).unwrap_or("");
     let subdir = match (filename.is_empty(), hash.is_empty()) {
-        (false, false) => format!("{filename}.{}", &hash[..hash.len().min(12)]),
+        (false, false) => format!("{filename}.{}", hash_prefix(hash)),
         (false, true) => filename.to_string(),
         (true, false) => hash.to_string(),
         (true, true) => "torrent".to_string(),
     };
-    safe_join(&base, &sanitize_filename(&subdir))
+    let subdir = sanitize_filename(&subdir);
+    if hash.is_empty() {
+        // Nothing unique in the name, so two different torrents with the same
+        // name would share (and on delete, destroy) one folder. Take a free
+        // one. With a hash the name is already per-swarm, and reusing an
+        // existing folder of the same swarm is what lets a re-add pick up the
+        // data already on disk.
+        resolve_unique_output_path(pool, &base, &subdir).await
+    } else {
+        safe_join(&base, &subdir)
+    }
+}
+
+/// First 12 characters of an info-hash, for folder names. Char-based so a
+/// malformed (non-ASCII) hash can never split a UTF-8 sequence.
+fn hash_prefix(hash: &str) -> &str {
+    match hash.char_indices().nth(12) {
+        Some((i, _)) => &hash[..i],
+        None => hash,
+    }
+}
+
+/// Resolve `path` against the process CWD when relative, the same way an
+/// explicit output path always has been.
+fn absolutize(path: &Path) -> PathBuf {
+    if path.is_absolute() || path.has_root() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    }
 }
 
 /// Startup repair for rows created while the no-config output fallback was
@@ -795,9 +863,10 @@ pub(crate) async fn repair_unwritable_output_paths(pool: &SqlitePool) -> Result<
         }
         let new_path = match r.kind {
             DownloadKind::Torrent => {
-                resolve_torrent_output_dir(pool, &r.filename, &None, r.torrent.as_ref()).await?
+                resolve_torrent_output_dir(pool, &r.filename, &None, None, r.torrent.as_ref())
+                    .await?
             }
-            _ => resolve_output_path(pool, &r.filename, &None, r.category_id).await?,
+            _ => resolve_output_path(pool, &r.filename, &None, None, r.category_id).await?,
         };
         tracing::info!(
             id = r.id,
@@ -1071,7 +1140,7 @@ pub(crate) async fn remove(
         // way: report failure on the row, but don't roll back the DB
         // delete — the user asked to remove the row.
         let delete_result = if record.kind == DownloadKind::Torrent {
-            tokio::fs::remove_dir_all(&record.output_path).await
+            remove_torrent_content(&record).await
         } else {
             tokio::fs::remove_file(&record.output_path).await
         };
@@ -1111,6 +1180,109 @@ pub(crate) async fn remove(
         }
     }
     Ok(outcome)
+}
+
+/// Delete a torrent row's data without ever touching files it does not own.
+///
+/// A folder this app created for the torrent goes wholesale. Anything else —
+/// an explicit content folder, or a row from before ownership was recorded
+/// (those were once created straight in a folder the user picked, such as
+/// Downloads itself) — only loses the torrent's own files, plus any
+/// subfolders that leaves empty. When the file list is not known there is no
+/// safe way to tell the torrent's files from the user's, so nothing is
+/// deleted and the error says so.
+async fn remove_torrent_content(record: &DownloadRecord) -> std::io::Result<()> {
+    let root = &record.output_path;
+    let meta = record.torrent.as_ref();
+    if owns_torrent_dir(record) {
+        return tokio::fs::remove_dir_all(root).await;
+    }
+
+    let Some(files) = meta.and_then(|m| m.files.as_ref()) else {
+        // Nothing was ever written without metadata, so a missing folder is
+        // the one case that is certainly fine.
+        if tokio::fs::metadata(root).await.is_err() {
+            return Ok(());
+        }
+        return Err(std::io::Error::other(format!(
+            "{} was not created by Unduhin and the torrent's file list is unknown, \
+             so nothing in it was deleted",
+            root.display()
+        )));
+    };
+
+    let mut first_err = None;
+    let mut dirs = std::collections::BTreeSet::new();
+    for file in files {
+        let Some(rel) = safe_relative_path(&file.path) else {
+            tracing::warn!(path = %file.path, "remove: skipping unsafe torrent file path");
+            continue;
+        };
+        let path = root.join(rel);
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                first_err.get_or_insert(e);
+            }
+        }
+        let mut parent = rel.parent();
+        while let Some(p) = parent.filter(|p| !p.as_os_str().is_empty()) {
+            dirs.insert(root.join(p));
+            parent = p.parent();
+        }
+    }
+    // Deepest first, so a parent is only tried once its children are gone.
+    // `remove_dir` refuses a non-empty folder, which is exactly the guard we
+    // want: anything the user put there keeps its folder. The root itself is
+    // never removed — it is the folder the user chose.
+    for dir in dirs.iter().rev() {
+        let _ = tokio::fs::remove_dir(dir).await;
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// `true` when a torrent row's `output_path` is a folder this app created for
+/// it, so everything inside is the torrent's.
+pub(crate) fn owns_torrent_dir(record: &DownloadRecord) -> bool {
+    record.torrent.as_ref().is_some_and(|m| m.owns_content_dir)
+        || is_legacy_owned_torrent_dir(record)
+}
+
+/// A torrent file path from the row's file list, if it is a plain relative
+/// path. The list is stored JSON that can arrive from the UI, so it is
+/// re-checked before anything joins it onto a folder: no `..`, no root, no
+/// drive prefix.
+pub(crate) fn safe_relative_path(path: &str) -> Option<&Path> {
+    let rel = Path::new(path);
+    let plain = !rel.as_os_str().is_empty()
+        && rel
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)));
+    plain.then_some(rel)
+}
+
+/// Recognizes a per-torrent folder minted by [`resolve_torrent_output_dir`]
+/// before `owns_content_dir` was recorded: its name ends in `.` plus the
+/// first twelve characters of this torrent's own info-hash. No folder a user
+/// made would carry that suffix by chance.
+fn is_legacy_owned_torrent_dir(record: &DownloadRecord) -> bool {
+    let Some(hash) = record
+        .torrent
+        .as_ref()
+        .map(|t| t.info_hash.as_str())
+        .filter(|h| h.len() >= 12)
+    else {
+        return false;
+    };
+    record
+        .output_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| name.ends_with(&format!(".{}", hash_prefix(hash))))
 }
 
 /// Root dir where librqbit persists per-torrent fastresume state — the
@@ -1573,7 +1745,14 @@ pub(crate) async fn apply_engine_filename(
     // in-folder rename. Best-effort: on any IO failure `move_renamed` returns
     // `current_path` unchanged, so we leave the DB pointing at the real file
     // rather than a path that was never produced.
-    let dest_folder = category_target_folder(pool, new_category).await?;
+    //
+    // A file in a folder the app does not route into was put there on
+    // purpose (a folder picked in the add dialog, an explicit path), so it is
+    // renamed where it is — the same test `reconcile_category_folder` uses.
+    let dest_folder = match current_path.parent() {
+        Some(folder) if !is_app_managed_folder(pool, folder).await? => folder.to_path_buf(),
+        _ => category_target_folder(pool, new_category).await?,
+    };
     let dest = move_renamed(&current_path, &dest_folder, std::ffi::OsStr::new(&new_name)).await;
     if dest == current_path {
         return Ok(None);
@@ -2320,16 +2499,18 @@ async fn resolve_output_path(
     pool: &SqlitePool,
     filename: &str,
     explicit: &Option<PathBuf>,
+    folder: Option<&Path>,
     category_id: Option<i64>,
 ) -> Result<PathBuf> {
     if let Some(path) = explicit {
-        return if path.is_absolute() || path.has_root() {
-            Ok(path.clone())
-        } else {
-            Ok(std::env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join(path))
-        };
+        return Ok(absolutize(path));
+    }
+
+    // A folder picked in the UI beats every configured default. It is a
+    // folder, never the file itself: the name is resolved and de-duplicated
+    // inside it exactly as it would be in a category folder.
+    if let Some(folder) = folder.filter(|f| !f.as_os_str().is_empty()) {
+        return resolve_unique_output_path(pool, &absolutize(folder), filename).await;
     }
 
     if let Some(id) = category_id {
@@ -2475,6 +2656,7 @@ mod tests {
                 url: "https://example.com/old?token=stale".parse().unwrap(),
                 filename: Some("movie.mkv".into()),
                 output_path: Some(dir.path().join("movie.mkv")),
+                output_dir: None,
                 category: None,
                 priority: 0,
                 segments: Some(1),
@@ -2769,14 +2951,14 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let p = resolve_output_path(&pool, "song.mp3", &None, Some(music.id))
+        let p = resolve_output_path(&pool, "song.mp3", &None, None, Some(music.id))
             .await
             .unwrap();
         assert!(p.is_absolute(), "resolved path must be absolute: {p:?}");
         assert_eq!(p.parent(), Some(downloads.as_path()));
 
         // No category at all resolves the same way.
-        let p = resolve_output_path(&pool, "blob", &None, None)
+        let p = resolve_output_path(&pool, "blob", &None, None, None)
             .await
             .unwrap();
         assert_eq!(p.parent(), Some(downloads.as_path()));
@@ -2874,7 +3056,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let p = resolve_output_path(&pool, "song.mp3", &None, Some(music.id))
+        let p = resolve_output_path(&pool, "song.mp3", &None, None, Some(music.id))
             .await
             .unwrap();
         assert_eq!(p, tmp.path().join("song.mp3"));
@@ -3019,6 +3201,7 @@ mod tests {
             url: u.parse().unwrap(),
             filename: Some("uc".to_string()),
             output_path: None,
+            output_dir: None,
             category: None,
             priority: 0,
             segments: Some(1),
@@ -3164,6 +3347,7 @@ mod tests {
             url: "https://example.com/file.zip".parse().unwrap(),
             filename: Some("file.zip".to_string()),
             output_path: Some(std::path::PathBuf::from("/tmp/file.zip")),
+            output_dir: None,
             category: None,
             priority: 0,
             segments: Some(4),
@@ -3186,6 +3370,7 @@ mod tests {
             url: "https://example.com/file.zip".parse().unwrap(),
             filename: Some("file.zip".to_string()),
             output_path: Some(std::path::PathBuf::from("/tmp/x.zip")),
+            output_dir: None,
             category: None,
             priority: 0,
             segments: Some(1),
@@ -3363,6 +3548,7 @@ mod tests {
                 down_bps: 2000,
                 ratio_milli: 1500,
             }),
+            owns_content_dir: true,
         };
         let json = serde_json::to_string(&meta).unwrap();
         let back: TorrentMeta = serde_json::from_str(&json).unwrap();
@@ -3449,6 +3635,7 @@ mod tests {
             url: "https://example.com/v".parse().unwrap(),
             filename: Some("v".to_string()),
             output_path: Some(std::path::PathBuf::from("/tmp/v")),
+            output_dir: None,
             category: None,
             priority: 0,
             segments: Some(1),
@@ -3479,11 +3666,13 @@ mod tests {
             selected_files: None,
             files: None,
             swarm: None,
+            owns_content_dir: false,
         };
         let input = AddDownload {
             url: "magnet:?xt=urn:btih:deadbeef".parse().unwrap(),
             filename: Some("torrent".to_string()),
             output_path: Some(std::path::PathBuf::from("/tmp/torrent")),
+            output_dir: None,
             category: None,
             priority: 0,
             segments: Some(1),
@@ -3565,6 +3754,16 @@ mod tests {
         let other_dir = tmp.path().join("Other");
         let video_dir = tmp.path().join("Video");
         tokio::fs::create_dir_all(&other_dir).await.unwrap();
+        // The slug file sits in Other's folder, as it would after add-time
+        // routing (category folders are seeded at startup). A file outside
+        // every app-managed folder is renamed in place instead — see
+        // `apply_engine_filename_keeps_a_user_picked_folder`.
+        sqlx::query("UPDATE categories SET default_output_path = ? WHERE id = ?")
+            .bind(other_dir.to_string_lossy().as_ref())
+            .bind(other.id)
+            .execute(&pool)
+            .await
+            .unwrap();
         // Configure the Video category's folder (a user who set per-category
         // download folders); the recategorized file should land here.
         sqlx::query("UPDATE categories SET default_output_path = ? WHERE id = ?")
@@ -3775,6 +3974,13 @@ mod tests {
         let other_dir = tmp.path().join("Other");
         let video_dir = tmp.path().join("Video");
         tokio::fs::create_dir_all(&other_dir).await.unwrap();
+        // Other's folder is app-managed in production (seeded at startup).
+        sqlx::query("UPDATE categories SET default_output_path = ? WHERE id = ?")
+            .bind(other_dir.to_string_lossy().as_ref())
+            .bind(other.id)
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query("UPDATE categories SET default_output_path = ? WHERE id = ?")
             .bind(video_dir.to_string_lossy().as_ref())
             .bind(video.id)
@@ -3845,6 +4051,7 @@ mod tests {
             selected_files: None,
             files: None,
             swarm: None,
+            owns_content_dir: false,
         };
         assert_eq!(
             provisional_torrent_name(Some(&magnet), &url),
@@ -3860,6 +4067,7 @@ mod tests {
             selected_files: None,
             files: None,
             swarm: None,
+            owns_content_dir: false,
         };
         assert_eq!(provisional_torrent_name(Some(&file), &url), "ubuntu-24.04");
 
@@ -3872,6 +4080,7 @@ mod tests {
             selected_files: None,
             files: None,
             swarm: None,
+            owns_content_dir: false,
         };
         let plain: url::Url = "magnet:?xt=urn:btih:deadbeef".parse().unwrap();
         assert_eq!(provisional_torrent_name(Some(&ih), &plain), "torrent");
@@ -3887,6 +4096,7 @@ mod tests {
             url: uri.parse().unwrap(),
             filename: None,
             output_path: Some(PathBuf::from("/tmp/torrents/debian")),
+            output_dir: None,
             category: None,
             priority: 0,
             segments: None,
@@ -3900,6 +4110,7 @@ mod tests {
                 selected_files: None,
                 files: None,
                 swarm: None,
+                owns_content_dir: false,
             }),
         };
         let rec = insert(&pool, input).await.unwrap();
@@ -3922,6 +4133,7 @@ mod tests {
             url: uri.parse().unwrap(),
             filename: None,
             output_path: Some(PathBuf::from("/tmp/torrents/thing")),
+            output_dir: None,
             category: None,
             priority: 0,
             segments: None,
@@ -3935,6 +4147,7 @@ mod tests {
                 selected_files: None,
                 files: None,
                 swarm: None,
+                owns_content_dir: false,
             }),
         };
         let first = insert(&pool, make()).await.unwrap();
@@ -3960,6 +4173,7 @@ mod tests {
                 url: uri.parse().unwrap(),
                 filename: None,
                 output_path: Some(PathBuf::from(format!("/tmp/torrents/{hash40}"))),
+                output_dir: None,
                 category: None,
                 priority: 0,
                 segments: None,
@@ -3973,6 +4187,7 @@ mod tests {
                     selected_files: None,
                     files: None,
                     swarm: None,
+                    owns_content_dir: false,
                 }),
             }
         };
@@ -4061,6 +4276,7 @@ mod tests {
                 selected: true,
             }]),
             swarm: None,
+            owns_content_dir: false,
         };
         let json = serde_json::to_string(&meta).unwrap();
         let row = sqlx::query(
@@ -4324,5 +4540,283 @@ mod tests {
         .await;
 
         assert!(reconcile_category_folder(&pool, id).await.unwrap().is_none());
+    }
+
+    // ---- Folder picked in the add dialog (`output_dir`) ----------------------
+
+    const OWN_HASH: &str = "abcdef0123456789abcdef0123456789abcdef01";
+
+    fn torrent_add(output_path: Option<PathBuf>, output_dir: Option<PathBuf>) -> AddDownload {
+        let uri = format!("magnet:?xt=urn:btih:{OWN_HASH}&dn=Show");
+        AddDownload {
+            url: uri.parse().unwrap(),
+            filename: None,
+            output_path,
+            output_dir,
+            category: None,
+            priority: 0,
+            segments: None,
+            media_info: None,
+            headers: None,
+            source: DownloadSource::Manual,
+            kind: DownloadKind::Torrent,
+            torrent: Some(TorrentMeta {
+                info_hash: String::new(),
+                source: TorrentSource::Magnet { uri },
+                selected_files: None,
+                files: Some(vec![
+                    TorrentFile {
+                        index: 0,
+                        path: "ep1.mkv".into(),
+                        length: 1,
+                        selected: true,
+                    },
+                    TorrentFile {
+                        index: 1,
+                        path: Path::new("extras").join("ep2.mkv").to_string_lossy().into(),
+                        length: 1,
+                        selected: true,
+                    },
+                ]),
+                swarm: None,
+                // Always overwritten by `insert`; a caller cannot claim it.
+                owns_content_dir: true,
+            }),
+        }
+    }
+
+    /// The add dialogs pick a FOLDER. It used to be stored as the output
+    /// file itself, so every HTTP download with a picked folder failed with
+    /// "output path is a directory".
+    #[tokio::test]
+    async fn output_dir_is_a_folder_the_file_lands_in() {
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let picked = tmp.path().join("Picked");
+        tokio::fs::create_dir_all(&picked).await.unwrap();
+        let add = || AddDownload {
+            url: "https://example.com/files/a.zip".parse().unwrap(),
+            filename: Some("a.zip".into()),
+            output_path: None,
+            output_dir: Some(picked.clone()),
+            category: None,
+            priority: 0,
+            segments: Some(1),
+            media_info: None,
+            headers: None,
+            source: DownloadSource::Manual,
+            kind: DownloadKind::Http,
+            torrent: None,
+        };
+        let first = insert(&pool, add()).await.unwrap();
+        assert_eq!(first.output_path, picked.join("a.zip"));
+        // Still de-duplicated inside the picked folder.
+        let second = insert(&pool, add()).await.unwrap();
+        assert_eq!(second.output_path, picked.join("a (1).zip"));
+        assert_eq!(second.filename, "a (1).zip");
+    }
+
+    /// A torrent pointed at a picked folder gets its own subfolder inside it
+    /// and owns only that — never the picked folder itself.
+    #[tokio::test]
+    async fn torrent_output_dir_gets_an_owned_subfolder() {
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let rec = insert(&pool, torrent_add(None, Some(tmp.path().to_path_buf())))
+            .await
+            .unwrap();
+        assert_eq!(rec.output_path, tmp.path().join("Show.abcdef012345"));
+        assert!(rec.torrent.unwrap().owns_content_dir);
+    }
+
+    #[tokio::test]
+    async fn explicit_torrent_content_folder_is_never_owned() {
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let rec = insert(&pool, torrent_add(Some(tmp.path().to_path_buf()), None))
+            .await
+            .unwrap();
+        assert_eq!(rec.output_path, tmp.path());
+        assert!(!rec.torrent.unwrap().owns_content_dir);
+    }
+
+    /// Two different nameless-hash torrents with the same name must not share
+    /// a folder: deleting one's data would take the other's with it.
+    #[tokio::test]
+    async fn hashless_torrent_folders_are_unique() {
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let add = |n: &str| {
+            let mut a = torrent_add(None, Some(tmp.path().to_path_buf()));
+            a.url = "magnet:?dn=Show".parse().unwrap();
+            a.filename = Some("Show".into());
+            a.torrent = Some(TorrentMeta {
+                info_hash: String::new(),
+                source: TorrentSource::File {
+                    path: tmp.path().join(n),
+                },
+                selected_files: None,
+                files: None,
+                swarm: None,
+                owns_content_dir: false,
+            });
+            a
+        };
+        let a = insert(&pool, add("a.torrent")).await.unwrap();
+        let b = insert(&pool, add("b.torrent")).await.unwrap();
+        assert_eq!(a.output_path, tmp.path().join("Show"));
+        assert_eq!(b.output_path, tmp.path().join("Show (1)"));
+    }
+
+    /// Lay out a torrent's two files plus a user file inside `root`.
+    async fn lay_out_torrent(root: &Path) {
+        tokio::fs::create_dir_all(root.join("extras"))
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("ep1.mkv"), b"1").await.unwrap();
+        tokio::fs::write(root.join("extras").join("ep2.mkv"), b"2")
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("keep.txt"), b"mine")
+            .await
+            .unwrap();
+    }
+
+    /// The data-loss case: a row whose content folder is a folder the user
+    /// already had (an explicit path, or a row from before ownership was
+    /// recorded). "Delete data" must take only the torrent's files.
+    #[tokio::test]
+    async fn remove_torrent_in_a_foreign_folder_deletes_only_its_files() {
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let downloads = tmp.path().join("Downloads");
+        lay_out_torrent(&downloads).await;
+        let rec = insert(&pool, torrent_add(Some(downloads.clone()), None))
+            .await
+            .unwrap();
+
+        let out = remove(&pool, rec.id, true).await.unwrap();
+
+        assert!(out.data_error.is_none(), "{:?}", out.data_error);
+        assert!(!downloads.join("ep1.mkv").exists());
+        assert!(!downloads.join("extras").exists(), "emptied subfolder goes");
+        assert!(
+            downloads.join("keep.txt").exists(),
+            "user file must survive"
+        );
+        assert!(downloads.exists(), "the folder itself must survive");
+    }
+
+    #[tokio::test]
+    async fn remove_torrent_in_a_foreign_folder_without_a_file_list_deletes_nothing() {
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let downloads = tmp.path().join("Downloads");
+        lay_out_torrent(&downloads).await;
+        let mut add = torrent_add(Some(downloads.clone()), None);
+        add.torrent.as_mut().unwrap().files = None;
+        let rec = insert(&pool, add).await.unwrap();
+
+        let out = remove(&pool, rec.id, true).await.unwrap();
+
+        assert!(
+            out.data_error.is_some(),
+            "the user must be told nothing was deleted"
+        );
+        assert!(downloads.join("ep1.mkv").exists());
+        assert!(downloads.join("keep.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn remove_torrent_never_follows_a_path_out_of_its_folder() {
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let downloads = tmp.path().join("Downloads");
+        tokio::fs::create_dir_all(&downloads).await.unwrap();
+        let outside = tmp.path().join("outside.txt");
+        tokio::fs::write(&outside, b"x").await.unwrap();
+        let mut add = torrent_add(Some(downloads.clone()), None);
+        add.torrent.as_mut().unwrap().files = Some(vec![TorrentFile {
+            index: 0,
+            path: Path::new("..").join("outside.txt").to_string_lossy().into(),
+            length: 1,
+            selected: true,
+        }]);
+        let rec = insert(&pool, add).await.unwrap();
+
+        remove(&pool, rec.id, true).await.unwrap();
+
+        assert!(outside.exists());
+    }
+
+    #[tokio::test]
+    async fn remove_torrent_deletes_an_owned_folder_wholesale() {
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let rec = insert(&pool, torrent_add(None, Some(tmp.path().to_path_buf())))
+            .await
+            .unwrap();
+        lay_out_torrent(&rec.output_path).await;
+
+        let out = remove(&pool, rec.id, true).await.unwrap();
+
+        assert!(out.data_error.is_none(), "{:?}", out.data_error);
+        assert!(!rec.output_path.exists());
+        assert!(tmp.path().exists(), "the picked folder around it stays");
+    }
+
+    /// Rows created before `owns_content_dir` existed deserialize it as
+    /// `false`. The per-torrent folders the app minted back then are still
+    /// recognized by their `.<hash prefix>` suffix and deleted wholesale.
+    #[tokio::test]
+    async fn remove_torrent_recognizes_a_legacy_owned_folder() {
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let legacy = tmp.path().join("Show.abcdef012345");
+        lay_out_torrent(&legacy).await;
+        let mut add = torrent_add(Some(legacy.clone()), None);
+        add.torrent.as_mut().unwrap().files = None;
+        let rec = insert(&pool, add).await.unwrap();
+        assert!(!rec.torrent.as_ref().unwrap().owns_content_dir);
+
+        let out = remove(&pool, rec.id, true).await.unwrap();
+
+        assert!(out.data_error.is_none(), "{:?}", out.data_error);
+        assert!(!legacy.exists());
+    }
+
+    /// A learned name is applied in place when the file sits in a folder
+    /// the user picked, instead of pulling it into a category folder.
+    #[tokio::test]
+    async fn apply_engine_filename_keeps_a_user_picked_folder() {
+        let pool = fresh_pool().await;
+        let video = crate::category::find_by_name(&pool, "Video")
+            .await
+            .unwrap()
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let picked = tmp.path().join("Picked");
+        let video_dir = tmp.path().join("Video");
+        tokio::fs::create_dir_all(&picked).await.unwrap();
+        sqlx::query("UPDATE categories SET default_output_path = ? WHERE id = ?")
+            .bind(video_dir.to_string_lossy().as_ref())
+            .bind(video.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let slug = "BWImVeeBXzQpnkCSnOk7PLUjH";
+        let on_disk = picked.join(slug);
+        tokio::fs::write(&on_disk, b"video bytes").await.unwrap();
+        let url = format!("https://dl.example.com/dl/{slug}");
+        let id = seed_row_with_url(&pool, &url, slug, on_disk.to_str().unwrap(), None).await;
+
+        let renamed = apply_engine_filename(&pool, id, &url.parse().unwrap(), "clip.mp4")
+            .await
+            .unwrap()
+            .expect("a better name should rename");
+
+        assert_eq!(renamed.path, picked.join("clip.mp4"));
+        assert!(picked.join("clip.mp4").exists());
     }
 }

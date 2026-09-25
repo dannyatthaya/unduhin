@@ -279,7 +279,7 @@ async function confirmTorrent() {
     const id = await downloads.add({
       url: trimmed,
       filename: filename.value.trim() || null,
-      output_path: outputPath.value.trim() || null,
+      output_dir: outputPath.value.trim() || null,
       category_id: categoryId.value,
       segments: null,
       kind: "torrent",
@@ -363,7 +363,7 @@ async function submit() {
     const id = await downloads.add({
       url: trimmedUrl,
       filename: filename.value.trim() || null,
-      output_path: outputPath.value.trim() || null,
+      output_dir: outputPath.value.trim() || null,
       category_id: categoryId.value,
       segments: segments.value,
     });

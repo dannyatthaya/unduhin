@@ -130,12 +130,14 @@ pub fn add_download_from_torrent_job(
         selected_files: None,
         files: None,
         swarm: None,
+        owns_content_dir: false,
     };
 
     Ok(AddDownload {
         url,
         filename: suggested_filename.filter(|s| !s.trim().is_empty()),
         output_path: None,
+        output_dir: None,
         category: None,
         priority: 0,
         segments: None,

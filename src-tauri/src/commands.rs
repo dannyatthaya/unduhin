@@ -26,7 +26,13 @@ use crate::window::ConfirmOnQuitBridge;
 pub struct AddDownloadInput {
     pub url: String,
     pub filename: Option<String>,
+    /// Exact output path, used verbatim (the file for HTTP / media, the
+    /// content folder for a torrent).
     pub output_path: Option<String>,
+    /// Folder picked in an add dialog. The file name is still derived and
+    /// de-duplicated inside it, and a torrent gets its own subfolder there.
+    #[serde(default)]
+    pub output_dir: Option<String>,
     pub category_id: Option<i64>,
     pub category_name: Option<String>,
     pub priority: Option<i64>,
@@ -341,7 +347,14 @@ pub async fn add_download(
         .add_download(AddDownload {
             url,
             filename: input.filename,
-            output_path: input.output_path.map(PathBuf::from),
+            output_path: input
+                .output_path
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from),
+            output_dir: input
+                .output_dir
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from),
             category,
             priority: input.priority.unwrap_or(0),
             segments: input.segments,
@@ -373,7 +386,7 @@ pub async fn start_handoff_download(
     core: State<'_, Core>,
     job: DownloadJob,
     filename: Option<String>,
-    output_path: Option<String>,
+    output_dir: Option<String>,
     category_id: Option<i64>,
     segments: Option<u32>,
 ) -> CommandResult<DownloadId> {
@@ -390,7 +403,9 @@ pub async fn start_handoff_download(
             // captured filename hint (the engine still derives a name if both
             // are absent).
             filename: filename.filter(|s| !s.is_empty()).or(job.filename),
-            output_path: output_path.filter(|s| !s.is_empty()).map(PathBuf::from),
+            // The dialog picks a folder; the name comes from the capture.
+            output_path: None,
+            output_dir: output_dir.filter(|s| !s.is_empty()).map(PathBuf::from),
             category,
             priority: 0,
             segments,

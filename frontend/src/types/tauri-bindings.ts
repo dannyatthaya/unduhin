@@ -121,6 +121,10 @@ export interface TorrentMeta {
   /** Last swarm snapshot; survives relaunch so the UI can render peers/seeds
    *  before the session re-attaches. */
   swarm: SwarmStats | null;
+  /** Whether the row's `output_path` is a folder the app created for this
+   *  torrent (and so deletes wholesale). Set by the backend; ignored on
+   *  input. */
+  owns_content_dir?: boolean;
 }
 
 /** Mirrors `core::download::ErrorKind`. Only `expired_auth` changes what the
@@ -425,7 +429,12 @@ export const EVENT_CHANNEL = "unduhin:event";
 export interface AddDownloadInput {
   url: string;
   filename?: string | null;
+  /** Exact output path, used verbatim: the file itself for HTTP / media, the
+   *  content folder for a torrent. The add dialogs use `output_dir`. */
   output_path?: string | null;
+  /** Folder to download into. The file name is still derived and
+   *  de-duplicated inside it; a torrent gets its own subfolder in it. */
+  output_dir?: string | null;
   category_id?: CategoryId | null;
   category_name?: string | null;
   priority?: number | null;
@@ -515,7 +524,8 @@ export const api = {
     job: DownloadJob,
     overrides: {
       filename?: string | null;
-      outputPath?: string | null;
+      /** Folder to download into (not the file path). */
+      outputDir?: string | null;
       categoryId?: CategoryId | null;
       segments?: number | null;
     } = {},
@@ -523,7 +533,7 @@ export const api = {
     invoke<DownloadId>("start_handoff_download", {
       job,
       filename: overrides.filename ?? null,
-      outputPath: overrides.outputPath ?? null,
+      outputDir: overrides.outputDir ?? null,
       categoryId: overrides.categoryId ?? null,
       segments: overrides.segments ?? null,
     }),

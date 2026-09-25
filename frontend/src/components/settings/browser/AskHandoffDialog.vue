@@ -129,7 +129,7 @@ async function confirm(): Promise<void> {
   try {
     const id = await api.startHandoffDownload(payload.job, {
       filename: filename.value.trim() || null,
-      outputPath: outputPath.value.trim() || null,
+      outputDir: outputPath.value.trim() || null,
       categoryId: categoryId.value,
       segments: segments.value,
     });
