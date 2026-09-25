@@ -187,7 +187,25 @@ mod keychain {
     static MASTER_KEY: OnceLock<Option<[u8; KEY_LEN]>> = OnceLock::new();
 
     fn master_key() -> Option<&'static [u8; KEY_LEN]> {
-        MASTER_KEY.get_or_init(load_or_create).as_ref()
+        MASTER_KEY
+            .get_or_init(|| {
+                if cfg!(any(test, feature = "ephemeral-header-key")) {
+                    ephemeral_key()
+                } else {
+                    load_or_create()
+                }
+            })
+            .as_ref()
+    }
+
+    /// A fresh random key that lives only as long as the process. Test
+    /// builds use it so headers are really sealed and opened without a
+    /// Keychain, which a CI runner doesn't have. Never for a shipped build:
+    /// nothing sealed with it can be read after a restart.
+    fn ephemeral_key() -> Option<[u8; KEY_LEN]> {
+        let mut key = [0u8; KEY_LEN];
+        SystemRandom::new().fill(&mut key).ok()?;
+        Some(key)
     }
 
     /// Bounded wrapper around [`keychain_io`]. See [`super::with_timeout`]
@@ -423,26 +441,20 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_either_encrypts_or_degrades_visibly() {
-        // A headless CI runner has no unlocked login keychain, so this
-        // legitimately takes the plaintext fallback there. Assert the
-        // invariant that holds either way: the value is either sealed and
-        // tagged, or untouched — never a tagged blob we cannot read back.
+    fn macos_output_is_sealed_and_round_trips() {
+        // Test builds seal with an in-memory key (see `ephemeral_key`), so
+        // this runs the real AES-GCM path even on a runner with no Keychain.
         let secret = "sid=supersecret";
         let stored = protect(secret);
-
-        if stored.starts_with(KEYCHAIN_TAG) {
-            assert!(
-                !stored.contains("supersecret"),
-                "ciphertext must not contain the plaintext"
-            );
-            assert_eq!(unprotect(&stored), secret, "sealed value must round-trip");
-        } else {
-            assert_eq!(
-                stored, secret,
-                "without a keychain the value must pass through unchanged"
-            );
-        }
+        assert!(
+            stored.starts_with(KEYCHAIN_TAG),
+            "stored value should be tagged"
+        );
+        assert!(
+            !stored.contains("supersecret"),
+            "ciphertext must not contain the plaintext"
+        );
+        assert_eq!(unprotect(&stored), secret, "sealed value must round-trip");
     }
 
     #[test]
