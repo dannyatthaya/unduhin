@@ -86,6 +86,10 @@ enum ServerMode {
     /// behind Cloudflare): the verify probe (`bytes=0-0`) and a single
     /// connection succeed, but the parallel offset segments are rejected.
     RejectOffsetRanges,
+    /// Range-capable, but answers every ranged GET with a `206` for the
+    /// bytes from offset 0 onward, whatever start was asked for — a broken
+    /// edge node. `Content-Range` tells the truth, so the engine can notice.
+    RangeFromZero,
 }
 
 #[derive(Clone)]
@@ -197,6 +201,25 @@ async fn handle(
                 .status(StatusCode::PARTIAL_CONTENT)
                 .header(CONTENT_LENGTH, slice.len() as u64)
                 .header(CONTENT_RANGE, format!("bytes {}-{}/{}", start, end, total))
+                .body(Full::new(Bytes::from(slice)))
+                .unwrap();
+            Ok(r)
+        }
+        (Some(r), ServerMode::RangeFromZero) => {
+            let Some((start, end)) = parse_range(r, total) else {
+                let r = resp
+                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .body(Full::new(Bytes::new()))
+                    .unwrap();
+                return Ok(r);
+            };
+            // Same length as asked for, but from the wrong place.
+            let len = end - start;
+            let slice = state.payload[..=len as usize].to_vec();
+            let r = resp
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(CONTENT_LENGTH, slice.len() as u64)
+                .header(CONTENT_RANGE, format!("bytes 0-{}/{}", len, total))
                 .body(Full::new(Bytes::from(slice)))
                 .unwrap();
             Ok(r)
@@ -889,5 +912,187 @@ async fn captured_user_agent_wins_over_engine_default() -> Result<()> {
 
     let _ = shutdown_tx.send(());
     let _ = server.await;
+    Ok(())
+}
+
+/// A server that answers a `206` for a range other than the one requested
+/// must never get its bytes spliced in at the requested offset. Before the
+/// `Content-Range` check, resuming the second half of this file wrote the
+/// file's first bytes over it and reported success.
+#[tokio::test]
+async fn wrong_content_range_is_never_written_at_the_requested_offset() -> Result<()> {
+    let server = TestServer::start(ServerMode::RangeFromZero).await?;
+    let tmp = tempfile::tempdir()?;
+    let out = tmp.path().join("shifted.bin");
+    let total = server.payload().len() as u64;
+    let half = total / 2;
+
+    // A transfer interrupted with the first segment done and the second not
+    // started: resuming must ask for `bytes=<half>-`.
+    let mut file = server.payload().to_vec();
+    file[half as usize..].fill(0);
+    std::fs::write(&out, &file)?;
+    let mut meta = engine::Meta::new(
+        server.url("/s.bin").to_string(),
+        out.clone(),
+        Some(total),
+        Some(ETAG_VALUE.to_string()),
+        Some(LAST_MODIFIED_VALUE.to_string()),
+        true,
+        vec![
+            engine::Segment {
+                index: 0,
+                start: 0,
+                end: half,
+            },
+            engine::Segment {
+                index: 1,
+                start: half,
+                end: total,
+            },
+        ],
+    );
+    meta.segments[0].bytes_downloaded = half;
+    let meta_path = engine::Meta::sidecar_path(&out);
+    meta.save(&meta_path).await?;
+
+    let result = resume_at(
+        meta_path,
+        Backoff {
+            base: Duration::from_millis(5),
+            cap: Duration::from_millis(10),
+            max_attempts: 2,
+        },
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+        None,
+        Vec::new(),
+        CancellationToken::new(),
+        None,
+        None,
+    )
+    .await;
+
+    let err = result.expect_err("a misplaced range must fail the transfer, not corrupt it");
+    assert!(
+        err.to_string().contains("range request"),
+        "unexpected error: {err}"
+    );
+    let bytes = std::fs::read(&out)?;
+    assert!(
+        bytes[half as usize..].iter().all(|b| *b == 0),
+        "no misplaced bytes may reach the file"
+    );
+    server.stop().await;
+    Ok(())
+}
+
+/// Minimal server that records each request's headers under its path and
+/// answers from `route`.
+async fn recording_server(
+    route: fn(&str) -> Response<Full<Bytes>>,
+) -> Result<(
+    SocketAddr,
+    Arc<tokio::sync::Mutex<Vec<(String, hyper::HeaderMap)>>>,
+)> {
+    let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let seen_for_server = seen.clone();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let seen = seen_for_server.clone();
+            tokio::spawn(async move {
+                let svc = service_fn(move |req: Request<Incoming>| {
+                    let seen = seen.clone();
+                    async move {
+                        let path = req.uri().path().to_string();
+                        seen.lock()
+                            .await
+                            .push((path.clone(), req.headers().clone()));
+                        Ok::<_, Infallible>(route(&path))
+                    }
+                });
+                let _ = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), svc)
+                    .await;
+            });
+        }
+    });
+    Ok((addr, seen))
+}
+
+fn tiny_file(_path: &str) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_LENGTH, 3)
+        .body(Full::new(Bytes::from_static(b"abc")))
+        .unwrap()
+}
+
+/// Captured credentials stay on the origin they were captured for. A
+/// redirect to another origin still gets the browser's ordinary headers,
+/// but not its cookies or a site's own token header; one that stays on the
+/// origin gets everything.
+#[tokio::test]
+async fn captured_headers_do_not_follow_a_redirect_to_another_origin() -> Result<()> {
+    let (cdn, cdn_seen) = recording_server(tiny_file).await?;
+
+    // The origin redirects `/away` to the CDN (another port, so another
+    // origin) and `/here` to its own `/file`. The CDN address is only known
+    // at runtime, so it rides in the query of the request URL.
+    fn origin_route(path: &str) -> Response<Full<Bytes>> {
+        match path {
+            "/here" => Response::builder()
+                .status(StatusCode::FOUND)
+                .header(hyper::header::LOCATION, "/file")
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+            p if p.starts_with("/away/") => Response::builder()
+                .status(StatusCode::FOUND)
+                .header(
+                    hyper::header::LOCATION,
+                    format!("http://{}/file", &p["/away/".len()..]),
+                )
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+            _ => tiny_file(path),
+        }
+    }
+    let (origin, origin_seen) = recording_server(origin_route).await?;
+
+    let extra = vec![
+        ("Cookie".to_string(), "session=abc".to_string()),
+        ("X-Api-Key".to_string(), "secret".to_string()),
+        ("Accept-Language".to_string(), "id-ID".to_string()),
+    ];
+    let client =
+        engine::http::build_client(Duration::from_secs(5), Duration::from_secs(5), None, &extra)?;
+
+    // Cross-origin: the CDN sees the ordinary header and the per-request
+    // Range, never the cookie or the token.
+    let url: Url = format!("http://{origin}/away/{cdn}").parse().unwrap();
+    let resp = client.get(url).header(RANGE, "bytes=0-").send().await?;
+    assert_eq!(resp.url().as_str(), format!("http://{cdn}/file"));
+    {
+        let seen = cdn_seen.lock().await;
+        let (_, h) = seen.last().expect("the CDN was reached");
+        assert!(h.get("cookie").is_none(), "cookie leaked cross-origin");
+        assert!(
+            h.get("x-api-key").is_none(),
+            "token header leaked cross-origin"
+        );
+        assert_eq!(h.get("accept-language").unwrap(), "id-ID");
+        assert_eq!(h.get("range").unwrap(), "bytes=0-");
+    }
+
+    // Same origin: everything is still sent.
+    let url: Url = format!("http://{origin}/here").parse().unwrap();
+    client.get(url).send().await?;
+    let seen = origin_seen.lock().await;
+    let (path, h) = seen.last().unwrap();
+    assert_eq!(path, "/file");
+    assert_eq!(h.get("cookie").unwrap(), "session=abc");
+    assert_eq!(h.get("x-api-key").unwrap(), "secret");
     Ok(())
 }

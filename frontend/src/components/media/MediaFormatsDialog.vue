@@ -97,7 +97,7 @@ async function submit() {
     const id = await downloads.add({
       url: props.probe.url,
       filename: null, // engine derives from the title in core::download::insert
-      output_path: outputPath.value.trim() || null,
+      output_dir: outputPath.value.trim() || null,
       category_id: categoryId.value,
       media_info: {
         extractor: props.probe.extractor,

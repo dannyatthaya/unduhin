@@ -7,14 +7,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::header::RANGE;
-use reqwest::{Client, Response, StatusCode};
+use reqwest::{Response, StatusCode};
 use tokio::fs::OpenOptions;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::error::{EngineError, Result};
-use crate::http::{build_client, probe, RemoteInfo};
+use crate::http::{build_client, probe, Client, RemoteInfo};
 use crate::meta::Meta;
 use crate::progress::{ProgressEvent, DEFAULT_CHANNEL_CAPACITY};
 use crate::retry::Backoff;
@@ -418,7 +418,9 @@ async fn verify_range_support(client: &Client, url: &Url) -> Result<bool> {
         .header(RANGE, "bytes=0-0")
         .send()
         .await?;
-    Ok(resp.status() == StatusCode::PARTIAL_CONTENT)
+    // A 206 for some other range is no better than ignoring `Range`.
+    Ok(resp.status() == StatusCode::PARTIAL_CONTENT
+        && crate::http::check_range_start(&resp, 0).is_ok())
 }
 
 fn build_initial_meta(opts: &DownloadOptions, info: &RemoteInfo, ranges: bool) -> Meta {

@@ -4,9 +4,9 @@ use std::time::Duration;
 
 use reqwest::header::{
     HeaderMap, HeaderName, HeaderValue, ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH,
-    CONTENT_TYPE, ETAG, LAST_MODIFIED, RANGE, USER_AGENT,
+    CONTENT_RANGE, CONTENT_TYPE, ETAG, LAST_MODIFIED, LOCATION, RANGE, USER_AGENT,
 };
-use reqwest::{Client, Response, StatusCode};
+use reqwest::{Method, Response, StatusCode};
 use url::Url;
 
 use crate::error::{EngineError, Result};
@@ -61,14 +61,168 @@ pub const HEADER_DROP_LIST: &[&str] = &[
     "proxy-authenticate",
 ];
 
-/// Build a reqwest client with sensible defaults. Pass `None` for
-/// `user_agent` to keep the engine's compiled-in default.
+/// Most redirects followed for one request, matching reqwest's default.
+const MAX_REDIRECTS: usize = 10;
+
+/// Captured headers that still go out after a redirect leaves the origin
+/// the request started on: the ones a browser itself sends to any site, and
+/// none that authenticate. Everything else a browser capture can carry —
+/// `Cookie`, `Authorization`, a site's own `X-Api-Key` — is only ever sent
+/// to the origin it was captured for.
+fn is_cross_origin_safe(name: &HeaderName) -> bool {
+    let n = name.as_str();
+    matches!(
+        n,
+        "accept"
+            | "accept-language"
+            | "cache-control"
+            | "dnt"
+            | "pragma"
+            | "priority"
+            | "referer"
+            | "upgrade-insecure-requests"
+    ) || n.starts_with("sec-fetch-")
+        || n.starts_with("sec-ch-")
+}
+
+/// HTTP client used by the engine: reqwest plus redirect handling that
+/// keeps captured credentials on the origin they belong to.
 ///
-/// `extra_headers` is replayed on every request via `default_headers`.
-/// Names on the [`HEADER_DROP_LIST`] are silently dropped — passing them
-/// is not an error because they typically arrive as part of a captured
-/// browser request and the caller would otherwise have to filter them
-/// itself.
+/// reqwest follows redirects itself, but only strips its fixed list of
+/// sensitive headers (`Cookie`, `Authorization`, …) when a redirect changes
+/// host. A browser capture carries arbitrary headers, and a site-specific
+/// token header would have followed a redirect to any host the server
+/// named. So automatic redirects are off, [`RequestBuilder::send`] follows
+/// them by hand, and once a redirect leaves the starting origin the rest of
+/// the chain uses a client that only carries [`is_cross_origin_safe`]
+/// headers.
+#[derive(Debug, Clone)]
+pub struct Client {
+    /// Every captured header.
+    full: reqwest::Client,
+    /// Only the cross-origin-safe ones. Same as `full` when nothing was
+    /// filtered out.
+    cross_origin: reqwest::Client,
+}
+
+impl Client {
+    pub fn get(&self, url: Url) -> RequestBuilder<'_> {
+        self.request(Method::GET, url)
+    }
+
+    pub fn head(&self, url: Url) -> RequestBuilder<'_> {
+        self.request(Method::HEAD, url)
+    }
+
+    fn request(&self, method: Method, url: Url) -> RequestBuilder<'_> {
+        RequestBuilder {
+            client: self,
+            method,
+            url,
+            headers: HeaderMap::new(),
+            invalid_header: None,
+        }
+    }
+}
+
+/// One request on a [`Client`]. Headers set here (`Range`, `If-Range`) are
+/// per-request and are re-sent on every redirect hop.
+#[must_use]
+pub struct RequestBuilder<'a> {
+    client: &'a Client,
+    method: Method,
+    url: Url,
+    headers: HeaderMap,
+    invalid_header: Option<HeaderName>,
+}
+
+impl RequestBuilder<'_> {
+    pub fn header<V>(mut self, name: HeaderName, value: V) -> Self
+    where
+        HeaderValue: TryFrom<V>,
+    {
+        match HeaderValue::try_from(value) {
+            Ok(v) => {
+                self.headers.insert(name, v);
+            }
+            Err(_) => self.invalid_header = Some(name),
+        }
+        self
+    }
+
+    /// Send the request, following up to [`MAX_REDIRECTS`] redirects.
+    pub async fn send(self) -> Result<Response> {
+        let RequestBuilder {
+            client,
+            mut method,
+            mut url,
+            headers,
+            invalid_header,
+        } = self;
+        if let Some(name) = invalid_header {
+            return Err(EngineError::other(format!(
+                "invalid value for header {name}"
+            )));
+        }
+        let origin = url.origin();
+        let mut left_origin = false;
+        for _ in 0..=MAX_REDIRECTS {
+            let http = if left_origin {
+                &client.cross_origin
+            } else {
+                &client.full
+            };
+            let resp = http
+                .request(method.clone(), url.clone())
+                .headers(headers.clone())
+                .send()
+                .await?;
+            let Some(next) = redirect_target(&resp, &url) else {
+                return Ok(resp);
+            };
+            if resp.status() == StatusCode::SEE_OTHER && method != Method::HEAD {
+                method = Method::GET;
+            }
+            // Sticky: a chain that comes back to the origin after leaving it
+            // has already been through a host that could have chosen where
+            // to send us next.
+            left_origin |= next.origin() != origin;
+            url = next;
+        }
+        Err(EngineError::other(format!(
+            "too many redirects (more than {MAX_REDIRECTS})"
+        )))
+    }
+}
+
+/// Where a redirect response points, or `None` when `resp` is not one to
+/// follow (not a 301/302/303/307/308, no usable `Location`, or a target
+/// that is not http(s)) — in which case it is returned to the caller as is.
+fn redirect_target(resp: &Response, current: &Url) -> Option<Url> {
+    if !matches!(
+        resp.status(),
+        StatusCode::MOVED_PERMANENTLY
+            | StatusCode::FOUND
+            | StatusCode::SEE_OTHER
+            | StatusCode::TEMPORARY_REDIRECT
+            | StatusCode::PERMANENT_REDIRECT
+    ) {
+        return None;
+    }
+    let location = resp.headers().get(LOCATION)?.to_str().ok()?;
+    let next = current.join(location).ok()?;
+    matches!(next.scheme(), "http" | "https").then_some(next)
+}
+
+/// Build the engine's HTTP client. Pass `None` for `user_agent` to keep
+/// the engine's compiled-in default.
+///
+/// `extra_headers` is replayed on every request via `default_headers`
+/// (only the cross-origin-safe subset once a redirect leaves the starting
+/// origin — see [`Client`]). Names on the [`HEADER_DROP_LIST`] are silently
+/// dropped — passing them is not an error because they typically arrive as
+/// part of a captured browser request and the caller would otherwise have
+/// to filter them itself.
 pub fn build_client(
     connect_timeout: Duration,
     read_timeout: Duration,
@@ -93,13 +247,56 @@ pub fn build_client(
         .filter(|s| !s.is_empty())
         .or(captured_ua)
         .unwrap_or_else(|| concat!("unduhin/", env!("CARGO_PKG_VERSION")).to_string());
-    Client::builder()
-        .connect_timeout(connect_timeout)
-        .read_timeout(read_timeout)
-        .user_agent(ua)
-        .default_headers(headers)
-        .build()
-        .map_err(EngineError::from)
+    let cross_origin_headers: HeaderMap = headers
+        .iter()
+        .filter(|(name, _)| is_cross_origin_safe(name))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    let all_safe = cross_origin_headers.len() == headers.len();
+    let make = |headers: HeaderMap| {
+        reqwest::Client::builder()
+            .connect_timeout(connect_timeout)
+            .read_timeout(read_timeout)
+            .user_agent(ua.clone())
+            .default_headers(headers)
+            // Followed by hand in `RequestBuilder::send`.
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(EngineError::from)
+    };
+    let full = make(headers)?;
+    let cross_origin = if all_safe {
+        full.clone()
+    } else {
+        make(cross_origin_headers)?
+    };
+    Ok(Client { full, cross_origin })
+}
+
+/// Check that a `206` really starts where `requested_start` asked it to.
+///
+/// The engine writes a range body at the offset it requested, so a server
+/// that answers `206` with some other range (clamped, rounded to a chunk, or
+/// simply from the start) would corrupt the file without any other error.
+/// A `206` with no `Content-Range` is accepted, as before: it gives nothing
+/// to check against, and rejecting it would break servers that worked.
+pub(crate) fn check_range_start(resp: &Response, requested_start: u64) -> Result<()> {
+    match content_range_start(resp) {
+        Some(served) if served != requested_start => Err(EngineError::RangeMismatch {
+            requested: requested_start,
+            served,
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// First byte offset of a `Content-Range: bytes <first>-<last>/<len>`
+/// header, if there is a parseable one.
+fn content_range_start(resp: &Response) -> Option<u64> {
+    let raw = resp.headers().get(CONTENT_RANGE)?.to_str().ok()?;
+    let range = raw.trim().strip_prefix("bytes")?.trim_start();
+    let (first, _) = range.split_once('-')?;
+    first.trim().parse().ok()
 }
 
 /// Filter `pairs` against [`HEADER_DROP_LIST`] and convert into a

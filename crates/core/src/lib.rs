@@ -28,6 +28,7 @@ pub mod download;
 pub mod error;
 pub mod event;
 pub mod logging;
+mod motw;
 mod queue;
 pub mod schedule;
 mod secret;
@@ -407,10 +408,37 @@ impl Core {
         // another identical failure.
         let remote = engine::probe(&client, &parsed).await?;
 
+        // Everything from here commits as one unit against status changes.
+        // The probe above took network time, and in that window the user
+        // may have resumed the row (and a worker claimed it), or a paused
+        // file may have been moved. Rewriting the URL and dropping the
+        // sidecar under a running worker would corrupt the transfer, so the
+        // status is re-checked with a compare-and-set that also takes
+        // SQLite's write lock: until the commit, no resume, retry, schedule
+        // or queue claim can change this row. Every statement goes through
+        // `tx`; touching the pool here could wait on our own lock.
+        let mut tx = self.inner.pool.begin().await?;
+        let claimed = sqlx::query(
+            "UPDATE downloads SET status = status \
+             WHERE id = ? AND status IN ('failed', 'paused')",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        let current = download::get_with(&mut *tx, id).await?;
+        if claimed == 0 {
+            return Err(CoreError::InvalidTransition {
+                id,
+                from: current.status.to_string(),
+                to: "refreshed".to_string(),
+            });
+        }
+
         // Does the new URL serve the same body the partial file came from?
         // `matches_remote` is the exact check `resume_at` runs, so agreeing
         // with it here means the worker will agree with us later.
-        let sidecar = engine::Meta::sidecar_path(&record.output_path);
+        let sidecar = engine::Meta::sidecar_path(&current.output_path);
         let mut meta = engine::Meta::load(&sidecar).await.ok();
         let resumable = match meta.as_ref() {
             Some(m) => m.matches_remote(
@@ -424,53 +452,66 @@ impl Core {
         };
 
         if meta.is_some() && !resumable && !force_restart {
+            // Nothing written; dropping `tx` rolls the no-op claim back.
             return Ok(RefreshOutcome::SourceChanged {
                 old_bytes: meta.as_ref().and_then(|m| m.total_bytes),
                 new_bytes: remote.content_length,
             });
         }
 
-        if !resumable {
-            // Drops the sidecar and zeroes the progress columns, so the row
-            // cannot show a bar it has no bytes behind.
-            download::reset_for_restart(&self.inner.pool, id).await?;
-        }
-
-        download::update_source(&self.inner.pool, id, parsed.as_str(), headers.as_deref()).await?;
+        download::update_source(&mut *tx, id, parsed.as_str(), headers.as_deref()).await?;
 
         if resumable {
-            // The DB column is not what the worker resumes against.
-            // `engine::resume_at_with_control` takes no URL argument at all —
-            // it reads `Meta.url` out of the sidecar. Rewriting only the row
-            // would leave the worker fetching the dead link and failing with
-            // the same 403 that started this. Write the sidecar BEFORE the
-            // row goes back to `Queued`, so the queue can never observe a
-            // refreshed row pointing at a stale sidecar.
-            if let Some(m) = meta.as_mut() {
-                m.url = parsed.to_string();
-                m.save(&sidecar).await?;
-            }
             // `update_source` cleared the validators along with the URL. Put
             // the freshly probed ones back so the DB mirrors the sidecar the
             // worker is about to validate against.
             download::persist_progress(
-                &self.inner.pool,
+                &mut *tx,
                 id,
-                record.downloaded_bytes,
+                current.downloaded_bytes,
                 remote.content_length,
                 remote.etag.as_deref(),
                 remote.last_modified.as_deref(),
                 None,
             )
             .await?;
+        } else {
+            // Zero the progress columns, so the row cannot show a bar it
+            // has no bytes behind.
+            download::reset_progress(&mut *tx, id).await?;
         }
-
-        self.change_status(id, &[Status::Failed, Status::Paused], Status::Queued)
+        sqlx::query("UPDATE downloads SET status = 'queued', error = NULL WHERE id = ?")
+            .bind(id)
+            .execute(&mut *tx)
             .await?;
+
+        // Files last, just before the commit: if one of these fails, the
+        // row rolls back to its old URL with the old sidecar intact.
+        if resumable {
+            // The DB column is not what the worker resumes against.
+            // `engine::resume_at_with_control` takes no URL argument at all —
+            // it reads `Meta.url` out of the sidecar. Rewriting only the row
+            // would leave the worker fetching the dead link and failing with
+            // the same 403 that started this.
+            if let Some(m) = meta.as_mut() {
+                m.url = parsed.to_string();
+                m.save(&sidecar).await?;
+            }
+        } else {
+            let _ = tokio::fs::remove_file(&sidecar).await;
+        }
+        tx.commit().await?;
+
+        let _ = self.inner.events.send(CoreEvent::StatusChanged {
+            id,
+            from: current.status,
+            to: Status::Queued,
+        });
+        self.poke_queue().await;
 
         if resumable {
             Ok(RefreshOutcome::Resumed {
-                downloaded_bytes: record.downloaded_bytes,
+                downloaded_bytes: current.downloaded_bytes,
                 total_bytes: remote.content_length,
             })
         } else {

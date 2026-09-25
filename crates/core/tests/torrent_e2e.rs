@@ -95,12 +95,14 @@ async fn magnet_completes_through_worker() -> Result<()> {
         selected_files: None,
         files: None,
         swarm: None,
+        owns_content_dir: false,
     };
     let id = core
         .add_download(AddDownload {
             url: magnet.parse()?,
             filename: None,
             output_path: Some(content.join("debian")),
+            output_dir: None,
             category: None,
             priority: 0,
             segments: None,

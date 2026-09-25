@@ -1113,6 +1113,13 @@ async fn run_worker(
                     ),
                 }
 
+                // Tag the files as downloaded from the internet, as a browser
+                // would have. Last, so every rename and move above is done
+                // and the tag lands on the file's final path.
+                if let Ok(record) = download::get(&pool, id).await {
+                    crate::motw::mark_download(&record).await;
+                }
+
                 tracing::info!(id, ?from, bytes = summary.bytes, "queue: marking completed");
                 if let Err(e) = download::mark_completed(&pool, id, summary.bytes).await {
                     tracing::warn!(id, error = %e, "queue: mark_completed failed");
@@ -1336,6 +1343,14 @@ const STRIPPABLE_EXTENSIONS: &[&str] = &[
 /// escape for one literal percent sign. Escaping the stem before it is
 /// formatted leaves the `%(ext)s` the caller appends untouched.
 fn ytdlp_output_stem(name: &str) -> String {
+    media_stem(name).replace('%', "%%")
+}
+
+/// The part of a stored media file name yt-dlp keeps: `name` minus any
+/// trailing [`STRIPPABLE_EXTENSIONS`]. yt-dlp writes the finished file as
+/// `<media_stem>.<ext>`, which is what add-time name resolution has to
+/// keep free. Unescaped — see [`ytdlp_output_stem`] for the template form.
+pub(crate) fn media_stem(name: &str) -> &str {
     let mut stem = name;
     while let Some((base, ext)) = stem.rsplit_once('.') {
         if base.is_empty() || !STRIPPABLE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()) {
@@ -1343,7 +1358,7 @@ fn ytdlp_output_stem(name: &str) -> String {
         }
         stem = base;
     }
-    stem.replace('%', "%%")
+    stem
 }
 
 /// Drive a yt-dlp child process for a media-info-tagged download. Wraps
@@ -1625,7 +1640,8 @@ fn classify_engine_error(err: &engine::EngineError) -> ErrorKind {
         engine::EngineError::Io { .. } => ErrorKind::Disk,
         engine::EngineError::TransientStatus { .. }
         | engine::EngineError::RetryExhausted { .. }
-        | engine::EngineError::BodyTruncated { .. } => ErrorKind::Network,
+        | engine::EngineError::BodyTruncated { .. }
+        | engine::EngineError::RangeMismatch { .. } => ErrorKind::Network,
         _ => ErrorKind::Other,
     }
 }

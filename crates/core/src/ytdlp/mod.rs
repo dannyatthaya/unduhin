@@ -144,8 +144,9 @@ pub struct YtdlpJob {
     /// `format_selector` involves separate video+audio streams.
     pub ffmpeg_path: Option<PathBuf>,
     pub user_agent: Option<String>,
-    /// Additional request headers forwarded to yt-dlp via `--add-header
-    /// "Name:Value"`. Populated by browser captures
+    /// Additional request headers forwarded to yt-dlp as `--add-header
+    /// "Name:Value"` in a private options file, never on the command line
+    /// (see `RequestOptionsFile`). Populated by browser captures
     /// (Cookie / Referer / observed `webRequest` headers). Names on
     /// [`engine::http::HEADER_DROP_LIST`] are silently dropped to mirror
     /// the engine's sanitization — captured `Range` or `Host` would
@@ -517,35 +518,19 @@ pub async fn download(
     for arg in impersonate_args(should_impersonate) {
         cmd.arg(arg);
     }
-    // Route the captured User-Agent and Referer through yt-dlp's dedicated
-    // flags rather than `--add-header`. `--add-header User-Agent:…` is
-    // unreliable — extractors set their own UA and can override it, and a
-    // non-browser UA is exactly what trips Referer/hotlink-protection 403s.
-    // `--user-agent` / `--referer` are authoritative. A custom UA from the
-    // global `user_agent` setting still wins over the captured one.
-    let sanitized = sanitize_extra_headers(&job.extra_headers);
-    let captured_ua = sanitized
-        .iter()
-        .find(|(n, _)| n.eq_ignore_ascii_case("user-agent"))
-        .map(|(_, v)| v.clone());
-    if let Some(ua) = job.user_agent.clone().or(captured_ua) {
-        cmd.arg("--user-agent").arg(ua);
-    }
-    if let Some((_, referer)) = sanitized
-        .iter()
-        .find(|(n, _)| n.eq_ignore_ascii_case("referer"))
-    {
-        cmd.arg("--referer").arg(referer);
-    }
-    for (name, value) in &sanitized {
-        // User-Agent and Referer are sent via their dedicated flags above;
-        // skip them here so yt-dlp doesn't see conflicting duplicates. The
-        // name is ASCII-validated and the value CR/LF-free per `sanitize`.
-        if name.eq_ignore_ascii_case("user-agent") || name.eq_ignore_ascii_case("referer") {
-            continue;
-        }
-        cmd.arg("--add-header").arg(format!("{name}:{value}"));
-    }
+    // The captured request context (cookies included) reaches yt-dlp
+    // through a private options file, never argv: any process can read
+    // another's command line (`ps`, Task Manager), and on macOS that
+    // includes other users' processes. Deleted when this function returns,
+    // however it returns.
+    let request_args = request_args(job.user_agent.as_deref(), &job.extra_headers);
+    let _request_file = if request_args.is_empty() {
+        None
+    } else {
+        let file = RequestOptionsFile::write(&job.temp_dir, &request_args)?;
+        cmd.arg("--config-locations").arg(file.path());
+        Some(file)
+    };
     cmd.arg(&job.url)
         // yt-dlp.exe on Windows is a PyInstaller-frozen Python program.
         // When its stdout is piped (not a TTY), Python defaults to
@@ -853,6 +838,100 @@ fn same_volume(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// yt-dlp options carrying a download's captured request context.
+///
+/// The captured User-Agent and Referer go through yt-dlp's dedicated flags
+/// rather than `--add-header`. `--add-header User-Agent:…` is unreliable —
+/// extractors set their own UA and can override it, and a non-browser UA is
+/// exactly what trips Referer/hotlink-protection 403s. `--user-agent` /
+/// `--referer` are authoritative. A custom UA from the global `user_agent`
+/// setting still wins over the captured one.
+fn request_args(user_agent: Option<&str>, extra_headers: &[(String, String)]) -> Vec<String> {
+    let sanitized = sanitize_extra_headers(extra_headers);
+    let mut args = Vec::new();
+    let captured_ua = sanitized
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case("user-agent"))
+        .map(|(_, v)| v.as_str());
+    if let Some(ua) = user_agent.or(captured_ua) {
+        args.extend(["--user-agent".to_string(), ua.to_string()]);
+    }
+    if let Some((_, referer)) = sanitized
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case("referer"))
+    {
+        args.extend(["--referer".to_string(), referer.clone()]);
+    }
+    for (name, value) in &sanitized {
+        // Sent via their dedicated flags above; skipped here so yt-dlp
+        // doesn't see conflicting duplicates.
+        if name.eq_ignore_ascii_case("user-agent") || name.eq_ignore_ascii_case("referer") {
+            continue;
+        }
+        args.extend(["--add-header".to_string(), format!("{name}:{value}")]);
+    }
+    args
+}
+
+/// A yt-dlp options file (`--config-locations`) holding `args`, readable
+/// only by the current user, removed on drop.
+struct RequestOptionsFile {
+    path: PathBuf,
+}
+
+impl RequestOptionsFile {
+    fn write(dir: &Path, args: &[String]) -> std::io::Result<Self> {
+        use std::io::Write as _;
+
+        let path = dir.join("request-options.conf");
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // Owner-only from the first byte. (On Windows the scratch dir
+            // under %TEMP% is already private to the user.)
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&path)?;
+        // Removed from here on, even if the write fails part-way.
+        let guard = Self { path };
+        file.write_all(options_file_contents(args).as_bytes())?;
+        file.sync_all()?;
+        Ok(guard)
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for RequestOptionsFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Render `args` as a yt-dlp options file.
+///
+/// yt-dlp splits the file with Python's `shlex.split(…, comments=True)`
+/// (POSIX rules), so every argument is single-quoted — inside single quotes
+/// nothing is special, `#` included — with an embedded `'` written as
+/// `'"'"'`. Without a BOM yt-dlp decodes the file in the locale encoding,
+/// which is not UTF-8 on most Windows systems; the `coding:` line pins it.
+fn options_file_contents(args: &[String]) -> String {
+    let mut out = String::from("# coding: utf-8\n");
+    for pair in args.chunks(2) {
+        let line: Vec<String> = pair
+            .iter()
+            .map(|a| format!("'{}'", a.replace('\'', r#"'"'"'"#)))
+            .collect();
+        out.push_str(&line.join(" "));
+        out.push('\n');
+    }
+    out
+}
+
 /// Filter a captured header list against the engine's drop-list and
 /// reject values containing control bytes (CR/LF would terminate the
 /// `--add-header` argument or break yt-dlp's own header parser). The
@@ -874,7 +953,8 @@ fn sanitize_extra_headers(pairs: &[(String, String)]) -> Vec<(String, String)> {
                 tracing::warn!(header = %name, "ytdlp: invalid header name; skipping");
                 return None;
             }
-            if value.bytes().any(|b| b == b'\r' || b == b'\n') {
+            // NUL cannot survive the trip through the options file either.
+            if value.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
                 tracing::warn!(header = %name, "ytdlp: invalid header value; skipping");
                 return None;
             }
@@ -1794,7 +1874,7 @@ Tor       -     curl_cffi>=0.11 (unavailable)
     /// A `YtdlpJob` pointed at `script`, writing into `dir`, with every
     /// optional knob off. Keeps the download tests below focused on the
     /// one thing each is actually about.
-    #[cfg(target_os = "windows")]
+    #[cfg(any(windows, unix))]
     fn download_job(script: &Path, dir: &Path) -> YtdlpJob {
         YtdlpJob {
             url: "https://cdn.example.com/media.m3u8".into(),
@@ -2045,5 +2125,109 @@ Tor       -     curl_cffi>=0.11 (unavailable)
         let output = Path::new(r"Z:\Media\Clips");
         let dir = scratch_dir_for(output, 7);
         assert_eq!(dir, output.join(SCRATCH_DIR_NAME).join("7"));
+    }
+
+    /// Every argument is single-quoted for yt-dlp's `shlex.split`, with an
+    /// embedded `'` closed, emitted in double quotes, and reopened.
+    #[test]
+    fn options_file_quotes_every_argument() {
+        let args = vec![
+            "--add-header".to_string(),
+            r#"Cookie:a=1; b="x y"; c=it's#not-a-comment"#.to_string(),
+            "--referer".to_string(),
+            "https://example.com/pâge?q=1".to_string(),
+        ];
+        assert_eq!(
+            options_file_contents(&args),
+            "# coding: utf-8\n\
+             '--add-header' 'Cookie:a=1; b=\"x y\"; c=it'\"'\"'s#not-a-comment'\n\
+             '--referer' 'https://example.com/pâge?q=1'\n"
+        );
+    }
+
+    #[test]
+    fn request_args_route_ua_and_referer_through_their_flags() {
+        let headers = vec![
+            ("User-Agent".to_string(), "browser/1".to_string()),
+            ("Referer".to_string(), "https://example.com/".to_string()),
+            ("Cookie".to_string(), "s=1".to_string()),
+        ];
+        assert_eq!(
+            request_args(None, &headers),
+            vec![
+                "--user-agent",
+                "browser/1",
+                "--referer",
+                "https://example.com/",
+                "--add-header",
+                "Cookie:s=1",
+            ]
+        );
+        // The global setting wins over the captured UA.
+        assert_eq!(request_args(Some("mine"), &headers)[1], "mine");
+        assert!(request_args(None, &[]).is_empty());
+    }
+
+    /// Cookies must never appear in yt-dlp's argv, which other processes can
+    /// read. They travel in an owner-only options file that is gone once
+    /// the download returns.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn download_keeps_captured_cookies_off_the_command_line() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake-yt-dlp");
+        let argv = dir.path().join("argv.txt");
+        let conf = dir.path().join("conf.txt");
+        let mode = dir.path().join("mode.txt");
+        // Record argv, and copy the options file (and its permissions)
+        // while yt-dlp would be reading it.
+        tokio::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 echo \"$@\" > '{argv}'\n\
+                 while [ $# -gt 0 ]; do\n\
+                   if [ \"$1\" = --config-locations ]; then\n\
+                     cp \"$2\" '{conf}'; stat -c %a \"$2\" > '{mode}' 2>/dev/null || stat -f %Lp \"$2\" > '{mode}'\n\
+                   fi\n\
+                   shift\n\
+                 done\n",
+                argv = argv.display(),
+                conf = conf.display(),
+                mode = mode.display(),
+            ),
+        )
+        .await
+        .unwrap();
+        tokio::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+
+        let mut job = download_job(&script, dir.path());
+        job.extra_headers = vec![("Cookie".into(), "session=top-secret".into())];
+        let options_path = job.temp_dir.join("request-options.conf");
+        let _ = download(job, CancellationToken::new(), None).await;
+
+        let argv = tokio::fs::read_to_string(&argv).await.unwrap();
+        assert!(
+            !argv.contains("top-secret"),
+            "cookie on the command line: {argv}"
+        );
+        assert!(argv.contains("--config-locations"), "got argv: {argv}");
+        let conf = tokio::fs::read_to_string(&conf).await.unwrap();
+        assert!(
+            conf.contains("'--add-header' 'Cookie:session=top-secret'"),
+            "{conf}"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&mode).await.unwrap().trim(),
+            "600"
+        );
+        assert!(
+            tokio::fs::metadata(&options_path).await.is_err(),
+            "the options file must be removed after the run"
+        );
     }
 }

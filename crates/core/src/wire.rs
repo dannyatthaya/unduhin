@@ -676,6 +676,28 @@ pub enum Outbound {
     },
 }
 
+impl Outbound {
+    /// True for a frame the app pushes on its own, false for the one reply
+    /// every forwarded [`Inbound`] frame gets.
+    ///
+    /// The extension matches replies to requests purely by order, so both
+    /// ends must agree on this split. The native host uses it to count the
+    /// replies the app still owes; the extension's `UNSOLICITED_TYPES`
+    /// (`extension/src/background/native-bridge.ts`) must list exactly these
+    /// variants. `Settings` is deliberately absent: it is the reply to
+    /// `SetSettings` / `GetSettings`.
+    pub fn is_unsolicited(&self) -> bool {
+        matches!(
+            self,
+            Outbound::SettingsChanged { .. }
+                | Outbound::HandoffDecision { .. }
+                | Outbound::ExtensionUpdated { .. }
+                | Outbound::ArmRefresh { .. }
+                | Outbound::RefreshCredentials { .. }
+        )
+    }
+}
+
 /// The well-known Native Messaging host name registered under
 /// `HKCU\Software\<browser>\NativeMessagingHosts\com.unduhin.host`.
 /// The installer registers these registry hooks; the NSIS hook wires them.
@@ -1032,5 +1054,109 @@ mod tests {
             }
             other => panic!("expected Download, got {other:?}"),
         }
+    }
+
+    /// One instance of every `Outbound` variant, for the reply/push split
+    /// test. The match forces this list to grow with the enum.
+    fn every_outbound() -> Vec<Outbound> {
+        let all = vec![
+            Outbound::Pong,
+            Outbound::Ack { id: 1 },
+            Outbound::Status { downloads: vec![] },
+            Outbound::Error {
+                message: "x".into(),
+            },
+            Outbound::Settings {
+                full: ExtensionSettings::defaults(),
+            },
+            Outbound::SettingsChanged {
+                full: ExtensionSettings::defaults(),
+            },
+            Outbound::HandoffDecision {
+                id: "a".into(),
+                decision: HandoffDecision::Capture,
+            },
+            Outbound::ExtensionUpdated {
+                version: "1.0.0".into(),
+            },
+            Outbound::MediaFormats { formats: vec![] },
+            Outbound::ArmRefresh {
+                download_id: 1,
+                filename: None,
+                size_bytes: None,
+                origin: None,
+                expires_at_ms: 0,
+            },
+            Outbound::RefreshCredentials {
+                token: "t".into(),
+                download_id: 1,
+                url: "https://example.com/".into(),
+            },
+        ];
+        for msg in &all {
+            match msg {
+                Outbound::Pong
+                | Outbound::Ack { .. }
+                | Outbound::Status { .. }
+                | Outbound::Error { .. }
+                | Outbound::Settings { .. }
+                | Outbound::SettingsChanged { .. }
+                | Outbound::HandoffDecision { .. }
+                | Outbound::ExtensionUpdated { .. }
+                | Outbound::MediaFormats { .. }
+                | Outbound::ArmRefresh { .. }
+                | Outbound::RefreshCredentials { .. } => {}
+            }
+        }
+        all
+    }
+
+    fn wire_type(msg: &Outbound) -> String {
+        serde_json::to_value(msg).unwrap()["type"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// `Settings` answers `SetSettings`, so it must count as a reply. The
+    /// extension once filed it as a push, which left the `setSettings` waiter
+    /// at the head of its reply queue forever and shifted every later reply
+    /// onto the wrong request.
+    #[test]
+    fn settings_is_a_reply_not_a_push() {
+        assert!(!Outbound::Settings {
+            full: ExtensionSettings::defaults()
+        }
+        .is_unsolicited());
+    }
+
+    /// The extension's `UNSOLICITED_TYPES` and `Outbound::is_unsolicited`
+    /// must name the same frames, or the host and the extension disagree
+    /// about which frames answer a request.
+    #[test]
+    fn extension_unsolicited_types_match_is_unsolicited() {
+        let src = include_str!("../../../extension/src/background/native-bridge.ts");
+        let start = src
+            .find("UNSOLICITED_TYPES")
+            .expect("UNSOLICITED_TYPES in native-bridge.ts");
+        let body = &src[start..];
+        let body = &body[body.find("([").expect("set literal") + 2..];
+        let body = &body[..body.find("])").expect("end of set literal")];
+        let mut from_ts: Vec<String> = body
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with('"'))
+            .map(|l| l.trim_end_matches(',').trim_matches('"').to_string())
+            .collect();
+        from_ts.sort();
+
+        let mut from_rust: Vec<String> = every_outbound()
+            .iter()
+            .filter(|m| m.is_unsolicited())
+            .map(wire_type)
+            .collect();
+        from_rust.sort();
+
+        assert_eq!(from_ts, from_rust);
     }
 }

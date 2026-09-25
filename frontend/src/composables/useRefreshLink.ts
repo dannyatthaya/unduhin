@@ -139,6 +139,17 @@ export function useRefreshLink() {
     phase.value = "done";
   }
 
+  /**
+   * The extension's capture reached the backend but the refresh was refused
+   * (`unduhin:refresh-failed`). Stay on "waiting" so the user can click the
+   * link again or paste one, and show why.
+   */
+  function applyExternalFailure(id: DownloadId, message: string): void {
+    if (pending.value?.id !== id) return;
+    error.value = message;
+    phase.value = "waiting";
+  }
+
   function close(): void {
     reset();
   }
@@ -155,6 +166,7 @@ export function useRefreshLink() {
     submitUrl,
     confirmRestart,
     applyExternalOutcome,
+    applyExternalFailure,
     close,
   };
 }

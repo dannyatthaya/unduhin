@@ -297,6 +297,7 @@ async fn run_add(db: Option<PathBuf>, args: AddArgs) -> anyhow::Result<()> {
             url: args.url,
             filename: args.filename,
             output_path: args.output,
+            output_dir: None,
             category: args.category.map(CategorySelector::Name),
             priority: args.priority,
             segments: args.segments,

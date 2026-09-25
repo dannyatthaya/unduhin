@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use reqwest::header::{IF_RANGE, RANGE};
-use reqwest::{Client, StatusCode};
+use reqwest::StatusCode;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
@@ -39,6 +39,7 @@ use url::Url;
 
 use crate::download::{DownloadOptions, DownloadSummary};
 use crate::error::{EngineError, Result};
+use crate::http::Client;
 use crate::meta::{Meta, SegmentState};
 use crate::progress::{emit, eta, ProgressEvent, SegmentRuntimeState, SpeedMeter};
 use crate::retry::{classify_reqwest, Backoff, RetryClass};
@@ -525,8 +526,11 @@ async fn try_probe_and_split(
             Err(_) => return false, // probe failed → stop ramping (non-fatal)
         },
     };
-    if resp.status() != StatusCode::PARTIAL_CONTENT {
-        // 403/429/… (cap reached) or 200 (range ignored) → stop ramping.
+    if resp.status() != StatusCode::PARTIAL_CONTENT
+        || crate::http::check_range_start(&resp, midpoint).is_err()
+    {
+        // 403/429/… (cap reached), 200 (range ignored), or a 206 for some
+        // other range → stop ramping.
         return false;
     }
 
@@ -822,7 +826,18 @@ async fn worker(
     shared: Arc<SharedState>,
     cancel: CancellationToken,
 ) -> Result<()> {
-    while let Some(segment) = rx.recv().await {
+    loop {
+        // Waiting for more work must also watch `cancel`. After a peer fails,
+        // `run_transfer` cancels and then joins every worker; one idling here
+        // with its sender still parked in `shared.senders` would otherwise
+        // never return, and the whole transfer would hang instead of failing.
+        let segment = tokio::select! {
+            _ = cancel.cancelled() => return Err(EngineError::Cancelled),
+            next = rx.recv() => match next {
+                Some(segment) => segment,
+                None => break,
+            },
+        };
         if cancel.is_cancelled() {
             return Err(EngineError::Cancelled);
         }
@@ -875,6 +890,9 @@ async fn process_segment(
                     EngineError::Http(reqwest_err) => classify_reqwest(reqwest_err),
                     EngineError::Io { .. } => RetryClass::Transient,
                     EngineError::BodyTruncated { .. } => RetryClass::Transient,
+                    // Usually one misbehaving edge node; a fresh request may
+                    // land on another. Bounded by the backoff budget.
+                    EngineError::RangeMismatch { .. } => RetryClass::Transient,
                     _ => RetryClass::Terminal,
                 };
                 if class == RetryClass::Terminal {
@@ -993,6 +1011,9 @@ async fn try_segment(
         if status != StatusCode::PARTIAL_CONTENT {
             return Err(crate::http::map_status_error(status.as_u16()));
         }
+        // The body is written at `absolute_offset`; a 206 carrying any other
+        // range would be spliced into the wrong place.
+        crate::http::check_range_start(&resp, absolute_offset)?;
     } else if !status.is_success() {
         return Err(crate::http::map_status_error(status.as_u16()));
     }

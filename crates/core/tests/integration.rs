@@ -372,6 +372,7 @@ async fn auto_categorize_by_extension() -> Result<()> {
                 url: Url::parse("https://example.com/x").unwrap(),
                 filename: Some((*filename).to_string()),
                 output_path: Some(out_dir.join(filename)),
+                output_dir: None,
                 category: None,
                 priority: 0,
                 segments: Some(1),
@@ -455,6 +456,7 @@ async fn queue_respects_concurrency_limit() -> Result<()> {
                 url: server.url(&format!("/file-{i}.bin")),
                 filename: Some(format!("file-{i}.bin")),
                 output_path: Some(out_dir.join(format!("file-{i}.bin"))),
+                output_dir: None,
                 category: Some(CategorySelector::Name("Other".into())),
                 priority: 0,
                 segments: Some(1),
@@ -537,6 +539,7 @@ async fn pause_resume_survives_core_restart() -> Result<()> {
                 url: server.url("/file.bin"),
                 filename: Some("file.bin".into()),
                 output_path: Some(out.clone()),
+                output_dir: None,
                 category: Some(CategorySelector::Name("Other".into())),
                 priority: 0,
                 segments: Some(4),
@@ -628,6 +631,7 @@ async fn queue_emptied_fires_once_per_drain() -> Result<()> {
                 url: server.url(&format!("/qe-{i}.bin")),
                 filename: Some(format!("qe-{i}.bin")),
                 output_path: Some(out_dir.join(format!("qe-{i}.bin"))),
+                output_dir: None,
                 category: Some(CategorySelector::Name("Other".into())),
                 priority: 0,
                 segments: Some(1),
@@ -697,6 +701,7 @@ async fn queue_emptied_does_not_fire_during_brief_gap() -> Result<()> {
             url: server.url("/gap-1.bin"),
             filename: Some("gap-1.bin".into()),
             output_path: Some(out_dir.join("gap-1.bin")),
+            output_dir: None,
             category: Some(CategorySelector::Name("Other".into())),
             priority: 0,
             segments: Some(1),
@@ -718,6 +723,7 @@ async fn queue_emptied_does_not_fire_during_brief_gap() -> Result<()> {
             url: server.url("/gap-2.bin"),
             filename: Some("gap-2.bin".into()),
             output_path: Some(out_dir.join("gap-2.bin")),
+            output_dir: None,
             category: Some(CategorySelector::Name("Other".into())),
             priority: 0,
             segments: Some(1),
@@ -778,6 +784,7 @@ async fn empty_body_download_fails_instead_of_completing() -> Result<()> {
             url: server.url("/empty"),
             filename: Some("movie.mkv".into()),
             output_path: Some(out_dir.join("movie.mkv")),
+            output_dir: None,
             category: Some(CategorySelector::Name("Other".into())),
             priority: 0,
             segments: Some(1),
@@ -827,6 +834,7 @@ async fn stalled_on_expired_link(
             url: server.url("/expiring?token=fresh"),
             filename: Some("file.bin".into()),
             output_path: Some(out.clone()),
+            output_dir: None,
             category: Some(CategorySelector::Name("Other".into())),
             priority: 0,
             // Segmented, not single-stream. A single-stream transfer cannot
@@ -1076,6 +1084,132 @@ async fn refresh_source_rejects_bad_input() -> Result<()> {
     Ok(())
 }
 
+/// The user resumes the row while `refresh_source` is still probing the new
+/// link. The refresh must then change nothing: before the status was
+/// re-checked under a lock, it rewrote the URL (and dropped the sidecar)
+/// of a row that was about to be picked up by a worker.
+#[tokio::test]
+async fn refresh_source_changes_nothing_if_the_row_resumed_during_the_probe() -> Result<()> {
+    // Holds every request until released, and reports that it got one.
+    let hit = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    {
+        let (hit, release) = (hit.clone(), release.clone());
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (hit, release) = (hit.clone(), release.clone());
+                tokio::spawn(async move {
+                    let svc = service_fn(move |_req: Request<Incoming>| {
+                        let (hit, release) = (hit.clone(), release.clone());
+                        async move {
+                            hit.notify_one();
+                            release.notified().await;
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(CONTENT_LENGTH, 3)
+                                    .body(Full::new(Bytes::from_static(b"abc")))
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), svc)
+                        .await;
+                });
+            }
+        });
+    }
+
+    let dir = tempfile::tempdir()?;
+    let core = Core::open(dir.path().join("race.db")).await?;
+    let old_url = "https://example.invalid/old.bin";
+    let id = core
+        .add_download(AddDownload {
+            url: old_url.parse()?,
+            filename: Some("old.bin".into()),
+            output_path: Some(dir.path().join("old.bin")),
+            output_dir: None,
+            category: None,
+            priority: 0,
+            segments: Some(1),
+            media_info: None,
+            headers: None,
+            source: DownloadSource::Manual,
+            kind: DownloadKind::Http,
+            torrent: None,
+        })
+        .await?;
+    // The queue is never started, so the row just sits there.
+    core.pause(id).await?;
+
+    let refreshing = {
+        let core = core.clone();
+        let new_url = format!("http://{addr}/new.bin");
+        tokio::spawn(async move { core.refresh_source(id, &new_url, None, false).await })
+    };
+    hit.notified().await;
+    // The user clicks resume while the probe is in flight.
+    core.resume(id).await?;
+    release.notify_one();
+
+    let err = refreshing.await?.unwrap_err();
+    assert!(
+        matches!(err, unduhin_core::CoreError::InvalidTransition { .. }),
+        "expected InvalidTransition, got {err:?}"
+    );
+    let rec = core.get_download(id).await?;
+    assert_eq!(rec.url, old_url, "the refresh must not touch a resumed row");
+    assert_eq!(rec.status, Status::Queued);
+    Ok(())
+}
+
+/// Captures that land together (the pipe serves connections concurrently)
+/// and reduce to the same name — every `drive.google.com/uc?id=…` link is
+/// `uc` — must still get distinct files. The free-name search and the
+/// INSERT used to interleave, so several could pick the same path and
+/// share one file and one sidecar.
+#[tokio::test]
+async fn concurrent_adds_with_the_same_name_get_distinct_paths() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let core = Core::open(dir.path().join("concurrent.db")).await?;
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(&out)?;
+
+    let adds = (0..16).map(|i| {
+        let core = core.clone();
+        let out = out.clone();
+        tokio::spawn(async move {
+            core.add_download(AddDownload {
+                url: format!("https://drive.example.com/uc?id={i}")
+                    .parse()
+                    .unwrap(),
+                filename: Some("uc".into()),
+                output_path: None,
+                output_dir: Some(out),
+                category: None,
+                priority: 0,
+                segments: Some(1),
+                media_info: None,
+                headers: None,
+                source: DownloadSource::ExtensionPipe,
+                kind: DownloadKind::Http,
+                torrent: None,
+            })
+            .await
+        })
+    });
+    let mut paths = std::collections::HashSet::new();
+    for add in adds.collect::<Vec<_>>() {
+        let id = add.await??;
+        paths.insert(core.get_download(id).await?.output_path);
+    }
+    assert_eq!(paths.len(), 16, "two downloads were given the same file");
+    Ok(())
+}
+
 /// A signed URL that has expired answers 403. `retry::classify` files every
 /// 4xx under `Terminal`, which is right for the transfer but too coarse for
 /// the UI: 403 is fixable with a fresh link, 404 is not. The row must record
@@ -1102,6 +1236,7 @@ async fn expired_link_is_classified_as_expired_auth() -> Result<()> {
             url: server.url("/expiring?token=stale"),
             filename: Some("movie.mkv".into()),
             output_path: Some(out_dir.join("movie.mkv")),
+            output_dir: None,
             category: Some(CategorySelector::Name("Other".into())),
             priority: 0,
             segments: Some(1),
@@ -1153,6 +1288,7 @@ async fn silent_expiry_is_classified_as_expired_auth() -> Result<()> {
                 url: server.url(path),
                 filename: Some("movie.mkv".into()),
                 output_path: Some(out_dir.join("movie.mkv")),
+                output_dir: None,
                 category: Some(CategorySelector::Name("Other".into())),
                 priority: 0,
                 segments: Some(1),
@@ -1201,6 +1337,7 @@ async fn connection_failure_is_not_expired_auth() -> Result<()> {
             url: Url::parse(&format!("http://127.0.0.1:{dead_port}/movie.mkv"))?,
             filename: Some("movie.mkv".into()),
             output_path: Some(out_dir.join("movie.mkv")),
+            output_dir: None,
             category: Some(CategorySelector::Name("Other".into())),
             priority: 0,
             segments: Some(1),
@@ -1249,6 +1386,7 @@ async fn html_landing_page_download_fails_instead_of_completing() -> Result<()> 
             url: server.url("/landing"),
             filename: Some("movie.mkv".into()),
             output_path: Some(out_dir.join("movie.mkv")),
+            output_dir: None,
             category: Some(CategorySelector::Name("Other".into())),
             priority: 0,
             segments: Some(1),
@@ -1299,6 +1437,7 @@ async fn start_at_schedule_defers_until_due() -> Result<()> {
             url: server.url("/sched-1.bin"),
             filename: Some("sched-1.bin".into()),
             output_path: Some(out_dir.join("sched-1.bin")),
+            output_dir: None,
             category: Some(CategorySelector::Name("Other".into())),
             priority: 0,
             segments: Some(1),
