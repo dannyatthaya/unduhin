@@ -520,7 +520,8 @@ const ARM_REFRESH_TTL_MS: i64 = 5 * 60 * 1000;
 /// deadline rather than an error — the dialog uses it to stop waiting.
 #[tauri::command]
 pub async fn arm_link_refresh(core: State<'_, Core>, id: DownloadId) -> CommandResult<i64> {
-    let record = core.get_download(id).await?;
+    // Full: the arm carries the page the row came from (its Referer).
+    let record = core.get_download_full(id).await?;
     if record.kind != DownloadKind::Http {
         return Err(CommandError::from(format!(
             "only direct HTTP downloads can have their link refreshed (this row is {})",

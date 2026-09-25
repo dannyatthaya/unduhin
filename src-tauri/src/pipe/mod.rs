@@ -887,8 +887,9 @@ async fn handle_credentials_refreshed(
         return Ok(());
     }
 
+    // Full: the row's original Referer is carried over below.
     let record = core
-        .get_download(download_id)
+        .get_download_full(download_id)
         .await
         .map_err(|e| format!("{e}"))?;
 

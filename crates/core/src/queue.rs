@@ -447,17 +447,22 @@ impl QueueManager {
     /// claim when nothing else is in flight.
     async fn fill_capacity(&self) -> crate::error::Result<()> {
         let limit = max_concurrent(&self.pool).await? as usize;
-        let queued = download::list_queued(&self.pool).await?;
+        // Every slot taken: nothing to claim, so don't read the queue at
+        // all. This runs twice a second, and a long queue behind a full
+        // set of workers is the common case.
+        if self.active.lock().await.len() >= limit {
+            return Ok(());
+        }
+        let queued = download::list_queued_ids(&self.pool).await?;
         let now = Utc::now();
         let mut active = self.active.lock().await;
         // Reaped after the claim loop so we touch the cache + emit once
         // per fill pass instead of once per fired start_at.
         let mut start_at_reaped: Vec<DownloadId> = Vec::new();
-        for record in queued {
+        for id in queued {
             if active.len() >= limit {
                 break;
             }
-            let id = record.id;
             // A worker already owns this id. Leave the row `queued` and
             // pick it up on a later tick, once the old worker has exited
             // and `reap_completed` has dropped its handle.
@@ -495,6 +500,16 @@ impl QueueManager {
                 // Someone else changed status before us — try the next row.
                 continue;
             }
+            // Only now load the whole row, with its captured headers — the
+            // one decrypt per started download.
+            let record = match download::get_full(&self.pool, id).await {
+                Ok(record) => record,
+                Err(e) => {
+                    // Removed between the claim and here: nothing to run.
+                    tracing::debug!(id, error = %e, "queue: claimed row vanished");
+                    continue;
+                }
+            };
             if was_start_at_gated {
                 // Mark in-memory so subsequent ticks in this pass don't
                 // re-gate the row before the DB delete + reload below.
@@ -1117,7 +1132,9 @@ async fn run_worker(
                 // Tag the files as downloaded from the internet, as a browser
                 // would have. Last, so every rename and move above is done
                 // and the tag lands on the file's final path.
-                if let Ok(record) = download::get(&pool, id).await {
+                // `get_full`: the tag records the page the file came from
+                // (its captured Referer).
+                if let Ok(record) = download::get_full(&pool, id).await {
                     crate::motw::mark_download(&record).await;
                 }
 

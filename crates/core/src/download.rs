@@ -342,6 +342,10 @@ pub struct DownloadRecord {
     /// Never serialized: records go to the webview (commands, events) and
     /// to the CLI's JSON output, and none of them needs the decrypted
     /// cookies. Read it through the typed API only.
+    ///
+    /// Only populated by `get_full` / `Core::get_download_full`; every
+    /// other read leaves it `None`, because decrypting it costs a DPAPI /
+    /// Keychain call per row.
     #[serde(default, skip_serializing)]
     pub headers: Option<Vec<(String, String)>>,
     /// Which surface added this row. Used by the Settings → Browser
@@ -1250,8 +1254,43 @@ fn is_windows_device_name(name: &str) -> bool {
         )
 }
 
+/// One row, WITHOUT its captured headers (see [`record_from_row`]). Use
+/// [`get_full`] when the headers are needed.
 pub(crate) async fn get(pool: &SqlitePool, id: DownloadId) -> Result<DownloadRecord> {
     get_with(pool, id).await
+}
+
+/// One row with its captured headers decrypted: what a worker needs to run
+/// the download.
+pub(crate) async fn get_full(pool: &SqlitePool, id: DownloadId) -> Result<DownloadRecord> {
+    let mut record = get(pool, id).await?;
+    record.headers = load_headers(pool, id).await?;
+    Ok(record)
+}
+
+/// The row's captured request headers, decrypted, or `None` when it has
+/// none. The column is read on its own, so this is one small query plus a
+/// single decrypt.
+pub(crate) async fn load_headers(
+    pool: &SqlitePool,
+    id: DownloadId,
+) -> Result<Option<Vec<(String, String)>>> {
+    // `try_get` rather than `get` because `headers` was added in migration
+    // 20260901000001; an unmigrated schema reads as `None`.
+    let row = sqlx::query("SELECT headers FROM downloads WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?
+        .ok_or(CoreError::DownloadNotFound(id))?;
+    let stored: Option<String> = row.try_get("headers").ok().flatten();
+    match stored {
+        // Decrypt (legacy plaintext rows pass through `unprotect`
+        // unchanged) before parsing the JSON.
+        Some(s) if !s.is_empty() => Ok(Some(serde_json::from_str::<Vec<(String, String)>>(
+            &crate::secret::unprotect(&s),
+        )?)),
+        _ => Ok(None),
+    }
 }
 
 /// [`get`] on any executor — a transaction's connection included.
@@ -2511,17 +2550,19 @@ pub(crate) async fn next_queued(pool: &SqlitePool) -> Result<Option<DownloadReco
     row.as_ref().map(record_from_row).transpose()
 }
 
-/// All queued downloads in priority + creation order. Used by
-/// the queue manager so the claim loop can consult the
-/// `SchedulesCache` per-row without round-tripping to SQL.
-pub(crate) async fn list_queued(pool: &SqlitePool) -> Result<Vec<DownloadRecord>> {
+/// Ids of all queued downloads in priority + creation order. Ids only: the
+/// queue polls this twice a second and consults the `SchedulesCache` per
+/// row, so loading whole rows (with their JSON columns) for every queued
+/// download on every tick was wasted work. The one it claims is loaded in
+/// full with [`get_full`].
+pub(crate) async fn list_queued_ids(pool: &SqlitePool) -> Result<Vec<DownloadId>> {
     let rows = sqlx::query(
-        "SELECT * FROM downloads WHERE status = 'queued' \
+        "SELECT id FROM downloads WHERE status = 'queued' \
          ORDER BY priority DESC, created_at ASC",
     )
     .fetch_all(pool)
     .await?;
-    rows.iter().map(record_from_row).collect()
+    Ok(rows.iter().map(|r| r.get("id")).collect())
 }
 
 /// Read all ids currently in an in-flight status. The queue manager uses
@@ -2568,19 +2609,12 @@ fn record_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<DownloadRecord> {
         Some(s) if !s.is_empty() => Some(serde_json::from_str(&s)?),
         _ => None,
     };
-    // `try_get` rather than `get` because `headers` was added in
-    // migration 20260901000001 — older databases predating it won't have
-    // the column at all (sqlx surfaces that as a column-not-found error
-    // until the migration runs; treat it as `None` defensively).
-    let headers_json: Option<String> = row.try_get("headers").ok().flatten();
-    let headers = match headers_json {
-        // Decrypt the DPAPI-protected column (legacy plaintext rows pass
-        // through `unprotect` unchanged) before parsing the JSON.
-        Some(s) if !s.is_empty() => Some(serde_json::from_str::<Vec<(String, String)>>(
-            &crate::secret::unprotect(&s),
-        )?),
-        _ => None,
-    };
+    // Headers are NOT decoded here. They are encrypted at rest, so decoding
+    // costs a DPAPI / Keychain call per row, and this function backs every
+    // listing (the UI's list, the extension's status, the queue loop) —
+    // none of which needs them. Callers that do use [`get_full`] or
+    // [`load_headers`].
+    let headers = None;
     // Same defensive `try_get` for `source` (migration 20260902000001).
     // Pre-9c rows fall back to Manual via the NOT NULL DEFAULT 'manual'
     // applied by the migration; if the column truly doesn't exist
@@ -2991,7 +3025,7 @@ mod tests {
         .await
         .unwrap();
 
-        let rec = get(&pool, id).await.unwrap();
+        let rec = get_full(&pool, id).await.unwrap();
         assert_eq!(rec.url, "https://cdn.example.com/new?token=fresh");
         assert_eq!(rec.headers.as_deref(), Some(fresh.as_slice()));
 
@@ -3729,7 +3763,7 @@ mod tests {
             torrent: None,
         };
         let rec = insert(&pool, input).await.unwrap();
-        let again = get(&pool, rec.id).await.unwrap();
+        let again = get_full(&pool, rec.id).await.unwrap();
         assert_eq!(again.headers.as_deref(), Some(headers.as_slice()));
         assert_eq!(again.source, DownloadSource::ExtensionPipe);
     }
@@ -5556,7 +5590,7 @@ mod tests {
         let pool = fresh_pool().await;
         let tmp = tempfile::tempdir().unwrap();
         let id = insert_row(&pool, &tmp).await;
-        let rec = get(&pool, id).await.unwrap();
+        let rec = get_full(&pool, id).await.unwrap();
         assert!(rec.headers.is_some(), "fixture must have headers");
 
         let json = serde_json::to_value(&rec).unwrap();
@@ -5573,5 +5607,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(v.and_then(|v| v.as_bool()), Some(false));
+    }
+
+    /// Listing never decrypts captured headers (a DPAPI / Keychain call per
+    /// row); only `get_full` / `load_headers` do.
+    #[tokio::test]
+    async fn listing_leaves_headers_encrypted_and_get_full_loads_them() {
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let id = insert_row(&pool, &tmp).await;
+
+        assert!(get(&pool, id).await.unwrap().headers.is_none());
+        let listed = list(&pool, DownloadFilter::default()).await.unwrap();
+        assert!(listed.iter().all(|r| r.headers.is_none()));
+
+        let full = get_full(&pool, id).await.unwrap();
+        assert_eq!(
+            full.headers,
+            Some(vec![("Cookie".to_string(), "session=old".to_string())])
+        );
+        assert_eq!(list_queued_ids(&pool).await.unwrap(), vec![id]);
     }
 }
