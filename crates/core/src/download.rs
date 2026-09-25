@@ -338,6 +338,11 @@ pub struct DownloadRecord {
     /// and forwarded to yt-dlp via `--add-header` (in an options file, not
     /// argv). `None` when the row
     /// was added without browser capture context (CLI, Add URL dialog).
+    ///
+    /// Never serialized: records go to the webview (commands, events) and
+    /// to the CLI's JSON output, and none of them needs the decrypted
+    /// cookies. Read it through the typed API only.
+    #[serde(default, skip_serializing)]
     pub headers: Option<Vec<(String, String)>>,
     /// Which surface added this row. Used by the Settings → Browser
     /// status card to count extension hand-offs. Older rows
@@ -619,12 +624,7 @@ pub(crate) async fn insert(pool: &SqlitePool, input: AddDownload) -> Result<Down
     // The JSON can carry `Cookie` / `Authorization` (incl. HttpOnly cookies)
     // captured from the browser, so it is encrypted at rest via DPAPI before
     // it touches the (unencrypted) SQLite file. See `crate::secret`.
-    let headers_json = match headers.as_ref() {
-        Some(pairs) if !pairs.is_empty() => {
-            Some(crate::secret::protect(&serde_json::to_string(pairs)?))
-        }
-        _ => None,
-    };
+    let headers_json = encode_headers(headers.as_deref())?;
     // Torrent state rides one nullable JSON column, exactly like
     // `media_info` / `headers`.
     let torrent_json = match torrent.as_ref() {
@@ -656,6 +656,45 @@ pub(crate) async fn insert(pool: &SqlitePool, input: AddDownload) -> Result<Down
 
     let id: i64 = row.get("id");
     get(pool, id).await
+}
+
+/// The `headers` column value for `pairs`: JSON `[[name, value], ...]`,
+/// encrypted at rest (see `crate::secret`).
+fn encode_headers(pairs: Option<&[(String, String)]>) -> Result<Option<String>> {
+    encode_headers_with(pairs, crate::secret::try_protect)
+}
+
+/// [`encode_headers`] with the encryption step injectable, so the failure
+/// path can be tested on any platform.
+///
+/// When encryption fails the capture is still stored, but only its ordinary
+/// browser headers (`User-Agent`, `Referer`, `Accept…`, …): cookies,
+/// `Authorization` and site token headers never reach the database in the
+/// clear. The download may then need a fresh login, which the "Refresh
+/// link" flow handles, rather than leaving a session readable on disk.
+fn encode_headers_with(
+    pairs: Option<&[(String, String)]>,
+    protect: impl Fn(&str) -> Option<String>,
+) -> Result<Option<String>> {
+    let Some(pairs) = pairs.filter(|p| !p.is_empty()) else {
+        return Ok(None);
+    };
+    if let Some(sealed) = protect(&serde_json::to_string(pairs)?) {
+        return Ok(Some(sealed));
+    }
+    let ordinary: Vec<&(String, String)> = pairs
+        .iter()
+        .filter(|(name, _)| engine::http::is_ordinary_browser_header(name))
+        .collect();
+    tracing::warn!(
+        dropped = pairs.len() - ordinary.len(),
+        "could not encrypt captured headers; storing only ordinary browser headers"
+    );
+    if ordinary.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(serde_json::to_string(&ordinary)?))
+    }
 }
 
 /// Serializes the resolve-and-insert tail of [`insert`]; see there.
@@ -2302,7 +2341,7 @@ pub(crate) async fn mark_failed(
 /// Two invariants:
 ///
 /// 1. The headers carry `Cookie` / `Authorization`, so they go through
-///    `crate::secret::protect` exactly as [`insert`] does. A plaintext write
+///    [`encode_headers`] exactly as [`insert`] does. A plaintext write
 ///    here would make `record_from_row` hand back garbage after `unprotect`.
 /// 2. `etag` and `last_modified` are cleared in the same statement. They
 ///    describe the *old* URL's body; leaving them while the URL changes is the
@@ -2319,12 +2358,7 @@ pub(crate) async fn update_source<'e, E>(
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
-    let headers_json = match headers {
-        Some(pairs) if !pairs.is_empty() => {
-            Some(crate::secret::protect(&serde_json::to_string(pairs)?))
-        }
-        _ => None,
-    };
+    let headers_json = encode_headers(headers)?;
     let res = sqlx::query(
         "UPDATE downloads SET url = ?, headers = ?, etag = NULL, last_modified = NULL, \
                               error = NULL, error_kind = NULL \
@@ -5469,5 +5503,64 @@ mod tests {
             .expect("the fallback name is ours to replace");
 
         assert_eq!(renamed.filename, "report.pdf");
+    }
+
+    // ---- Captured headers at rest and on the wire ----------------------------
+
+    /// If encryption fails, cookies and tokens must not be written in the
+    /// clear; the ordinary browser headers are still kept.
+    #[test]
+    fn unencryptable_headers_keep_only_ordinary_browser_headers() {
+        let pairs = vec![
+            ("Cookie".to_string(), "session=secret".to_string()),
+            ("Authorization".to_string(), "Bearer t".to_string()),
+            ("X-Api-Key".to_string(), "k".to_string()),
+            ("User-Agent".to_string(), "browser/1".to_string()),
+            ("Referer".to_string(), "https://example.com/".to_string()),
+        ];
+        let stored = encode_headers_with(Some(&pairs), |_| None)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !stored.contains("secret")
+                && !stored.contains("Bearer")
+                && !stored.contains("X-Api-Key")
+        );
+        let back: Vec<(String, String)> = serde_json::from_str(&stored).unwrap();
+        assert_eq!(
+            back,
+            vec![
+                ("User-Agent".to_string(), "browser/1".to_string()),
+                ("Referer".to_string(), "https://example.com/".to_string()),
+            ]
+        );
+
+        // Nothing ordinary left: store nothing rather than an empty list.
+        let only_secret = vec![("Cookie".to_string(), "s=1".to_string())];
+        assert_eq!(
+            encode_headers_with(Some(&only_secret), |_| None).unwrap(),
+            None
+        );
+
+        // Encryption working: the sealed form is stored as is.
+        assert_eq!(
+            encode_headers_with(Some(&pairs), |_| Some("sealed".into())).unwrap(),
+            Some("sealed".to_string())
+        );
+    }
+
+    /// Records are sent to the webview and printed by the CLI; neither may
+    /// carry the decrypted cookies.
+    #[tokio::test]
+    async fn serialized_records_never_carry_captured_headers() {
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let id = insert_row(&pool, &tmp).await;
+        let rec = get(&pool, id).await.unwrap();
+        assert!(rec.headers.is_some(), "fixture must have headers");
+
+        let json = serde_json::to_value(&rec).unwrap();
+        assert!(json.get("headers").is_none(), "{json}");
+        assert!(!json.to_string().contains("session=old"));
     }
 }

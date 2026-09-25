@@ -93,24 +93,36 @@ where
 
 /// Encrypt `plaintext` for storage.
 ///
-/// On success returns `<scheme>:v1:<base64>`; if encryption is unavailable
-/// or fails for any reason, returns the plaintext unchanged so a download
-/// is never lost merely because DPAPI hiccuped or the Keychain was locked.
-/// The worst case degrades to the prior behavior rather than to an error.
-pub(crate) fn protect(plaintext: &str) -> String {
+/// Returns `<scheme>:v1:<base64>` on success, and `None` when encryption
+/// is available on this platform but failed (DPAPI error, a locked
+/// Keychain that timed out). Deciding what to store instead is the
+/// caller's call: storing the plaintext would put the very cookies this
+/// module exists to protect into the database in the clear.
+///
+/// On platforms with no at-rest scheme (neither Windows nor macOS — not a
+/// shipped target) the plaintext is returned as is.
+pub(crate) fn try_protect(plaintext: &str) -> Option<String> {
     #[cfg(target_os = "windows")]
     {
-        if let Some(cipher) = dpapi_protect(plaintext.as_bytes()) {
-            return format!("{TAG}{}", STANDARD.encode(cipher));
-        }
+        dpapi_protect(plaintext.as_bytes())
+            .map(|cipher| format!("{TAG}{}", STANDARD.encode(cipher)))
     }
     #[cfg(target_os = "macos")]
     {
-        if let Some(cipher) = keychain::protect(plaintext.as_bytes()) {
-            return format!("{KEYCHAIN_TAG}{}", STANDARD.encode(cipher));
-        }
+        keychain::protect(plaintext.as_bytes())
+            .map(|cipher| format!("{KEYCHAIN_TAG}{}", STANDARD.encode(cipher)))
     }
-    plaintext.to_string()
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        Some(plaintext.to_string())
+    }
+}
+
+/// [`try_protect`], falling back to the plaintext. Tests only: production
+/// code must decide what to do when encryption fails.
+#[cfg(test)]
+pub(crate) fn protect(plaintext: &str) -> String {
+    try_protect(plaintext).unwrap_or_else(|| plaintext.to_string())
 }
 
 /// Reverse of [`protect`]. A tagged value is base64-decoded and decrypted;

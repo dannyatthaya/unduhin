@@ -70,7 +70,15 @@ const MAX_REDIRECTS: usize = 10;
 /// `Cookie`, `Authorization`, a site's own `X-Api-Key` — is only ever sent
 /// to the origin it was captured for.
 fn is_cross_origin_safe(name: &HeaderName) -> bool {
-    let n = name.as_str();
+    is_ordinary_browser_header(name.as_str())
+}
+
+/// Whether `name` (any case) is one of the ordinary, non-credential headers
+/// a browser sends to any site — the set [`Client`] keeps across origins.
+/// Also what the app keeps when it cannot encrypt a capture at rest.
+pub fn is_ordinary_browser_header(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    let n = n.as_str();
     matches!(
         n,
         "accept"
@@ -81,6 +89,10 @@ fn is_cross_origin_safe(name: &HeaderName) -> bool {
             | "priority"
             | "referer"
             | "upgrade-insecure-requests"
+            // Set on the client builder rather than carried in the header
+            // map, so listing it changes nothing for `Client`; it is here
+            // for the other callers.
+            | "user-agent"
     ) || n.starts_with("sec-fetch-")
         || n.starts_with("sec-ch-")
 }
