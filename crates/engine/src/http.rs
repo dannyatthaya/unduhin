@@ -271,6 +271,13 @@ pub fn build_client(
             .read_timeout(read_timeout)
             .user_agent(ua.clone())
             .default_headers(headers)
+            // Save exactly the bytes the server sends. With decoding on,
+            // reqwest asked for `gzip` and decoded it, so a `.tar.gz` served
+            // with `Content-Encoding: gzip` (or a text file a CDN
+            // compresses) was not saved as served — and its range offsets
+            // and lengths no longer matched the bytes on disk. A download
+            // manager wants the representation, not a decoded view of it.
+            .no_gzip()
             // Followed by hand in `RequestBuilder::send`.
             .redirect(reqwest::redirect::Policy::none())
             .build()
