@@ -751,7 +751,7 @@ async fn handle_refresh_download(
     job: unduhin_core::wire::DownloadJob,
 ) -> Result<(), String> {
     let headers = unduhin_core::wire::headers_from_job(&job);
-    let outcome = core
+    let outcome = match core
         .refresh_source(
             download_id,
             &job.final_url,
@@ -763,7 +763,21 @@ async fn handle_refresh_download(
             false,
         )
         .await
-        .map_err(|e| format!("{e}"))?;
+    {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            let message = format!("{e}");
+            // The refresh dialog is open and waiting on this capture. Tell it
+            // why nothing happened, or it sits on "waiting" until the user
+            // gives up.
+            if let Some(app) = app_handle() {
+                if let Err(e) = app.emit("unduhin:refresh-failed", (download_id, &message)) {
+                    tracing::warn!(error = %e, "failed to emit refresh-failed event");
+                }
+            }
+            return Err(message);
+        }
+    };
 
     // A size mismatch needs a human decision, so surface it to the frontend
     // rather than deciding here. The dialog is already open and waiting.

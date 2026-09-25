@@ -44,7 +44,8 @@ export interface NativeBridge {
 
 /**
  * Listener invoked for any unsolicited Outbound frame that doesn't
- * match a pending request — currently `settings` and `settingsChanged`.
+ * match a pending request — `settingsChanged`, `handoffDecision`, and the
+ * other app-initiated pushes in `UNSOLICITED_TYPES`.
  * The handler runs synchronously; long work should be
  * dispatched off-thread.
  */
@@ -55,9 +56,14 @@ export type UnsolicitedHandler = (msg: Outbound) => void;
  *  unsolicited because the user response is async — the original
  *  `askHandoff` `send()` has already resolved by then. `extensionUpdated`
  *  is the app's push (connection greeting / post-sync broadcast) telling
- *  us the canonical folder now holds a different version. */
-const UNSOLICITED_TYPES = new Set<Outbound["type"]>([
-  "settings",
+ *  us the canonical folder now holds a different version.
+ *
+ *  Only types the app NEVER sends as a reply belong here. `settings` is the
+ *  reply to `setSettings` / `getSettings`; listing it here once left that
+ *  waiter at the head of the FIFO forever, so every later reply was handed
+ *  to the request before it. The app follows each `setSettings` with a
+ *  `settingsChanged` broadcast, which is what applies the new shape. */
+export const UNSOLICITED_TYPES: ReadonlySet<Outbound["type"]> = new Set<Outbound["type"]>([
   "settingsChanged",
   "handoffDecision",
   "extensionUpdated",
@@ -69,13 +75,24 @@ const UNSOLICITED_TYPES = new Set<Outbound["type"]>([
   "refreshCredentials",
 ]);
 
+/** How long a request may wait for its reply before the port is torn down.
+ *
+ *  Replies are matched to requests purely by order, so one reply that never
+ *  comes (the app hung, or dropped the connection after the host forwarded
+ *  the frame) would otherwise stall the waiter forever and hand every later
+ *  reply to the wrong request. Dropping the whole port rejects every waiter
+ *  and starts the next connection with an empty queue.
+ *
+ *  Generous on purpose: the slowest legitimate round-trip is a yt-dlp probe,
+ *  capped at 30 s by `ytdlp_probe_timeout_ms` plus a 3 s impersonation check. */
+const REPLY_TIMEOUT_MS = 90_000;
+
 /** Resolved on every reply except `pong` (which is consumed by the health check). */
 interface PendingReply {
   readonly resolve: (msg: Outbound) => void;
   readonly reject: (err: Error) => void;
-  // We don't need timeouts on user-facing sends; the browser tears the
-  // port down on its own when the host dies, and `onDisconnect` rejects
-  // every pending reply. Keeping this lean.
+  /** Backstop for a reply that never arrives; see `REPLY_TIMEOUT_MS`. */
+  readonly timer: ReturnType<typeof setTimeout>;
 }
 
 export function createNativeBridge(
@@ -119,7 +136,10 @@ export function createNativeBridge(
   function rejectAllPending(err: Error): void {
     while (replyQueue.length > 0) {
       const next = replyQueue.shift();
-      next?.reject(err);
+      if (next) {
+        clearTimeout(next.timer);
+        next.reject(err);
+      }
     }
     if (pongWaiter) {
       pongWaiter = null;
@@ -132,6 +152,10 @@ export function createNativeBridge(
 
   function teardown(reason: string): void {
     log.warn("bridge teardown:", reason);
+    // `port.disconnect()` below does NOT fire our own `onDisconnect`, so
+    // waiters on this port have to be failed here. Left pending, they would
+    // sit at the head of the FIFO and swallow the next port's replies.
+    rejectAllPending(new Error(`bridge torn down: ${reason}`));
     if (port) {
       try {
         port.disconnect();
@@ -256,6 +280,7 @@ export function createNativeBridge(
       log.warn("bridge: unexpected reply with no waiter", msg);
       return;
     }
+    clearTimeout(pending.timer);
     pending.resolve(msg);
   }
 
@@ -331,17 +356,28 @@ export function createNativeBridge(
     const live = port;
     if (!live) throw new Error("bridge: connect did not produce a port");
     return new Promise<Outbound>((resolve, reject) => {
-      replyQueue.push({ resolve, reject });
+      const pending: PendingReply = {
+        resolve,
+        reject,
+        timer: setTimeout(() => {
+          // Only meaningful while this port is still the live one; a
+          // teardown in between has already rejected (and cleared) it.
+          if (port !== live) return;
+          teardown(`no reply to ${msg.type} within ${REPLY_TIMEOUT_MS}ms`);
+          scheduleReconnect();
+        }, REPLY_TIMEOUT_MS),
+      };
+      replyQueue.push(pending);
       try {
         live.postMessage(msg);
       } catch (err) {
-        // postMessage threw — pop the waiter we just enqueued (it's the
-        // last one) and reject with the error. The disconnect handler
-        // will not also fire on a sync throw.
-        const popped = replyQueue.pop();
-        popped?.reject(err instanceof Error ? err : new Error(String(err)));
-        if (popped) reject(popped.reject as never); // unreachable; rejected above
-        else reject(err instanceof Error ? err : new Error(String(err)));
+        // postMessage threw — withdraw the waiter we just enqueued (it's
+        // the last one) and reject. The disconnect handler will not also
+        // fire on a sync throw.
+        const idx = replyQueue.lastIndexOf(pending);
+        if (idx >= 0) replyQueue.splice(idx, 1);
+        clearTimeout(pending.timer);
+        reject(err instanceof Error ? err : new Error(String(err)));
       }
     });
   }

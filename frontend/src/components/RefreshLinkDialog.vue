@@ -31,6 +31,7 @@ const {
   submitUrl,
   confirmRestart,
   applyExternalOutcome,
+  applyExternalFailure,
   close,
 } = useRefreshLink();
 
@@ -80,6 +81,7 @@ function onSubmit() {
 // here. Without this listener the dialog would sit on "waiting" after the
 // refresh had already succeeded.
 let unlisten: UnlistenFn | null = null;
+let unlistenFailed: UnlistenFn | null = null;
 
 onMounted(async () => {
   unlisten = await listen<[DownloadId, RefreshOutcome, string]>(
@@ -89,10 +91,17 @@ onMounted(async () => {
       applyExternalOutcome(id, outcome, capturedUrl);
     },
   );
+  // The same path, refused: without this the dialog would keep waiting for a
+  // capture that already arrived and failed.
+  unlistenFailed = await listen<[DownloadId, string]>("unduhin:refresh-failed", (event) => {
+    const [id, message] = event.payload;
+    applyExternalFailure(id, message);
+  });
 });
 
 onBeforeUnmount(() => {
   if (unlisten) unlisten();
+  if (unlistenFailed) unlistenFailed();
 });
 </script>
 

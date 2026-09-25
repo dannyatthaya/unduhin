@@ -34,7 +34,7 @@
 // APIs and the bridge.
 
 import { log } from "../shared/log.js";
-import type { DownloadJob, RequestHeader } from "../shared/types.js";
+import type { DownloadJob, Outbound, RequestHeader } from "../shared/types.js";
 import { buildCookieHeader } from "./cookie-forwarder.js";
 import type { HeaderCache } from "./header-capture.js";
 import type { NativeBridge } from "./native-bridge.js";
@@ -61,6 +61,7 @@ export interface InterceptorDeps {
  */
 const NOT_RUNNING_FLAG = "unduhinNotRunningNotified";
 const NOT_RUNNING_NOTIFICATION = "unduhin-not-running";
+const REJECTED_NOTIFICATION = "unduhin-rejected";
 
 /**
  * 1×1 transparent PNG. `chrome.notifications.create` requires a non-empty
@@ -270,11 +271,24 @@ async function handleCapture(
       ? ({ type: "askHandoff", id: newAskId(), job } as const)
       : ({ type: "download", job } as const);
 
+  let reply: Outbound;
   try {
-    await deps.bridge.send(message);
+    reply = await deps.bridge.send(message);
   } catch (err) {
     log.warn("bridge.send failed after cancel; re-downloading", err);
     await notifyNotRunningOnce();
+    await redownloadInBrowser(url);
+    return;
+  }
+  // The app answered but refused the job (bad URL, unwritable folder, DB
+  // error, …). The browser's copy is already cancelled, so handing it back
+  // is the only way the user still gets the file.
+  if (reply.type === "error") {
+    log.warn("app rejected the download; re-downloading in the browser", reply.message);
+    notifyRejected(
+      "Download handed back to the browser",
+      `Unduhin couldn't take this download: ${reply.message}`,
+    );
     await redownloadInBrowser(url);
   }
 }
@@ -314,17 +328,28 @@ async function handleRefreshCapture(
     forwardCookies: settings.forwardCookies,
   });
 
+  // Unlike `handleCapture`, never re-download in the browser here. The user
+  // asked to repair a specific row; handing them a loose duplicate file would
+  // leave the broken row exactly as it was.
+  let reply: Outbound;
   try {
-    await deps.bridge.send({ type: "refreshDownload", downloadId: armed.downloadId, job });
-    deps.refreshArms?.remove(armed.downloadId);
-    log.info(`refreshed download ${armed.downloadId} with a fresh capture`);
+    reply = await deps.bridge.send({ type: "refreshDownload", downloadId: armed.downloadId, job });
   } catch (err) {
-    // Unlike `handleCapture`, do NOT re-download in the browser. The user
-    // asked to repair a specific row; handing them a loose duplicate file
-    // would leave the broken row exactly as it was.
     log.warn("refreshDownload send failed; arm kept for another try", err);
     await notifyNotRunningOnce();
+    return;
   }
+  if (reply.type === "error") {
+    // The app refused the refresh (the row is running again, the new link is
+    // dead too, …) and shows the reason in its refresh dialog. Say so here
+    // too — the click otherwise looks like it did nothing — and keep the arm
+    // so the user can click again once the cause is fixed.
+    log.warn(`refresh of download ${armed.downloadId} rejected; arm kept`, reply.message);
+    notifyRejected("Link refresh failed", `Unduhin couldn't refresh the download: ${reply.message}`);
+    return;
+  }
+  deps.refreshArms?.remove(armed.downloadId);
+  log.info(`refreshed download ${armed.downloadId} with a fresh capture`);
 }
 
 interface BuildJobInput {
@@ -430,6 +455,23 @@ async function notifyNotRunningOnce(): Promise<void> {
       type: "basic",
       title: "Unduhin is not running",
       message: "Start the Unduhin app to capture browser downloads.",
+      iconUrl: NOTIFICATION_ICON,
+      priority: 1,
+    });
+  } catch (err) {
+    log.warn("notifications.create failed", err);
+  }
+}
+
+/** Tell the user the app refused a capture. Unlike the not-running notice
+ * this is per-event: each one is a click that did not do what the user
+ * expected. */
+function notifyRejected(title: string, message: string): void {
+  try {
+    chrome.notifications.create(REJECTED_NOTIFICATION, {
+      type: "basic",
+      title,
+      message,
       iconUrl: NOTIFICATION_ICON,
       priority: 1,
     });
