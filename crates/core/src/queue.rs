@@ -706,6 +706,12 @@ async fn run_worker(
         // `speed_samples` column once the stream ends so the detail-pane
         // sparkline survives a relaunch (Bug: empty sparkline after finish).
         let mut speed_samples: Vec<u32> = Vec::new();
+        // Progress reaches SQLite at most once per `PROGRESS_PERSIST_EVERY`
+        // (the UI event still goes out on every tick). The last unsaved tick
+        // is written when the stream ends, so a pause or stop still records
+        // the final byte count.
+        let mut last_persist: Option<std::time::Instant> = None;
+        let mut unsaved: Option<(u64, Option<u64>)> = None;
         loop {
             match rx.recv().await {
                 Ok(ProgressEvent::Started { total, .. }) => {
@@ -740,22 +746,12 @@ async fn run_worker(
                     let downloaded = downloaded.saturating_add(stream_base);
                     let total = total.map(|t| t.saturating_add(stream_base));
 
-                    // Re-read the sidecar lazily — engine writes it on
-                    // every tick, so a stale read here just means slightly
-                    // older segment positions in the DB.
-                    let segments_meta = read_sidecar_segments(&pump_meta_path).await;
-                    if let Err(e) = download::persist_progress(
-                        &pump_pool,
-                        id,
-                        downloaded,
-                        total,
-                        None,
-                        None,
-                        segments_meta.as_deref(),
-                    )
-                    .await
-                    {
-                        tracing::warn!(id, error = %e, "queue: persist_progress failed");
+                    if last_persist.map_or(true, |t| t.elapsed() >= PROGRESS_PERSIST_EVERY) {
+                        persist_tick(&pump_pool, id, &pump_meta_path, downloaded, total).await;
+                        last_persist = Some(std::time::Instant::now());
+                        unsaved = None;
+                    } else {
+                        unsaved = Some((downloaded, total));
                     }
                     let _ = pump_events.send(CoreEvent::ProgressUpdate {
                         id,
@@ -795,6 +791,9 @@ async fn run_worker(
                 }
                 Ok(ProgressEvent::Completed { bytes }) => {
                     tracing::info!(id, bytes, "queue: pump received Completed");
+                    // The final count is written right below; an older
+                    // unsaved tick flushed after it would regress the row.
+                    unsaved = None;
                     // Also persist so the DB matches the in-memory state —
                     // mark_completed below uses COALESCE on total_bytes,
                     // which would otherwise keep a stale second-stream
@@ -924,6 +923,9 @@ async fn run_worker(
                 Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
+        }
+        if let Some((downloaded, total)) = unsaved {
+            persist_tick(&pump_pool, id, &pump_meta_path, downloaded, total).await;
         }
 
         // Persist the captured speed series (downsampled, trailing zeros
@@ -1308,6 +1310,37 @@ async fn run_torrent(
         content_type: None,
         filename_hint: None,
     })
+}
+
+/// How often the progress pump writes a download's progress to SQLite.
+/// Every tick (250 ms) meant four row updates with a JSON blob, plus a
+/// sidecar read, per second per active download; the UI does not need the
+/// database for live progress — it gets an event on every tick.
+const PROGRESS_PERSIST_EVERY: Duration = Duration::from_secs(1);
+
+/// Write one progress tick to the row, with the segment positions the
+/// engine last saved in its sidecar.
+async fn persist_tick(
+    pool: &SqlitePool,
+    id: DownloadId,
+    meta_path: &std::path::Path,
+    downloaded: u64,
+    total: Option<u64>,
+) {
+    let segments_meta = read_sidecar_segments(meta_path).await;
+    if let Err(e) = download::persist_progress(
+        pool,
+        id,
+        downloaded,
+        total,
+        None,
+        None,
+        segments_meta.as_deref(),
+    )
+    .await
+    {
+        tracing::warn!(id, error = %e, "queue: persist_progress failed");
+    }
 }
 
 /// Extensions [`ytdlp_output_stem`] strips off a stored file name.
