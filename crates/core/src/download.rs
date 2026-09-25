@@ -1030,6 +1030,11 @@ pub(crate) async fn reconcile_torrent_filename(
     Ok(Some((new_name, new_category, category_changed)))
 }
 
+/// Longest filename [`sanitize_filename`] emits, in bytes. Well under the
+/// 255-unit component limit of NTFS / APFS / ext4, with room left for the
+/// ` (n)` de-dup suffix and the `.unduhin-meta` sidecar suffix.
+const MAX_FILENAME_BYTES: usize = 200;
+
 /// Make an arbitrary string safe to use as a single filename.
 /// Strips path separators (`/` `\`), the drive colon, and other reserved
 /// characters, drops control characters, trims trailing dots/whitespace,
@@ -1042,36 +1047,119 @@ pub(crate) async fn reconcile_torrent_filename(
 /// The reserved set is the Windows one on every platform. `:` and `\` are
 /// legal on APFS, but keeping one rule means a queue database stays
 /// portable between machines, and the cost is only an occasional
-/// underscore.
+/// underscore. The same goes for Windows device names (`CON`, `NUL`,
+/// `COM1`, …), which are prefixed with `_`: written as a file name on
+/// Windows they open the device instead.
+///
+/// Invisible formatting characters are removed outright. A right-to-left
+/// override (U+202E) makes `invoice<RLO>fdp.exe` display as
+/// `invoiceexe.pdf`, the classic way to dress an executable up as a
+/// document, and none of these characters has a legitimate place in a
+/// file name.
 pub(crate) fn sanitize_filename(s: &str) -> String {
-    let mut out: String = s
+    let cleaned: String = s
         .chars()
+        .filter(|c| !is_invisible_format_char(*c))
         .map(|c| match c {
             '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
-            c if (c as u32) < 0x20 => '_',
+            // C0, DEL and C1 controls.
+            c if c.is_control() => '_',
             c => c,
         })
         .collect();
-    let trimmed = out.trim().trim_end_matches('.').to_string();
-    out = if trimmed.is_empty() {
-        "download".to_string()
-    } else {
-        trimmed
-    };
-    if out.len() > 200 {
-        // `len` and `truncate` are both byte-based, and `truncate` panics
-        // unless the index falls on a char boundary. A CJK or accented
-        // title longer than 200 bytes lands mid-sequence and takes the
-        // process down, so step back to the nearest boundary. At most four
-        // iterations, and the cap is high enough that the result is never
-        // empty.
-        let cut = (0..=200)
-            .rev()
-            .find(|&i| out.is_char_boundary(i))
-            .unwrap_or(0);
-        out.truncate(cut);
+    let mut out = trim_filename(&cleaned).to_string();
+    if out.is_empty() {
+        out = "download".to_string();
+    }
+    if out.len() > MAX_FILENAME_BYTES {
+        out = truncate_keeping_extension(&out, MAX_FILENAME_BYTES);
+    }
+    if is_windows_device_name(&out) {
+        out.insert(0, '_');
     }
     out
+}
+
+/// Leading whitespace and trailing dots/whitespace go: Windows silently
+/// drops the trailing ones, so a name ending in them is not the name that
+/// ends up on disk.
+fn trim_filename(s: &str) -> &str {
+    s.trim_start()
+        .trim_end_matches(|c: char| c == '.' || c.is_whitespace())
+}
+
+/// Bidi controls and zero-width characters: they change how a name
+/// displays without being visible themselves.
+fn is_invisible_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
+}
+
+/// Cut `name` to at most `max` bytes, keeping a short extension so the
+/// file still opens with the right program (and routes to the right
+/// category). `len`/`truncate` are byte-based and a cut inside a UTF-8
+/// sequence would panic, so the cut steps back to a char boundary.
+fn truncate_keeping_extension(name: &str, max: usize) -> String {
+    let (stem, ext) = match name.rfind('.') {
+        // An "extension" of more than 16 bytes is really part of the name.
+        Some(i) if i > 0 && name.len() - i <= 17 => name.split_at(i),
+        _ => (name, ""),
+    };
+    let budget = max.saturating_sub(ext.len());
+    let cut = (0..=budget.min(stem.len()))
+        .rev()
+        .find(|&i| stem.is_char_boundary(i))
+        .unwrap_or(0);
+    let stem = trim_filename(&stem[..cut]);
+    if stem.is_empty() {
+        // Nothing sensible left before the extension; keep the head of the
+        // whole name instead.
+        let cut = (0..=max)
+            .rev()
+            .find(|&i| name.is_char_boundary(i))
+            .unwrap_or(0);
+        return trim_filename(&name[..cut]).to_string();
+    }
+    format!("{stem}{ext}")
+}
+
+/// Windows device names, which it resolves to the device whatever folder
+/// they appear in and whatever extension follows (`nul.txt` is `NUL`).
+fn is_windows_device_name(name: &str) -> bool {
+    let base = name.split('.').next().unwrap_or(name).trim_end();
+    let upper = base.to_uppercase();
+    if matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) {
+        return true;
+    }
+    let mut chars = upper.chars();
+    let prefix: String = chars.by_ref().take(3).collect();
+    let rest: String = chars.collect();
+    (prefix == "COM" || prefix == "LPT")
+        && matches!(
+            rest.as_str(),
+            "1" | "2"
+                | "3"
+                | "4"
+                | "5"
+                | "6"
+                | "7"
+                | "8"
+                | "9"
+                | "\u{00B9}"
+                | "\u{00B2}"
+                | "\u{00B3}"
+        )
 }
 
 pub(crate) async fn get(pool: &SqlitePool, id: DownloadId) -> Result<DownloadRecord> {
@@ -3067,6 +3155,66 @@ mod tests {
 
         // ASCII still truncates exactly at the cap.
         assert_eq!(sanitize_filename(&"a".repeat(300)).len(), 200);
+    }
+
+    /// A long name keeps its extension: cutting `.mp4` off leaves a file
+    /// no program claims and routes it to the wrong category.
+    #[test]
+    fn sanitize_filename_truncation_keeps_the_extension() {
+        let long = format!("{}.mp4", "a".repeat(300));
+        let out = sanitize_filename(&long);
+        assert_eq!(out.len(), 200);
+        assert!(out.ends_with("aaa.mp4"), "{out}");
+
+        // Multi-byte stems still cut on a char boundary.
+        let out = sanitize_filename(&format!("{}.mkv", "字".repeat(100)));
+        assert!(out.len() <= 200 && out.ends_with("字.mkv"), "{out}");
+
+        // A dot deep inside a long name is not an extension.
+        let dotted = format!("v1.{}", "b".repeat(300));
+        assert_eq!(sanitize_filename(&dotted).len(), 200);
+    }
+
+    #[test]
+    fn sanitize_filename_trims_trailing_dots_and_spaces_together() {
+        // Windows drops both, so either left behind names a different file.
+        assert_eq!(sanitize_filename("report ."), "report");
+        assert_eq!(sanitize_filename("report. . "), "report");
+        assert_eq!(sanitize_filename("  report.pdf"), "report.pdf");
+    }
+
+    #[test]
+    fn sanitize_filename_prefixes_windows_device_names() {
+        for (input, expected) in [
+            ("CON", "_CON"),
+            ("nul.txt", "_nul.txt"),
+            ("Com1.log", "_Com1.log"),
+            ("lpt9", "_lpt9"),
+            ("AUX .tar.gz", "_AUX .tar.gz"),
+            ("conin$", "_conin$"),
+        ] {
+            assert_eq!(sanitize_filename(input), expected, "{input:?}");
+        }
+        // Only the exact names: these are ordinary files.
+        for ok in ["CONSOLE.txt", "com10", "lpt", "nullable.rs", "my con.txt"] {
+            assert_eq!(sanitize_filename(ok), ok, "{ok:?}");
+        }
+    }
+
+    /// `invoice<RLO>fdp.exe` renders as `invoiceexe.pdf`. The override and
+    /// its relatives are removed so the real extension shows.
+    #[test]
+    fn sanitize_filename_removes_bidi_and_zero_width_characters() {
+        assert_eq!(
+            sanitize_filename("invoice\u{202E}fdp.exe"),
+            "invoicefdp.exe"
+        );
+        assert_eq!(
+            sanitize_filename("a\u{200B}b\u{2066}c\u{2069}\u{FEFF}.txt"),
+            "abc.txt"
+        );
+        // DEL and C1 controls are replaced like C0 ones.
+        assert_eq!(sanitize_filename("a\u{7F}b\u{85}c"), "a_b_c");
     }
 
     #[test]
