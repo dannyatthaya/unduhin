@@ -1,6 +1,7 @@
 //! Rotating file logger.
 //!
-//! Writes a daily-rolling log under `<directories_root>/logs/unduhin.log.YYYY-MM-DD`.
+//! Writes a daily-rolling log under `<directories_root>/logs/unduhin.log.YYYY-MM-DD`
+//! and keeps the last [`RETAIN_DAYS`] days of them.
 //! Keeps a small in-memory ring of recent lines so the About page can
 //! show a "Copy diagnostic" snapshot without re-reading disk.
 //!
@@ -11,8 +12,15 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-use chrono::Utc;
+use chrono::{NaiveDate, Utc};
 use tracing::Level;
+
+/// Days of daily log files kept. Older ones are deleted at start-up and at
+/// each day rollover: logs carry URLs and file names, so they should not
+/// pile up forever, and nothing needs more than a couple of weeks of them.
+pub const RETAIN_DAYS: i64 = 14;
+
+const LOG_PREFIX: &str = "unduhin.log.";
 
 /// Folder that contains the daily-rolling log files. Created on first
 /// write. Returns `None` if the directory root is unavailable (no
@@ -38,6 +46,7 @@ pub fn init() -> io::Result<Option<PathBuf>> {
     let dir = logs_dir();
     if let Some(ref d) = dir {
         fs::create_dir_all(d)?;
+        prune_old_logs(d, Utc::now().date_naive(), RETAIN_DAYS);
     }
 
     let appender = dir.as_ref().map(|d| FileAppender::new(d.clone()));
@@ -85,26 +94,67 @@ pub fn record(level: Level, msg: impl AsRef<str>) {
     }
 }
 
-/// A minimal day-rolling appender. Each `write` opens the current day's
-/// file in append mode, writes the line, and closes — slow but trivial
-/// and good enough for the volume Unduhin produces. Avoids pulling in
-/// `tracing-appender` to keep the dependency surface small.
+/// Delete this logger's daily files dated more than `keep_days` before
+/// `today`. Only names of the form `unduhin.log.YYYY-MM-DD` are touched;
+/// anything else in the folder is left alone. Best-effort.
+fn prune_old_logs(dir: &std::path::Path, today: NaiveDate, keep_days: i64) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(date) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix(LOG_PREFIX))
+            .and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+        else {
+            continue;
+        };
+        if (today - date).num_days() > keep_days {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// A minimal day-rolling appender. The current day's file stays open
+/// between lines — opening and closing it for every line was a blocking
+/// file-system round trip on whatever async worker thread logged — and is
+/// swapped for the next day's on the first line after midnight (UTC), which
+/// also prunes old days. Avoids pulling in `tracing-appender` to keep the
+/// dependency surface small.
 struct FileAppender {
     dir: PathBuf,
-    state: Mutex<()>,
+    /// The open file and the day it belongs to.
+    state: Mutex<Option<(NaiveDate, fs::File)>>,
 }
 
 impl FileAppender {
     fn new(dir: PathBuf) -> Self {
         Self {
             dir,
-            state: Mutex::new(()),
+            state: Mutex::new(None),
         }
     }
 
-    fn current_path(&self) -> PathBuf {
-        let today = Utc::now().format("%Y-%m-%d");
-        self.dir.join(format!("unduhin.log.{today}"))
+    fn path_for(&self, day: NaiveDate) -> PathBuf {
+        self.dir
+            .join(format!("{LOG_PREFIX}{}", day.format("%Y-%m-%d")))
+    }
+
+    fn write_line(&self, buf: &[u8], today: NaiveDate) -> io::Result<()> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.as_ref().map(|(day, _)| *day) != Some(today) {
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.path_for(today))?;
+            if state.is_some() {
+                prune_old_logs(&self.dir, today, RETAIN_DAYS);
+            }
+            *state = Some((today, file));
+        }
+        let (_, file) = state.as_mut().expect("opened above");
+        file.write_all(buf)
     }
 }
 
@@ -122,20 +172,66 @@ struct FileAppenderWriter<'a> {
 
 impl<'a> Write for FileAppenderWriter<'a> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let _g = self
-            .appender
-            .state
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let mut f = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.appender.current_path())?;
-        f.write_all(buf)?;
+        self.appender.write_line(buf, Utc::now().date_naive())?;
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn day(s: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
+    }
+
+    #[test]
+    fn prune_keeps_recent_days_and_foreign_files() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "unduhin.log.2026-09-25",
+            "unduhin.log.2026-09-11", // exactly 14 days back: kept
+            "unduhin.log.2026-09-10", // 15 days back: deleted
+            "unduhin.log.2025-01-01",
+            "unduhin.log.not-a-date",
+            "notes.txt",
+        ] {
+            fs::write(dir.path().join(name), b"x").unwrap();
+        }
+
+        prune_old_logs(dir.path(), day("2026-09-25"), 14);
+
+        let mut left: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![
+                "notes.txt",
+                "unduhin.log.2026-09-11",
+                "unduhin.log.2026-09-25",
+                "unduhin.log.not-a-date",
+            ]
+        );
+    }
+
+    #[test]
+    fn appender_rolls_over_to_a_new_file_each_day() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = FileAppender::new(dir.path().to_path_buf());
+        app.write_line(b"one\n", day("2026-09-24")).unwrap();
+        app.write_line(b"two\n", day("2026-09-24")).unwrap();
+        app.write_line(b"three\n", day("2026-09-25")).unwrap();
+
+        let read =
+            |d: &str| fs::read_to_string(dir.path().join(format!("unduhin.log.{d}"))).unwrap();
+        assert_eq!(read("2026-09-24"), "one\ntwo\n");
+        assert_eq!(read("2026-09-25"), "three\n");
     }
 }

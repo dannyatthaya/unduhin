@@ -17,9 +17,10 @@ and every file named under it keeps the same name.
   categories, segment progress) in a local SQLite database at
   `%LOCALAPPDATA%\unduhin\unduhin.db`. Nothing in that database is sent
   anywhere — it's purely local.
-- Writes rotating log files to `%LOCALAPPDATA%\unduhin\logs\`. URLs and
-  filenames appear in those logs the same way they appear in the UI.
-  You can delete the directory at any time.
+- Writes one log file per day to `%LOCALAPPDATA%\unduhin\logs\` and
+  deletes files older than 14 days. URLs and filenames appear in those
+  logs the same way they appear in the UI. You can delete the directory
+  at any time.
 - Reads system information (operating system version, architecture, free
   disk space) for display in the UI. None of it is transmitted.
 
