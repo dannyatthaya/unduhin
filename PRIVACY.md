@@ -31,10 +31,13 @@ and every file named under it keeps the same name.
   update endpoint (default: `github.com/dannyatthaya/unduhin/releases/...`).
   No identifying information is sent — just a standard HTTPS GET.
 - **Install yt-dlp / FFmpeg.** When you press "Install" or "Update" in
-  Settings → Media, the app downloads the pinned binary from its
-  upstream release URL (yt-dlp's GitHub Releases / gyan.dev FFmpeg
-  builds). The download is verified by running `--version` on the
-  result. No identifying information is sent.
+  Settings → Media, the app asks GitHub's API for the latest release and
+  downloads it from upstream: yt-dlp from yt-dlp's GitHub Releases, FFmpeg
+  from BtbN's GitHub Releases on Windows and from a pinned
+  `ffmpeg.martin-riedl.de` build on macOS. Every download is checked
+  against a SHA-256 (the one GitHub publishes for the asset, or the one
+  pinned in the app) before it is installed. No identifying information
+  is sent.
 - **Download a media URL via yt-dlp.** When you paste a URL that yt-dlp
   recognizes, the app runs `yt-dlp --dump-single-json <url>` and then
   `yt-dlp ... -o <path> <url>`. Networking is done by yt-dlp itself —

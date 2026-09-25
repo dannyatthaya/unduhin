@@ -7,6 +7,7 @@
 import { createApp } from "vue";
 import { createPinia } from "pinia";
 
+import "../fonts.css";
 import "../style.css";
 import { i18n } from "../i18n";
 import Popover from "./Popover.vue";

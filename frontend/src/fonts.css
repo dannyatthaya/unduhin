@@ -1,0 +1,32 @@
+/*
+ * Self-hosted fonts, bundled into the app.
+ *
+ * These used to load from Google Fonts at every launch, which sent the
+ * user's IP address to Google each time the app started — at odds with an
+ * app that promises to make no network calls of its own (see PRIVACY.md),
+ * and it needed the Content-Security-Policy to allow Google's hosts.
+ *
+ * Only the weights the UI uses, in the Latin and Latin Extended subsets
+ * (English and Indonesian). Each file's `unicode-range` means only the
+ * subsets a page actually needs are loaded.
+ */
+@import "@fontsource/open-sans/latin-400.css";
+@import "@fontsource/open-sans/latin-ext-400.css";
+@import "@fontsource/open-sans/latin-500.css";
+@import "@fontsource/open-sans/latin-ext-500.css";
+@import "@fontsource/open-sans/latin-600.css";
+@import "@fontsource/open-sans/latin-ext-600.css";
+@import "@fontsource/open-sans/latin-700.css";
+@import "@fontsource/open-sans/latin-ext-700.css";
+
+@import "@fontsource/merriweather/latin-400.css";
+@import "@fontsource/merriweather/latin-ext-400.css";
+@import "@fontsource/merriweather/latin-700.css";
+@import "@fontsource/merriweather/latin-ext-700.css";
+@import "@fontsource/merriweather/latin-900.css";
+@import "@fontsource/merriweather/latin-ext-900.css";
+
+@import "@fontsource/jetbrains-mono/latin-400.css";
+@import "@fontsource/jetbrains-mono/latin-ext-400.css";
+@import "@fontsource/jetbrains-mono/latin-500.css";
+@import "@fontsource/jetbrains-mono/latin-ext-500.css";
