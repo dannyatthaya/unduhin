@@ -59,7 +59,11 @@ pub(crate) const SPEED_ALPHA: f64 = 0.3;
 /// (see [`try_probe_and_split`]), so we never burst — the gap just paces
 /// how quickly a healthy host reaches full parallelism (~target × interval).
 const RAMP_INTERVAL: Duration = Duration::from_millis(500);
-const WRITE_CHUNK_FLUSH_BYTES: u64 = 64 * 1024;
+/// Received bytes a segment buffers before writing them out, and the
+/// longest it holds any (so progress keeps moving on a slow link). At most
+/// `MAX_SEGMENTS` × this is buffered per download.
+const WRITE_BUFFER_BYTES: usize = 512 * 1024;
+const WRITE_MAX_DELAY: Duration = Duration::from_millis(250);
 
 /// A worker that produced zero bytes for at least this long is reported
 /// as [`SegmentRuntimeState::Stalled`].
@@ -1100,23 +1104,36 @@ async fn consume_into_file(
     cancel: &CancellationToken,
 ) -> Result<()> {
     let mut stream = resp.bytes_stream();
-    let mut written_since_flush: u64 = 0;
+    // Bytes of this response already written (and flushed) to the file.
     let mut written_total: u64 = 0;
+    // Bytes received but not yet written. Batched: every write goes through
+    // tokio's blocking pool, and one per 8-16 KB network chunk was most of
+    // the cost of a fast transfer.
+    let mut pending: Vec<u8> = Vec::with_capacity(WRITE_BUFFER_BYTES);
+    let mut last_write = std::time::Instant::now();
+    let mut outcome: Result<()> = Ok(());
 
     loop {
         let next = tokio::select! {
-            _ = cancel.cancelled() => return Err(EngineError::Cancelled),
+            _ = cancel.cancelled() => {
+                outcome = Err(EngineError::Cancelled);
+                break;
+            }
             c = stream.next() => c,
         };
         let chunk = match next {
-            Some(c) => c?,
+            Some(Ok(c)) => c,
+            Some(Err(e)) => {
+                outcome = Err(e.into());
+                break;
+            }
             None => break,
         };
         if chunk.is_empty() {
             continue;
         }
         // If a misbehaving server hands us more bytes than the segment
-        // covers, truncate before writing so we never trample the next
+        // covers, truncate before buffering so we never trample the next
         // segment's region. Use the LIVE end so a split-shrunk range
         // doesn't get overwritten.
         let live_end = {
@@ -1124,8 +1141,9 @@ async fn consume_into_file(
             m.segments[index].segment.end
         };
         let segment_len = live_end.saturating_sub(segment_start);
+        let buffered = written_total + pending.len() as u64;
         let max_write = if segment_len > 0 {
-            segment_len.saturating_sub((absolute_offset - segment_start) + written_total)
+            segment_len.saturating_sub((absolute_offset - segment_start) + buffered)
         } else {
             chunk.len() as u64
         };
@@ -1143,35 +1161,81 @@ async fn consume_into_file(
         if let Some(rl) = shared.rate_limiter.as_ref() {
             rl.acquire(slice.len() as u64).await;
         }
-        file.write_all(slice)
-            .await
-            .map_err(|e| EngineError::io(None, e))?;
-        written_since_flush += slice.len() as u64;
-        written_total += slice.len() as u64;
+        pending.extend_from_slice(slice);
 
-        // Update the segment's high-water mark. The ticker reads this
-        // every 250 ms and is the only place SegmentProgress is emitted.
-        let truncated = {
-            let mut m = shared.meta.lock().await;
-            let s = &mut m.segments[index];
-            s.bytes_downloaded = (absolute_offset + written_total) - s.segment.start;
-            s.segment.end <= s.segment.start + s.bytes_downloaded
-        };
-        if truncated {
-            break;
-        }
-
-        if segment_len > 0 && (absolute_offset - segment_start) + written_total >= segment_len {
-            break;
-        }
-
-        if written_since_flush >= WRITE_CHUNK_FLUSH_BYTES {
-            file.flush().await.map_err(|e| EngineError::io(None, e))?;
-            written_since_flush = 0;
+        let reached_end = segment_len > 0
+            && (absolute_offset - segment_start) + written_total + pending.len() as u64
+                >= segment_len;
+        if reached_end
+            || pending.len() >= WRITE_BUFFER_BYTES
+            || last_write.elapsed() >= WRITE_MAX_DELAY
+        {
+            let truncated = write_pending(
+                file,
+                &mut pending,
+                shared,
+                index,
+                absolute_offset,
+                &mut written_total,
+            )
+            .await?;
+            last_write = std::time::Instant::now();
+            if truncated || reached_end {
+                break;
+            }
         }
     }
+
+    // Whatever is buffered still belongs on disk — on a cancel or a failed
+    // read too, so the progress already received survives for the resume.
+    if !pending.is_empty() {
+        write_pending(
+            file,
+            &mut pending,
+            shared,
+            index,
+            absolute_offset,
+            &mut written_total,
+        )
+        .await?;
+    }
+    outcome
+}
+
+/// Write the buffered bytes at the file's current position, then advance
+/// the segment's high-water mark — only after the write is flushed, since
+/// the sidecar persists that mark and a resume skips everything below it.
+/// Returns `true` when a live split has moved the segment's end to (or
+/// below) what is now written, i.e. this worker is done.
+async fn write_pending(
+    file: &mut File,
+    pending: &mut Vec<u8>,
+    shared: &Arc<SharedState>,
+    index: usize,
+    absolute_offset: u64,
+    written_total: &mut u64,
+) -> Result<bool> {
+    file.write_all(pending)
+        .await
+        .map_err(|e| EngineError::io(None, e))?;
     file.flush().await.map_err(|e| EngineError::io(None, e))?;
-    Ok(())
+    *written_total += pending.len() as u64;
+    pending.clear();
+
+    // The ticker reads this every 250 ms and is the only place
+    // SegmentProgress is emitted.
+    let mut m = shared.meta.lock().await;
+    let s = &mut m.segments[index];
+    let written = (absolute_offset + *written_total) - s.segment.start;
+    // A split may have moved the end below what this batch covered; the
+    // bytes past it belong to the new segment (which rewrites them with the
+    // same content), so they must not count here too.
+    s.bytes_downloaded = if !s.segment.is_empty() {
+        written.min(s.segment.len())
+    } else {
+        written
+    };
+    Ok(s.segment.end <= s.segment.start + written)
 }
 
 #[cfg(test)]
