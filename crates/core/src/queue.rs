@@ -1113,6 +1113,13 @@ async fn run_worker(
                     ),
                 }
 
+                // Tag the files as downloaded from the internet, as a browser
+                // would have. Last, so every rename and move above is done
+                // and the tag lands on the file's final path.
+                if let Ok(record) = download::get(&pool, id).await {
+                    crate::motw::mark_download(&record).await;
+                }
+
                 tracing::info!(id, ?from, bytes = summary.bytes, "queue: marking completed");
                 if let Err(e) = download::mark_completed(&pool, id, summary.bytes).await {
                     tracing::warn!(id, error = %e, "queue: mark_completed failed");

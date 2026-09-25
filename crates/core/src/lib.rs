@@ -28,6 +28,7 @@ pub mod download;
 pub mod error;
 pub mod event;
 pub mod logging;
+mod motw;
 mod queue;
 pub mod schedule;
 mod secret;
