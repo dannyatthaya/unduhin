@@ -485,22 +485,24 @@ pub(crate) async fn insert(pool: &SqlitePool, input: AddDownload) -> Result<Down
         None => None,
     };
 
-    // Provisional name. Torrents skip the HEAD probe entirely (there is no
-    // HTTP resource to probe) and take a provisional name now — magnet
-    // `dn=` → `.torrent` stem → `"torrent"` — reconciled to the real
-    // torrent name once librqbit resolves metadata (the facade emits
-    // `FilenameLearned`, mirroring `finalize_ytdlp_completion`). yt-dlp rows
-    // bring their own title and also skip the probe; plain HTTP rows pre-probe
-    // the URL so randomized URLs like `/d/abc123xyz` don't save as
-    // extension-less garbage.
+    // Provisional name. Torrents take one now — magnet `dn=` → `.torrent`
+    // stem → `"torrent"` — reconciled to the real torrent name once librqbit
+    // resolves metadata (the facade emits `FilenameLearned`, mirroring
+    // `finalize_ytdlp_completion`). yt-dlp rows bring their own title.
+    //
+    // Plain HTTP rows take the URL tail and send NOTHING to the server here.
+    // An add-time HEAD probe used to fetch a better name, but on one-click
+    // and single-use-token hosts any request spends the token, and the
+    // real download then got an empty body. The engine learns the name
+    // from the download's own GET instead: the row's display name updates
+    // mid-flight (`mark_learned_filename`) and the file is renamed and
+    // re-categorized at completion (`apply_engine_filename`), which both
+    // recognize this URL-derived name as one they may replace.
     let filename = match (filename, kind, media_info.as_ref(), torrent.as_ref()) {
         (Some(f), ..) => f,
         (None, DownloadKind::Torrent, _, torrent) => provisional_torrent_name(torrent, &url),
         (None, _, Some(info), _) => sanitize_filename(&info.title),
-        (None, ..) => probe_filename(pool, &url)
-            .await
-            .or_else(|| filename_from_url(&url))
-            .unwrap_or_else(|| "download.bin".to_string()),
+        (None, ..) => url_fallback_filename(&url),
     };
 
     // Path-traversal guard. Every filename source converges here: an
@@ -1796,7 +1798,7 @@ async fn decide_learned(
     if new_name == physical_name {
         return Ok(None);
     }
-    let url_fallback = filename_from_url(url).map(|t| sanitize_filename(&t));
+    let url_fallback = Some(sanitize_filename(&url_fallback_filename(url)));
     // The physical name must be one WE derived from the URL tail before the
     // real name was known — either it *is* the tail, or it's the tail plus a
     // " (n)" de-dup suffix we appended when two links share a tail (every
@@ -2621,58 +2623,19 @@ fn parse_dt(s: &str) -> Result<DateTime<Utc>> {
         .map_err(|e| CoreError::InvalidArgument(format!("bad timestamp {s:?}: {e}")))
 }
 
+/// The name an HTTP row starts with when nobody supplied one: the URL's
+/// path tail, else `download.bin`. The learned-name guard
+/// ([`decide_learned`]) treats exactly this name as replaceable.
+fn url_fallback_filename(url: &url::Url) -> String {
+    filename_from_url(url).unwrap_or_else(|| "download.bin".to_string())
+}
+
 fn filename_from_url(url: &url::Url) -> Option<String> {
     let last = url.path_segments()?.next_back()?.to_string();
     if last.is_empty() {
         None
     } else {
         Some(urlencoding_decode(&last))
-    }
-}
-
-/// Fast HEAD probe used at add-download time to pull a filename from
-/// `Content-Disposition` / final-redirect URL / `Content-Type`. Returns
-/// `None` if the probe fails, times out, or yields nothing better than
-/// the URL path tail. Times out fast (5s caps) so a slow or unreachable
-/// host doesn't make Add URL hang.
-async fn probe_filename(pool: &SqlitePool, url: &url::Url) -> Option<String> {
-    const PROBE_TIMEOUT_SECS: u64 = 5;
-
-    let connect = crate::settings::get(pool, crate::settings::settings_keys::CONNECT_TIMEOUT_SECS)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|v| v.as_u64())
-        .unwrap_or(15)
-        .min(PROBE_TIMEOUT_SECS);
-    let read = crate::settings::get(pool, crate::settings::settings_keys::READ_TIMEOUT_SECS)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|v| v.as_u64())
-        .unwrap_or(60)
-        .min(PROBE_TIMEOUT_SECS);
-    let user_agent = crate::settings::get(pool, crate::settings::settings_keys::USER_AGENT)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .filter(|s| !s.is_empty());
-
-    let client = engine::http::build_client(
-        std::time::Duration::from_secs(connect),
-        std::time::Duration::from_secs(read),
-        user_agent.as_deref(),
-        &[],
-    )
-    .ok()?;
-
-    match engine::probe(&client, url).await {
-        Ok(info) => info.filename_hint,
-        Err(e) => {
-            tracing::debug!(error = %e, "add_download probe failed; falling back to URL");
-            None
-        }
     }
 }
 
@@ -5454,5 +5417,57 @@ mod tests {
             names.push(e.file_name().to_string_lossy().into_owned());
         }
         assert_eq!(names, vec!["dst.bin".to_string()]);
+    }
+
+    // ---- No add-time request (single-use links) ------------------------------
+
+    /// Adding an HTTP download without a name must not touch the server.
+    /// One-click / single-use-token hosts spend the token on ANY request,
+    /// so the add-time HEAD probe left the real download with an empty
+    /// body. The name now starts as the URL tail and is learned from the
+    /// download's own GET.
+    #[tokio::test]
+    async fn adding_without_a_filename_sends_no_request() {
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((_stream, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+
+        let mut add = http_add(tmp.path(), "unused");
+        add.filename = None;
+        add.url = format!("http://{addr}/dl/token-abc").parse().unwrap();
+        let rec = insert(&pool, add).await.unwrap();
+
+        assert_eq!(rec.filename, "token-abc");
+        // Give a stray connection time to land before counting.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// A URL with no path tail starts as `download.bin`; the learned name
+    /// must still replace it, now that no add-time probe runs first.
+    #[tokio::test]
+    async fn learned_name_replaces_the_download_bin_fallback() {
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let on_disk = tmp.path().join("download.bin");
+        tokio::fs::write(&on_disk, b"x").await.unwrap();
+        let url = "https://files.example.com/";
+        let id =
+            seed_row_with_url(&pool, url, "download.bin", on_disk.to_str().unwrap(), None).await;
+
+        let renamed = apply_engine_filename(&pool, id, &url.parse().unwrap(), "report.pdf")
+            .await
+            .unwrap()
+            .expect("the fallback name is ours to replace");
+
+        assert_eq!(renamed.filename, "report.pdf");
     }
 }
