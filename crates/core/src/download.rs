@@ -1059,9 +1059,17 @@ pub(crate) fn sanitize_filename(s: &str) -> String {
 }
 
 pub(crate) async fn get(pool: &SqlitePool, id: DownloadId) -> Result<DownloadRecord> {
+    get_with(pool, id).await
+}
+
+/// [`get`] on any executor — a transaction's connection included.
+pub(crate) async fn get_with<'e, E>(exec: E, id: DownloadId) -> Result<DownloadRecord>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     let row = sqlx::query("SELECT * FROM downloads WHERE id = ?")
         .bind(id)
-        .fetch_optional(pool)
+        .fetch_optional(exec)
         .await?;
     let row = row.ok_or(CoreError::DownloadNotFound(id))?;
     record_from_row(&row)
@@ -2046,12 +2054,20 @@ pub(crate) async fn reset_for_restart(pool: &SqlitePool, id: DownloadId) -> Resu
     let record = get(pool, id).await?;
     let sidecar = engine::Meta::sidecar_path(&record.output_path);
     let _ = tokio::fs::remove_file(&sidecar).await;
+    reset_progress(pool, id).await
+}
+
+/// The row half of [`reset_for_restart`]: zero the progress columns.
+pub(crate) async fn reset_progress<'e, E>(exec: E, id: DownloadId) -> Result<()>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     sqlx::query(
         "UPDATE downloads SET downloaded_bytes = 0, completed_at = NULL, error = NULL \
          WHERE id = ?",
     )
     .bind(id)
-    .execute(pool)
+    .execute(exec)
     .await?;
     Ok(())
 }
@@ -2094,12 +2110,15 @@ pub(crate) async fn mark_failed(
 ///    freshly probed validators back straight after.
 ///
 /// Clears `error` and `error_kind` too — the row is about to be re-queued.
-pub(crate) async fn update_source(
-    pool: &SqlitePool,
+pub(crate) async fn update_source<'e, E>(
+    exec: E,
     id: DownloadId,
     url: &str,
     headers: Option<&[(String, String)]>,
-) -> Result<()> {
+) -> Result<()>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     let headers_json = match headers {
         Some(pairs) if !pairs.is_empty() => {
             Some(crate::secret::protect(&serde_json::to_string(pairs)?))
@@ -2114,7 +2133,7 @@ pub(crate) async fn update_source(
     .bind(url)
     .bind(headers_json)
     .bind(id)
-    .execute(pool)
+    .execute(exec)
     .await?;
     if res.rows_affected() == 0 {
         return Err(CoreError::DownloadNotFound(id));
@@ -2124,15 +2143,18 @@ pub(crate) async fn update_source(
 
 /// Persist a fresh snapshot of progress + sidecar state. Called from the
 /// queue manager on every progress tick.
-pub(crate) async fn persist_progress(
-    pool: &SqlitePool,
+pub(crate) async fn persist_progress<'e, E>(
+    exec: E,
     id: DownloadId,
     downloaded: u64,
     total: Option<u64>,
     etag: Option<&str>,
     last_modified: Option<&str>,
     segments_meta: Option<&[SegmentState]>,
-) -> Result<()> {
+) -> Result<()>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     let segments_json = match segments_meta {
         Some(s) => Some(serde_json::to_string(s)?),
         None => None,
@@ -2151,7 +2173,7 @@ pub(crate) async fn persist_progress(
     .bind(last_modified)
     .bind(segments_json)
     .bind(id)
-    .execute(pool)
+    .execute(exec)
     .await?;
     Ok(())
 }

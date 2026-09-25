@@ -1084,6 +1084,88 @@ async fn refresh_source_rejects_bad_input() -> Result<()> {
     Ok(())
 }
 
+/// The user resumes the row while `refresh_source` is still probing the new
+/// link. The refresh must then change nothing: before the status was
+/// re-checked under a lock, it rewrote the URL (and dropped the sidecar)
+/// of a row that was about to be picked up by a worker.
+#[tokio::test]
+async fn refresh_source_changes_nothing_if_the_row_resumed_during_the_probe() -> Result<()> {
+    // Holds every request until released, and reports that it got one.
+    let hit = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    {
+        let (hit, release) = (hit.clone(), release.clone());
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (hit, release) = (hit.clone(), release.clone());
+                tokio::spawn(async move {
+                    let svc = service_fn(move |_req: Request<Incoming>| {
+                        let (hit, release) = (hit.clone(), release.clone());
+                        async move {
+                            hit.notify_one();
+                            release.notified().await;
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(CONTENT_LENGTH, 3)
+                                    .body(Full::new(Bytes::from_static(b"abc")))
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), svc)
+                        .await;
+                });
+            }
+        });
+    }
+
+    let dir = tempfile::tempdir()?;
+    let core = Core::open(dir.path().join("race.db")).await?;
+    let old_url = "https://example.invalid/old.bin";
+    let id = core
+        .add_download(AddDownload {
+            url: old_url.parse()?,
+            filename: Some("old.bin".into()),
+            output_path: Some(dir.path().join("old.bin")),
+            output_dir: None,
+            category: None,
+            priority: 0,
+            segments: Some(1),
+            media_info: None,
+            headers: None,
+            source: DownloadSource::Manual,
+            kind: DownloadKind::Http,
+            torrent: None,
+        })
+        .await?;
+    // The queue is never started, so the row just sits there.
+    core.pause(id).await?;
+
+    let refreshing = {
+        let core = core.clone();
+        let new_url = format!("http://{addr}/new.bin");
+        tokio::spawn(async move { core.refresh_source(id, &new_url, None, false).await })
+    };
+    hit.notified().await;
+    // The user clicks resume while the probe is in flight.
+    core.resume(id).await?;
+    release.notify_one();
+
+    let err = refreshing.await?.unwrap_err();
+    assert!(
+        matches!(err, unduhin_core::CoreError::InvalidTransition { .. }),
+        "expected InvalidTransition, got {err:?}"
+    );
+    let rec = core.get_download(id).await?;
+    assert_eq!(rec.url, old_url, "the refresh must not touch a resumed row");
+    assert_eq!(rec.status, Status::Queued);
+    Ok(())
+}
+
 /// A signed URL that has expired answers 403. `retry::classify` files every
 /// 4xx under `Terminal`, which is right for the transfer but too coarse for
 /// the UI: 403 is fixable with a fresh link, 404 is not. The row must record
