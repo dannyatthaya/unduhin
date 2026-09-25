@@ -138,10 +138,15 @@ filename: string | null,
  */
 sizeBytes: number | null, 
 /**
- * Origin of the dead URL, shown by the app's dialog so the user can
- * confirm a capture that arrives from a different host.
+ * Origin of the dead URL. Its site is one the capture may come from.
  */
 origin: string | null, 
+/**
+ * Origin of the page the dead row was first captured from (its
+ * stored `Referer`), when known — the other acceptable site. A
+ * missing field (an older app) leaves only `origin`.
+ */
+referrerOrigin: string | null, 
 /**
  * Unix epoch milliseconds after which the extension drops the entry.
  */

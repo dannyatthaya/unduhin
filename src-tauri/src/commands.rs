@@ -519,11 +519,20 @@ pub async fn arm_link_refresh(core: State<'_, Core>, id: DownloadId) -> CommandR
             record.kind
         )));
     }
-    let origin = record
-        .url
-        .parse::<url::Url>()
-        .ok()
-        .map(|u| u.origin().ascii_serialization());
+    let origin_of = |raw: &str| {
+        raw.parse::<url::Url>()
+            .ok()
+            .filter(|u| matches!(u.scheme(), "http" | "https"))
+            .map(|u| u.origin().ascii_serialization())
+    };
+    let origin = origin_of(&record.url);
+    // The page the row was first captured from. With the dead URL's own
+    // origin, these are the sites the extension accepts a refresh from.
+    let referrer_origin = record.headers.as_ref().and_then(|hs| {
+        hs.iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("referer"))
+            .and_then(|(_, value)| origin_of(value))
+    });
     let expires_at_ms = chrono::Utc::now().timestamp_millis() + ARM_REFRESH_TTL_MS;
 
     crate::pipe::broadcast_arm_refresh(
@@ -531,6 +540,7 @@ pub async fn arm_link_refresh(core: State<'_, Core>, id: DownloadId) -> CommandR
         Some(record.filename),
         record.total_bytes,
         origin,
+        referrer_origin,
         expires_at_ms,
     )
     .await;

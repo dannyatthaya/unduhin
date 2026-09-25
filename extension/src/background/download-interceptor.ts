@@ -147,7 +147,11 @@ export function installDownloadInterceptor(deps: InterceptorDeps): void {
     // it go to the browser must not strand them — they would click the link,
     // watch the browser save a duplicate, and the broken row would sit there
     // untouched. Checked before `shouldIntercept` for that reason.
-    const armed = deps.refreshArms?.match(filename, item.totalBytes > 0 ? item.totalBytes : null);
+    const armed = deps.refreshArms?.match(
+      filename,
+      item.totalBytes > 0 ? item.totalBytes : null,
+      [url, item.referrer],
+    );
     if (armed) {
       if (!deps.bridge.isHealthy()) {
         log.info("armed refresh but bridge unhealthy — leaving to the browser:", url);

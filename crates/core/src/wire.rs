@@ -647,6 +647,13 @@ pub enum Outbound {
     /// Matching on name and size is what makes this work for rows that
     /// already exist — both are columns every row has, so no backfill of
     /// page context is needed.
+    ///
+    /// Name and size alone are not enough to trust a capture, though: while
+    /// an arm is live, any page could trigger a download with the same name
+    /// and have it folded into the row. So a capture must also come from the
+    /// same *site* (registrable domain) as the dead URL or the page it was
+    /// first captured from — its URL's site or its referring page's site.
+    /// Sites rather than origins, because a CDN legitimately moves hosts.
     #[serde(rename_all = "camelCase")]
     ArmRefresh {
         #[cfg_attr(feature = "ts-rs-export", ts(type = "number"))]
@@ -657,9 +664,13 @@ pub enum Outbound {
         /// which case the extension matches on the file name alone.
         #[cfg_attr(feature = "ts-rs-export", ts(type = "number | null"))]
         size_bytes: Option<u64>,
-        /// Origin of the dead URL, shown by the app's dialog so the user can
-        /// confirm a capture that arrives from a different host.
+        /// Origin of the dead URL. Its site is one the capture may come from.
         origin: Option<String>,
+        /// Origin of the page the dead row was first captured from (its
+        /// stored `Referer`), when known — the other acceptable site. A
+        /// missing field (an older app) leaves only `origin`.
+        #[serde(default)]
+        referrer_origin: Option<String>,
         /// Unix epoch milliseconds after which the extension drops the entry.
         #[cfg_attr(feature = "ts-rs-export", ts(type = "number"))]
         expires_at_ms: i64,
@@ -1085,6 +1096,7 @@ mod tests {
                 filename: None,
                 size_bytes: None,
                 origin: None,
+                referrer_origin: None,
                 expires_at_ms: 0,
             },
             Outbound::RefreshCredentials {

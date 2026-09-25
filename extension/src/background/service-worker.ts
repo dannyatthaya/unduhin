@@ -149,6 +149,7 @@ const rawBridge = createNativeBridge(
         filename: msg.filename,
         sizeBytes: msg.sizeBytes,
         origin: msg.origin,
+        referrerOrigin: msg.referrerOrigin ?? null,
         expiresAt: msg.expiresAtMs,
       });
       return;

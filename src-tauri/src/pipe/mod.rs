@@ -242,6 +242,7 @@ pub async fn broadcast_arm_refresh(
     filename: Option<String>,
     size_bytes: Option<u64>,
     origin: Option<String>,
+    referrer_origin: Option<String>,
     expires_at_ms: i64,
 ) {
     broadcast(
@@ -250,6 +251,7 @@ pub async fn broadcast_arm_refresh(
             filename,
             size_bytes,
             origin,
+            referrer_origin,
             expires_at_ms,
         },
         "ArmRefresh",
