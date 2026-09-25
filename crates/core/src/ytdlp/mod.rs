@@ -285,7 +285,11 @@ async fn probe_raw(
         for arg in impersonate_args(should_impersonate) {
             cmd.arg(arg);
         }
-        cmd.arg(&url_string)
+        // `--` ends option parsing: whatever the URL string holds, yt-dlp
+        // reads it as a URL. Without it a "URL" like `--exec=…` from the
+        // add dialog would be an option — `--exec` runs a command.
+        cmd.arg("--")
+            .arg(&url_string)
             // When the timeout below fires, this future is dropped
             // mid-await; `kill_on_drop` is what turns that drop into an
             // actual process kill rather than leaving a yt-dlp running in
@@ -531,7 +535,9 @@ pub async fn download(
         cmd.arg("--config-locations").arg(file.path());
         Some(file)
     };
-    cmd.arg(&job.url)
+    // See `probe_raw`: `--` keeps the URL from ever parsing as an option.
+    cmd.arg("--")
+        .arg(&job.url)
         // yt-dlp.exe on Windows is a PyInstaller-frozen Python program.
         // When its stdout is piped (not a TTY), Python defaults to
         // block-buffering — progress lines accumulate in the buffer and
@@ -2229,5 +2235,53 @@ Tor       -     curl_cffi>=0.11 (unavailable)
             tokio::fs::metadata(&options_path).await.is_err(),
             "the options file must be removed after the run"
         );
+    }
+
+    /// A "URL" that looks like an option must reach yt-dlp as a URL. After
+    /// `--` yt-dlp stops parsing options; without it, `--exec=…` typed into
+    /// the add dialog would have run a command after the download.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn url_is_always_passed_after_the_end_of_options_marker() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake-yt-dlp");
+        let argv = dir.path().join("argv.txt");
+        tokio::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done >> '{}'\n",
+                argv.display()
+            ),
+        )
+        .await
+        .unwrap();
+        tokio::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+        let hostile = "--exec=touch pwned";
+
+        let _ = probe(hostile, &script, Duration::from_secs(5), None, false).await;
+        let mut job = download_job(&script, dir.path());
+        job.url = hostile.to_string();
+        let _ = download(job, CancellationToken::new(), None).await;
+
+        let args = tokio::fs::read_to_string(&argv).await.unwrap();
+        let lines: Vec<&str> = args.lines().collect();
+        let uses: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| **a == hostile)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            uses.len(),
+            2,
+            "probe and download each pass the URL once: {args}"
+        );
+        for i in uses {
+            assert_eq!(lines[i - 1], "--", "URL not preceded by `--`: {args}");
+        }
     }
 }
