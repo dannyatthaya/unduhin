@@ -46,6 +46,9 @@ pub enum EngineError {
     #[error("response body ended early: got {actual} of {expected} expected bytes")]
     BodyTruncated { expected: u64, actual: u64 },
 
+    #[error("server answered a range request for byte {requested} with bytes from {served}")]
+    RangeMismatch { requested: u64, served: u64 },
+
     #[error("other: {0}")]
     Other(String),
 }

@@ -1632,7 +1632,8 @@ fn classify_engine_error(err: &engine::EngineError) -> ErrorKind {
         engine::EngineError::Io { .. } => ErrorKind::Disk,
         engine::EngineError::TransientStatus { .. }
         | engine::EngineError::RetryExhausted { .. }
-        | engine::EngineError::BodyTruncated { .. } => ErrorKind::Network,
+        | engine::EngineError::BodyTruncated { .. }
+        | engine::EngineError::RangeMismatch { .. } => ErrorKind::Network,
         _ => ErrorKind::Other,
     }
 }
