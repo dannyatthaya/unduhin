@@ -159,7 +159,9 @@ async function handleClick(
   // Respect `forwardCookies`. When the user wants Unduhin to behave
   // as if it were a fresh browser session, drop cookies on the floor.
   const forwardCookies = deps.settings.current().forwardCookies;
-  const cookieHeader = forwardCookies ? await buildCookieHeader(url).catch(() => "") : "";
+  const cookieHeader = forwardCookies
+    ? await buildCookieHeader(url, tab?.id).catch(() => "")
+    : "";
   const cached = deps.headerCache.getHeadersFor(url) ?? [];
   const requestHeaders: RequestHeader[] = cached
     .filter((h) => typeof h.name === "string" && h.name.length > 0)

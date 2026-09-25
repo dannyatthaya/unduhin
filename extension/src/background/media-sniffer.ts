@@ -126,7 +126,9 @@ export function installMediaSniffer(deps: MediaSnifferDeps): MediaSniffer {
       return byTab.get(tabId) ?? [];
     },
     async enrich(stream) {
-      const cookieHeader = await buildCookieHeader(stream.manifestUrl).catch(() => "");
+      const cookieHeader = await buildCookieHeader(stream.manifestUrl, stream.tabId).catch(
+        () => "",
+      );
       const cached = deps.headerCache.getHeadersFor(stream.manifestUrl) ?? [];
       const requestHeaders: RequestHeader[] = cached
         .filter((h) => typeof h.name === "string" && h.name.length > 0)

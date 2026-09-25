@@ -112,6 +112,16 @@ export function installDownloadInterceptor(deps: InterceptorDeps): void {
     // history rows restored on startup — but guard anyway.
     if (item.state !== "in_progress") return;
 
+    // Never capture from a private window. The app keeps a download history
+    // and would store the private session's cookies with the row — the
+    // opposite of what incognito promises. The browser handles it.
+    // (Explicit actions — the context menu, the popup — still work, with
+    // that tab's own cookies.)
+    if (item.incognito) {
+      log.debug("passthrough: incognito download");
+      return;
+    }
+
     const url = pickUrl(item);
 
     // A download we re-issued ourselves (post-decline / post-failure
