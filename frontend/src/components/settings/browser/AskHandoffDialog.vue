@@ -29,6 +29,8 @@ import type { DownloadJob } from "@/types/wire";
 
 interface AskHandoffPayload {
   readonly id: string;
+  /** Redacted: no cookies or captured request headers. The backend holds
+   *  the real job under `id`. */
   readonly job: DownloadJob;
 }
 
@@ -127,7 +129,7 @@ async function confirm(): Promise<void> {
   submitting.value = true;
   errorMessage.value = null;
   try {
-    const id = await api.startHandoffDownload(payload.job, {
+    const id = await api.startHandoffDownload(payload.id, {
       filename: filename.value.trim() || null,
       outputDir: outputPath.value.trim() || null,
       categoryId: categoryId.value,
@@ -147,6 +149,8 @@ async function confirm(): Promise<void> {
  *  downloads — the user can re-trigger from the browser if they change their
  *  mind. */
 function cancel(): void {
+  const payload = current.value;
+  if (payload) void api.discardHandoff(payload.id).catch(() => {});
   finish();
 }
 

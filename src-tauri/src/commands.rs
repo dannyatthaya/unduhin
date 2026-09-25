@@ -384,12 +384,20 @@ pub async fn add_download(
 #[tauri::command]
 pub async fn start_handoff_download(
     core: State<'_, Core>,
-    job: DownloadJob,
+    handoff_id: String,
     filename: Option<String>,
     output_dir: Option<String>,
     category_id: Option<i64>,
     segments: Option<u32>,
 ) -> CommandResult<DownloadId> {
+    // The job (cookies included) never left the backend; the dialog only
+    // saw a redacted copy and hands back its id.
+    let job: DownloadJob = crate::pipe::take_handoff(&handoff_id)
+        .await
+        .ok_or_else(|| CommandError {
+            message: "this download is no longer available — click the link in the browser again"
+                .into(),
+        })?;
     let url = url::Url::parse(&job.final_url).map_err(|e| CommandError {
         message: format!("invalid URL: {e}"),
     })?;
@@ -959,6 +967,14 @@ pub async fn respond_handoff(
     decision: HandoffDecision,
 ) -> CommandResult<()> {
     crate::pipe::broadcast_handoff_decision(id, decision).await;
+    Ok(())
+}
+
+/// The user dismissed an `ask-first` prompt: drop the job held for it, and
+/// with it the capture's cookies.
+#[tauri::command]
+pub async fn discard_handoff(handoff_id: String) -> CommandResult<()> {
+    let _ = crate::pipe::take_handoff(&handoff_id).await;
     Ok(())
 }
 
