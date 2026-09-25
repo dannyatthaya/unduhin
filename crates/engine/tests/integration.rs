@@ -1096,3 +1096,65 @@ async fn captured_headers_do_not_follow_a_redirect_to_another_origin() -> Result
     assert_eq!(h.get("x-api-key").unwrap(), "secret");
     Ok(())
 }
+
+/// A download is saved byte-for-byte as the server sent it. The engine used
+/// to send `Accept-Encoding: gzip` and decode transparently, so a response
+/// with `Content-Encoding: gzip` — a `.tar.gz` from a misconfigured server,
+/// or any text file a CDN compresses — was not saved as served: the run
+/// "succeeded" with an empty file.
+#[tokio::test]
+async fn content_encoded_responses_are_saved_as_served() -> Result<()> {
+    // Not valid gzip on purpose: nothing may try to decode it.
+    let served: &'static [u8] = b"\x1f\x8b\x08\x00 opaque bytes that must land on disk unchanged";
+    let seen_accept_encoding = Arc::new(tokio::sync::Mutex::new(None::<String>));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let seen = seen_accept_encoding.clone();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                let svc = service_fn(move |req: Request<Incoming>| {
+                    let seen = seen.clone();
+                    async move {
+                        *seen.lock().await = req
+                            .headers()
+                            .get("accept-encoding")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string);
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header("content-encoding", "gzip")
+                                .header(CONTENT_LENGTH, served.len())
+                                .body(Full::new(Bytes::from_static(served)))
+                                .unwrap(),
+                        )
+                    }
+                });
+                let _ = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), svc)
+                    .await;
+            });
+        }
+    });
+
+    let tmp = tempfile::tempdir()?;
+    let out = tmp.path().join("archive.tar.gz");
+    let url: Url = format!("http://{addr}/archive.tar.gz").parse().unwrap();
+    let summary = download(
+        opts_for(url, out.clone(), 1),
+        CancellationToken::new(),
+        None,
+    )
+    .await?;
+
+    assert_eq!(std::fs::read(&out)?, served);
+    assert_eq!(summary.bytes, served.len() as u64);
+    let asked = seen_accept_encoding.lock().await.clone();
+    assert!(
+        asked.as_deref().map_or(true, |v| !v.contains("gzip")),
+        "must not ask for a compressed body, sent {asked:?}"
+    );
+    Ok(())
+}

@@ -72,3 +72,5 @@ default = []
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The pipe tests check captured cookies are stored; see the feature's note.
+unduhin-core = { path = "../crates/core", features = ["ephemeral-header-key"] }

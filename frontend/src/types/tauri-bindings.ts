@@ -515,13 +515,14 @@ export const api = {
     invoke<DownloadId>("add_download", { input }),
   /**
    * Start a download the extension captured in `ask-first` mode, with the
-   * options the user picked in the in-app config dialog. The captured HTTP
-   * context (cookies / referer / user-agent / headers) travels inside `job`
-   * and is folded in server-side, so authenticated downloads keep working;
-   * the row is tagged as a browser hand-off (`ExtensionPipe`).
+   * options the user picked in the in-app config dialog. The captured job
+   * (cookies / referer / user-agent / headers) never leaves the backend:
+   * the dialog gets a redacted copy and passes back only `handoffId`, and
+   * the backend folds the real one in, so authenticated downloads keep
+   * working. The row is tagged as a browser hand-off (`ExtensionPipe`).
    */
   startHandoffDownload: (
-    job: DownloadJob,
+    handoffId: string,
     overrides: {
       filename?: string | null;
       /** Folder to download into (not the file path). */
@@ -531,12 +532,14 @@ export const api = {
     } = {},
   ) =>
     invoke<DownloadId>("start_handoff_download", {
-      job,
+      handoffId,
       filename: overrides.filename ?? null,
       outputDir: overrides.outputDir ?? null,
       categoryId: overrides.categoryId ?? null,
       segments: overrides.segments ?? null,
     }),
+  /** Drop the job held for a dismissed `ask-first` prompt. */
+  discardHandoff: (handoffId: string) => invoke<void>("discard_handoff", { handoffId }),
   listDownloads: (filter?: DownloadFilter) =>
     invoke<DownloadRecord[]>("list_downloads", { filter: filter ?? null }),
   getDownload: (id: DownloadId) =>

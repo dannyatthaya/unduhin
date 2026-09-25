@@ -338,6 +338,15 @@ pub struct DownloadRecord {
     /// and forwarded to yt-dlp via `--add-header` (in an options file, not
     /// argv). `None` when the row
     /// was added without browser capture context (CLI, Add URL dialog).
+    ///
+    /// Never serialized: records go to the webview (commands, events) and
+    /// to the CLI's JSON output, and none of them needs the decrypted
+    /// cookies. Read it through the typed API only.
+    ///
+    /// Only populated by `get_full` / `Core::get_download_full`; every
+    /// other read leaves it `None`, because decrypting it costs a DPAPI /
+    /// Keychain call per row.
+    #[serde(default, skip_serializing)]
     pub headers: Option<Vec<(String, String)>>,
     /// Which surface added this row. Used by the Settings → Browser
     /// status card to count extension hand-offs. Older rows
@@ -485,22 +494,24 @@ pub(crate) async fn insert(pool: &SqlitePool, input: AddDownload) -> Result<Down
         None => None,
     };
 
-    // Provisional name. Torrents skip the HEAD probe entirely (there is no
-    // HTTP resource to probe) and take a provisional name now — magnet
-    // `dn=` → `.torrent` stem → `"torrent"` — reconciled to the real
-    // torrent name once librqbit resolves metadata (the facade emits
-    // `FilenameLearned`, mirroring `finalize_ytdlp_completion`). yt-dlp rows
-    // bring their own title and also skip the probe; plain HTTP rows pre-probe
-    // the URL so randomized URLs like `/d/abc123xyz` don't save as
-    // extension-less garbage.
+    // Provisional name. Torrents take one now — magnet `dn=` → `.torrent`
+    // stem → `"torrent"` — reconciled to the real torrent name once librqbit
+    // resolves metadata (the facade emits `FilenameLearned`, mirroring
+    // `finalize_ytdlp_completion`). yt-dlp rows bring their own title.
+    //
+    // Plain HTTP rows take the URL tail and send NOTHING to the server here.
+    // An add-time HEAD probe used to fetch a better name, but on one-click
+    // and single-use-token hosts any request spends the token, and the
+    // real download then got an empty body. The engine learns the name
+    // from the download's own GET instead: the row's display name updates
+    // mid-flight (`mark_learned_filename`) and the file is renamed and
+    // re-categorized at completion (`apply_engine_filename`), which both
+    // recognize this URL-derived name as one they may replace.
     let filename = match (filename, kind, media_info.as_ref(), torrent.as_ref()) {
         (Some(f), ..) => f,
         (None, DownloadKind::Torrent, _, torrent) => provisional_torrent_name(torrent, &url),
         (None, _, Some(info), _) => sanitize_filename(&info.title),
-        (None, ..) => probe_filename(pool, &url)
-            .await
-            .or_else(|| filename_from_url(&url))
-            .unwrap_or_else(|| "download.bin".to_string()),
+        (None, ..) => url_fallback_filename(&url),
     };
 
     // Path-traversal guard. Every filename source converges here: an
@@ -617,12 +628,7 @@ pub(crate) async fn insert(pool: &SqlitePool, input: AddDownload) -> Result<Down
     // The JSON can carry `Cookie` / `Authorization` (incl. HttpOnly cookies)
     // captured from the browser, so it is encrypted at rest via DPAPI before
     // it touches the (unencrypted) SQLite file. See `crate::secret`.
-    let headers_json = match headers.as_ref() {
-        Some(pairs) if !pairs.is_empty() => {
-            Some(crate::secret::protect(&serde_json::to_string(pairs)?))
-        }
-        _ => None,
-    };
+    let headers_json = encode_headers(headers.as_deref())?;
     // Torrent state rides one nullable JSON column, exactly like
     // `media_info` / `headers`.
     let torrent_json = match torrent.as_ref() {
@@ -656,6 +662,45 @@ pub(crate) async fn insert(pool: &SqlitePool, input: AddDownload) -> Result<Down
     get(pool, id).await
 }
 
+/// The `headers` column value for `pairs`: JSON `[[name, value], ...]`,
+/// encrypted at rest (see `crate::secret`).
+fn encode_headers(pairs: Option<&[(String, String)]>) -> Result<Option<String>> {
+    encode_headers_with(pairs, crate::secret::try_protect)
+}
+
+/// [`encode_headers`] with the encryption step injectable, so the failure
+/// path can be tested on any platform.
+///
+/// When encryption fails the capture is still stored, but only its ordinary
+/// browser headers (`User-Agent`, `Referer`, `Accept…`, …): cookies,
+/// `Authorization` and site token headers never reach the database in the
+/// clear. The download may then need a fresh login, which the "Refresh
+/// link" flow handles, rather than leaving a session readable on disk.
+fn encode_headers_with(
+    pairs: Option<&[(String, String)]>,
+    protect: impl Fn(&str) -> Option<String>,
+) -> Result<Option<String>> {
+    let Some(pairs) = pairs.filter(|p| !p.is_empty()) else {
+        return Ok(None);
+    };
+    if let Some(sealed) = protect(&serde_json::to_string(pairs)?) {
+        return Ok(Some(sealed));
+    }
+    let ordinary: Vec<&(String, String)> = pairs
+        .iter()
+        .filter(|(name, _)| engine::http::is_ordinary_browser_header(name))
+        .collect();
+    tracing::warn!(
+        dropped = pairs.len() - ordinary.len(),
+        "could not encrypt captured headers; storing only ordinary browser headers"
+    );
+    if ordinary.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(serde_json::to_string(&ordinary)?))
+    }
+}
+
 /// Serializes the resolve-and-insert tail of [`insert`]; see there.
 fn insert_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
@@ -684,32 +729,77 @@ fn normalize_torrent_meta(meta: &mut TorrentMeta, url: &url::Url) {
             meta.info_hash = h;
         }
     }
-    meta.info_hash = meta.info_hash.trim().to_ascii_lowercase();
+    // A caller-supplied hash may be base32 (the add dialog passes one
+    // through as-is); de-dup needs the one canonical hex spelling.
+    meta.info_hash = canonical_info_hash(&meta.info_hash)
+        .unwrap_or_else(|| meta.info_hash.trim().to_ascii_lowercase());
 }
 
 /// Extract the BitTorrent v1 info-hash from a magnet URI's
 /// `xt=urn:btih:<hash>` parameter, normalized to lowercase hex. Accepts the
-/// 40-char hex form; returns `None` for the (rarer) base32 form or when the
-/// parameter is absent — callers fall back to other hash sources. No
+/// 40-char hex form and the 32-char base32 form (converted to hex, so both
+/// spellings of one swarm de-dup together); returns `None` when there is no
+/// usable `btih` topic — callers fall back to other hash sources. No
 /// network / metadata fetch is involved (design §5.7).
 fn info_hash_from_magnet(uri: &str) -> Option<String> {
     // Magnets are not always valid `Url`s for `url::Url`, but the query is a
     // simple `&`-joined list of `key=value`s after the first `?`.
     let query = uri.split_once('?').map(|(_, q)| q).unwrap_or(uri);
     for pair in query.split('&') {
-        let (k, v) = pair.split_once('=')?;
-        if !k.eq_ignore_ascii_case("xt") {
+        // A bare flag (`&foo&`) is not a key/value pair; skip it rather than
+        // giving up on the parameters after it.
+        let Some((k, v)) = pair.split_once('=') else {
+            continue;
+        };
+        // `xt`, or an indexed topic `xt.1`, `xt.2`, … (BEP 9).
+        let k = k.to_ascii_lowercase();
+        if k != "xt"
+            && !k
+                .strip_prefix("xt.")
+                .is_some_and(|n| n.parse::<u32>().is_ok())
+        {
             continue;
         }
-        // urn:btih:<hash> (case-insensitive scheme).
-        let lower = v.to_ascii_lowercase();
-        if let Some(hash) = lower.strip_prefix("urn:btih:") {
-            if hash.len() == 40 && hash.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Some(hash.to_string());
-            }
+        // urn:btih:<hash> (case-insensitive scheme), possibly percent-encoded.
+        let decoded = urlencoding_decode(v);
+        let lower = decoded.trim().to_ascii_lowercase();
+        if let Some(hash) = lower
+            .strip_prefix("urn:btih:")
+            .and_then(canonical_info_hash)
+        {
+            return Some(hash);
         }
     }
     None
+}
+
+/// Lowercase-hex form of a v1 info-hash given as 40 hex digits or 32
+/// base32 characters (RFC 4648, as magnets use), else `None`.
+fn canonical_info_hash(hash: &str) -> Option<String> {
+    let hash = hash.trim();
+    if hash.len() == 40 && hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Some(hash.to_ascii_lowercase());
+    }
+    if hash.len() != 32 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(20);
+    let (mut acc, mut bits) = (0u64, 0u32);
+    for c in hash.bytes() {
+        let v = match c.to_ascii_uppercase() {
+            c @ b'A'..=b'Z' => c - b'A',
+            c @ b'2'..=b'7' => c - b'2' + 26,
+            _ => return None,
+        };
+        acc = (acc << 5) | u64::from(v);
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            bytes.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Provisional display name for a torrent before librqbit resolves
@@ -745,7 +835,9 @@ fn provisional_torrent_name(torrent: Option<&TorrentMeta>, url: &url::Url) -> St
 fn magnet_display_name(uri: &str) -> Option<String> {
     let query = uri.split_once('?').map(|(_, q)| q).unwrap_or(uri);
     for pair in query.split('&') {
-        let (k, v) = pair.split_once('=')?;
+        let Some((k, v)) = pair.split_once('=') else {
+            continue;
+        };
         if k.eq_ignore_ascii_case("dn") {
             // Magnet `dn=` uses `+` for spaces in addition to percent-encoding.
             let decoded = urlencoding_decode(&v.replace('+', " "));
@@ -1030,6 +1122,11 @@ pub(crate) async fn reconcile_torrent_filename(
     Ok(Some((new_name, new_category, category_changed)))
 }
 
+/// Longest filename [`sanitize_filename`] emits, in bytes. Well under the
+/// 255-unit component limit of NTFS / APFS / ext4, with room left for the
+/// ` (n)` de-dup suffix and the `.unduhin-meta` sidecar suffix.
+const MAX_FILENAME_BYTES: usize = 200;
+
 /// Make an arbitrary string safe to use as a single filename.
 /// Strips path separators (`/` `\`), the drive colon, and other reserved
 /// characters, drops control characters, trims trailing dots/whitespace,
@@ -1042,40 +1139,158 @@ pub(crate) async fn reconcile_torrent_filename(
 /// The reserved set is the Windows one on every platform. `:` and `\` are
 /// legal on APFS, but keeping one rule means a queue database stays
 /// portable between machines, and the cost is only an occasional
-/// underscore.
+/// underscore. The same goes for Windows device names (`CON`, `NUL`,
+/// `COM1`, …), which are prefixed with `_`: written as a file name on
+/// Windows they open the device instead.
+///
+/// Invisible formatting characters are removed outright. A right-to-left
+/// override (U+202E) makes `invoice<RLO>fdp.exe` display as
+/// `invoiceexe.pdf`, the classic way to dress an executable up as a
+/// document, and none of these characters has a legitimate place in a
+/// file name.
 pub(crate) fn sanitize_filename(s: &str) -> String {
-    let mut out: String = s
+    let cleaned: String = s
         .chars()
+        .filter(|c| !is_invisible_format_char(*c))
         .map(|c| match c {
             '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
-            c if (c as u32) < 0x20 => '_',
+            // C0, DEL and C1 controls.
+            c if c.is_control() => '_',
             c => c,
         })
         .collect();
-    let trimmed = out.trim().trim_end_matches('.').to_string();
-    out = if trimmed.is_empty() {
-        "download".to_string()
-    } else {
-        trimmed
-    };
-    if out.len() > 200 {
-        // `len` and `truncate` are both byte-based, and `truncate` panics
-        // unless the index falls on a char boundary. A CJK or accented
-        // title longer than 200 bytes lands mid-sequence and takes the
-        // process down, so step back to the nearest boundary. At most four
-        // iterations, and the cap is high enough that the result is never
-        // empty.
-        let cut = (0..=200)
-            .rev()
-            .find(|&i| out.is_char_boundary(i))
-            .unwrap_or(0);
-        out.truncate(cut);
+    let mut out = trim_filename(&cleaned).to_string();
+    if out.is_empty() {
+        out = "download".to_string();
+    }
+    if out.len() > MAX_FILENAME_BYTES {
+        out = truncate_keeping_extension(&out, MAX_FILENAME_BYTES);
+    }
+    if is_windows_device_name(&out) {
+        out.insert(0, '_');
     }
     out
 }
 
+/// Leading whitespace and trailing dots/whitespace go: Windows silently
+/// drops the trailing ones, so a name ending in them is not the name that
+/// ends up on disk.
+fn trim_filename(s: &str) -> &str {
+    s.trim_start()
+        .trim_end_matches(|c: char| c == '.' || c.is_whitespace())
+}
+
+/// Bidi controls and zero-width characters: they change how a name
+/// displays without being visible themselves.
+fn is_invisible_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
+}
+
+/// Cut `name` to at most `max` bytes, keeping a short extension so the
+/// file still opens with the right program (and routes to the right
+/// category). `len`/`truncate` are byte-based and a cut inside a UTF-8
+/// sequence would panic, so the cut steps back to a char boundary.
+fn truncate_keeping_extension(name: &str, max: usize) -> String {
+    let (stem, ext) = match name.rfind('.') {
+        // An "extension" of more than 16 bytes is really part of the name.
+        Some(i) if i > 0 && name.len() - i <= 17 => name.split_at(i),
+        _ => (name, ""),
+    };
+    let budget = max.saturating_sub(ext.len());
+    let cut = (0..=budget.min(stem.len()))
+        .rev()
+        .find(|&i| stem.is_char_boundary(i))
+        .unwrap_or(0);
+    let stem = trim_filename(&stem[..cut]);
+    if stem.is_empty() {
+        // Nothing sensible left before the extension; keep the head of the
+        // whole name instead.
+        let cut = (0..=max)
+            .rev()
+            .find(|&i| name.is_char_boundary(i))
+            .unwrap_or(0);
+        return trim_filename(&name[..cut]).to_string();
+    }
+    format!("{stem}{ext}")
+}
+
+/// Windows device names, which it resolves to the device whatever folder
+/// they appear in and whatever extension follows (`nul.txt` is `NUL`).
+fn is_windows_device_name(name: &str) -> bool {
+    let base = name.split('.').next().unwrap_or(name).trim_end();
+    let upper = base.to_uppercase();
+    if matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) {
+        return true;
+    }
+    let mut chars = upper.chars();
+    let prefix: String = chars.by_ref().take(3).collect();
+    let rest: String = chars.collect();
+    (prefix == "COM" || prefix == "LPT")
+        && matches!(
+            rest.as_str(),
+            "1" | "2"
+                | "3"
+                | "4"
+                | "5"
+                | "6"
+                | "7"
+                | "8"
+                | "9"
+                | "\u{00B9}"
+                | "\u{00B2}"
+                | "\u{00B3}"
+        )
+}
+
+/// One row, WITHOUT its captured headers (see [`record_from_row`]). Use
+/// [`get_full`] when the headers are needed.
 pub(crate) async fn get(pool: &SqlitePool, id: DownloadId) -> Result<DownloadRecord> {
     get_with(pool, id).await
+}
+
+/// One row with its captured headers decrypted: what a worker needs to run
+/// the download.
+pub(crate) async fn get_full(pool: &SqlitePool, id: DownloadId) -> Result<DownloadRecord> {
+    let mut record = get(pool, id).await?;
+    record.headers = load_headers(pool, id).await?;
+    Ok(record)
+}
+
+/// The row's captured request headers, decrypted, or `None` when it has
+/// none. The column is read on its own, so this is one small query plus a
+/// single decrypt.
+pub(crate) async fn load_headers(
+    pool: &SqlitePool,
+    id: DownloadId,
+) -> Result<Option<Vec<(String, String)>>> {
+    // `try_get` rather than `get` because `headers` was added in migration
+    // 20260901000001; an unmigrated schema reads as `None`.
+    let row = sqlx::query("SELECT headers FROM downloads WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?
+        .ok_or(CoreError::DownloadNotFound(id))?;
+    let stored: Option<String> = row.try_get("headers").ok().flatten();
+    match stored {
+        // Decrypt (legacy plaintext rows pass through `unprotect`
+        // unchanged) before parsing the JSON.
+        Some(s) if !s.is_empty() => Ok(Some(serde_json::from_str::<Vec<(String, String)>>(
+            &crate::secret::unprotect(&s),
+        )?)),
+        _ => Ok(None),
+    }
 }
 
 /// [`get`] on any executor — a transaction's connection included.
@@ -1661,7 +1876,7 @@ async fn decide_learned(
     if new_name == physical_name {
         return Ok(None);
     }
-    let url_fallback = filename_from_url(url).map(|t| sanitize_filename(&t));
+    let url_fallback = Some(sanitize_filename(&url_fallback_filename(url)));
     // The physical name must be one WE derived from the URL tail before the
     // real name was known — either it *is* the tail, or it's the tail plus a
     // " (n)" de-dup suffix we appended when two links share a tail (every
@@ -2165,7 +2380,7 @@ pub(crate) async fn mark_failed(
 /// Two invariants:
 ///
 /// 1. The headers carry `Cookie` / `Authorization`, so they go through
-///    `crate::secret::protect` exactly as [`insert`] does. A plaintext write
+///    [`encode_headers`] exactly as [`insert`] does. A plaintext write
 ///    here would make `record_from_row` hand back garbage after `unprotect`.
 /// 2. `etag` and `last_modified` are cleared in the same statement. They
 ///    describe the *old* URL's body; leaving them while the URL changes is the
@@ -2182,12 +2397,7 @@ pub(crate) async fn update_source<'e, E>(
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
-    let headers_json = match headers {
-        Some(pairs) if !pairs.is_empty() => {
-            Some(crate::secret::protect(&serde_json::to_string(pairs)?))
-        }
-        _ => None,
-    };
+    let headers_json = encode_headers(headers)?;
     let res = sqlx::query(
         "UPDATE downloads SET url = ?, headers = ?, etag = NULL, last_modified = NULL, \
                               error = NULL, error_kind = NULL \
@@ -2340,17 +2550,19 @@ pub(crate) async fn next_queued(pool: &SqlitePool) -> Result<Option<DownloadReco
     row.as_ref().map(record_from_row).transpose()
 }
 
-/// All queued downloads in priority + creation order. Used by
-/// the queue manager so the claim loop can consult the
-/// `SchedulesCache` per-row without round-tripping to SQL.
-pub(crate) async fn list_queued(pool: &SqlitePool) -> Result<Vec<DownloadRecord>> {
+/// Ids of all queued downloads in priority + creation order. Ids only: the
+/// queue polls this twice a second and consults the `SchedulesCache` per
+/// row, so loading whole rows (with their JSON columns) for every queued
+/// download on every tick was wasted work. The one it claims is loaded in
+/// full with [`get_full`].
+pub(crate) async fn list_queued_ids(pool: &SqlitePool) -> Result<Vec<DownloadId>> {
     let rows = sqlx::query(
-        "SELECT * FROM downloads WHERE status = 'queued' \
+        "SELECT id FROM downloads WHERE status = 'queued' \
          ORDER BY priority DESC, created_at ASC",
     )
     .fetch_all(pool)
     .await?;
-    rows.iter().map(record_from_row).collect()
+    Ok(rows.iter().map(|r| r.get("id")).collect())
 }
 
 /// Read all ids currently in an in-flight status. The queue manager uses
@@ -2397,19 +2609,12 @@ fn record_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<DownloadRecord> {
         Some(s) if !s.is_empty() => Some(serde_json::from_str(&s)?),
         _ => None,
     };
-    // `try_get` rather than `get` because `headers` was added in
-    // migration 20260901000001 — older databases predating it won't have
-    // the column at all (sqlx surfaces that as a column-not-found error
-    // until the migration runs; treat it as `None` defensively).
-    let headers_json: Option<String> = row.try_get("headers").ok().flatten();
-    let headers = match headers_json {
-        // Decrypt the DPAPI-protected column (legacy plaintext rows pass
-        // through `unprotect` unchanged) before parsing the JSON.
-        Some(s) if !s.is_empty() => Some(serde_json::from_str::<Vec<(String, String)>>(
-            &crate::secret::unprotect(&s),
-        )?),
-        _ => None,
-    };
+    // Headers are NOT decoded here. They are encrypted at rest, so decoding
+    // costs a DPAPI / Keychain call per row, and this function backs every
+    // listing (the UI's list, the extension's status, the queue loop) —
+    // none of which needs them. Callers that do use [`get_full`] or
+    // [`load_headers`].
+    let headers = None;
     // Same defensive `try_get` for `source` (migration 20260902000001).
     // Pre-9c rows fall back to Manual via the NOT NULL DEFAULT 'manual'
     // applied by the migration; if the column truly doesn't exist
@@ -2486,58 +2691,19 @@ fn parse_dt(s: &str) -> Result<DateTime<Utc>> {
         .map_err(|e| CoreError::InvalidArgument(format!("bad timestamp {s:?}: {e}")))
 }
 
+/// The name an HTTP row starts with when nobody supplied one: the URL's
+/// path tail, else `download.bin`. The learned-name guard
+/// ([`decide_learned`]) treats exactly this name as replaceable.
+fn url_fallback_filename(url: &url::Url) -> String {
+    filename_from_url(url).unwrap_or_else(|| "download.bin".to_string())
+}
+
 fn filename_from_url(url: &url::Url) -> Option<String> {
     let last = url.path_segments()?.next_back()?.to_string();
     if last.is_empty() {
         None
     } else {
         Some(urlencoding_decode(&last))
-    }
-}
-
-/// Fast HEAD probe used at add-download time to pull a filename from
-/// `Content-Disposition` / final-redirect URL / `Content-Type`. Returns
-/// `None` if the probe fails, times out, or yields nothing better than
-/// the URL path tail. Times out fast (5s caps) so a slow or unreachable
-/// host doesn't make Add URL hang.
-async fn probe_filename(pool: &SqlitePool, url: &url::Url) -> Option<String> {
-    const PROBE_TIMEOUT_SECS: u64 = 5;
-
-    let connect = crate::settings::get(pool, crate::settings::settings_keys::CONNECT_TIMEOUT_SECS)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|v| v.as_u64())
-        .unwrap_or(15)
-        .min(PROBE_TIMEOUT_SECS);
-    let read = crate::settings::get(pool, crate::settings::settings_keys::READ_TIMEOUT_SECS)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|v| v.as_u64())
-        .unwrap_or(60)
-        .min(PROBE_TIMEOUT_SECS);
-    let user_agent = crate::settings::get(pool, crate::settings::settings_keys::USER_AGENT)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .filter(|s| !s.is_empty());
-
-    let client = engine::http::build_client(
-        std::time::Duration::from_secs(connect),
-        std::time::Duration::from_secs(read),
-        user_agent.as_deref(),
-        &[],
-    )
-    .ok()?;
-
-    match engine::probe(&client, url).await {
-        Ok(info) => info.filename_hint,
-        Err(e) => {
-            tracing::debug!(error = %e, "add_download probe failed; falling back to URL");
-            None
-        }
     }
 }
 
@@ -2660,7 +2826,14 @@ async fn resolve_unique_output_path(
 ) -> Result<PathBuf> {
     // Reuse safe_join's path-traversal validation for the base candidate.
     let base = safe_join(folder, filename)?;
-    if !output_path_taken(pool, &base, kind).await {
+    // A media candidate is checked against every `<stem>.*` in the folder;
+    // list it once here rather than once per candidate.
+    let listing = if kind == DownloadKind::Media {
+        folder_names(folder).await
+    } else {
+        Vec::new()
+    };
+    if !output_path_taken(pool, &base, kind, &listing).await {
         return Ok(base);
     }
 
@@ -2676,7 +2849,7 @@ async fn resolve_unique_output_path(
             None => format!("{stem} ({i})"),
         };
         let candidate = folder.join(&candidate_name);
-        if !output_path_taken(pool, &candidate, kind).await {
+        if !output_path_taken(pool, &candidate, kind, &listing).await {
             return Ok(candidate);
         }
     }
@@ -2718,7 +2891,15 @@ const PATH_COLLATE: &str = if cfg!(any(windows, target_os = "macos")) {
 /// that file already exists it reports the old file as the new download.
 /// So for a media candidate any `<stem>.*` on disk or in flight is taken,
 /// and any candidate is taken by an in-flight media row with its stem.
-async fn output_path_taken(pool: &SqlitePool, path: &Path, kind: DownloadKind) -> bool {
+///
+/// `listing` is the names in the candidate's folder ([`folder_names`]), read
+/// once by the caller; only a media candidate consults it.
+async fn output_path_taken(
+    pool: &SqlitePool,
+    path: &Path,
+    kind: DownloadKind,
+    listing: &[String],
+) -> bool {
     if tokio::fs::metadata(path).await.is_ok() {
         return true;
     }
@@ -2728,22 +2909,35 @@ async fn output_path_taken(pool: &SqlitePool, path: &Path, kind: DownloadKind) -
         return false;
     };
     let stem = crate::queue::media_stem(name);
-    if media && stem_in_use_on_disk(folder, stem).await {
+    if media && stem_in_use(listing, stem) {
         return true;
     }
+    // Exact matches and the `LIKE` prefix match are separate queries: each is
+    // then answered from an `output_path` index, where one query `OR`ing all
+    // three would scan the table.
     let stem_path = folder.join(stem);
-    let stem_prefix = format!("{}.%", escape_like(&stem_path.to_string_lossy()));
     let claimed: Option<i64> = sqlx::query_scalar(&format!(
         "SELECT 1 FROM downloads \
          WHERE status IN ('queued', 'active', 'paused', 'muxing') \
            AND (output_path = ?1{PATH_COLLATE} \
-                OR (kind = 'media' AND output_path = ?2{PATH_COLLATE}) \
-                OR (?3 AND output_path LIKE ?4 ESCAPE '\\')) \
+                OR (kind = 'media' AND output_path = ?2{PATH_COLLATE})) \
          LIMIT 1"
     ))
     .bind(path.to_string_lossy().as_ref())
     .bind(stem_path.to_string_lossy().as_ref())
-    .bind(media)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None);
+    if claimed.is_some() || !media {
+        return claimed.is_some();
+    }
+    let stem_prefix = format!("{}.%", escape_like(&stem_path.to_string_lossy()));
+    let claimed: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM downloads \
+         WHERE status IN ('queued', 'active', 'paused', 'muxing') \
+           AND output_path LIKE ?1 ESCAPE '\\' \
+         LIMIT 1",
+    )
     .bind(stem_prefix)
     .fetch_optional(pool)
     .await
@@ -2751,25 +2945,32 @@ async fn output_path_taken(pool: &SqlitePool, path: &Path, kind: DownloadKind) -
     claimed.is_some()
 }
 
-/// True when `folder` holds `stem` or any `stem.<something>` — what a yt-dlp
-/// run for `stem` would write or collide with.
-async fn stem_in_use_on_disk(folder: &Path, stem: &str) -> bool {
+/// The names of the entries in `folder` (empty when it can't be read, e.g.
+/// it doesn't exist yet). Names that aren't valid UTF-8 are skipped: no
+/// candidate built from a `&str` file name can match them.
+async fn folder_names(folder: &Path) -> Vec<String> {
+    let mut names = Vec::new();
     let Ok(mut entries) = tokio::fs::read_dir(folder).await else {
-        return false;
+        return names;
     };
-    let dotted = format!("{stem}.");
     while let Ok(Some(entry)) = entries.next_entry().await {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if same_file_name(name, stem)
+        if let Ok(name) = entry.file_name().into_string() {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// True when `listing` holds `stem` or any `stem.<something>` — what a yt-dlp
+/// run for `stem` would write or collide with.
+fn stem_in_use(listing: &[String], stem: &str) -> bool {
+    let dotted = format!("{stem}.");
+    listing.iter().any(|name| {
+        same_file_name(name, stem)
             || name
                 .get(..dotted.len())
                 .is_some_and(|head| same_file_name(head, &dotted))
-        {
-            return true;
-        }
-    }
-    false
+    })
 }
 
 /// Escape `%`, `_` and the escape character itself for a SQL `LIKE`.
@@ -2859,7 +3060,7 @@ mod tests {
         .await
         .unwrap();
 
-        let rec = get(&pool, id).await.unwrap();
+        let rec = get_full(&pool, id).await.unwrap();
         assert_eq!(rec.url, "https://cdn.example.com/new?token=fresh");
         assert_eq!(rec.headers.as_deref(), Some(fresh.as_slice()));
 
@@ -3067,6 +3268,66 @@ mod tests {
 
         // ASCII still truncates exactly at the cap.
         assert_eq!(sanitize_filename(&"a".repeat(300)).len(), 200);
+    }
+
+    /// A long name keeps its extension: cutting `.mp4` off leaves a file
+    /// no program claims and routes it to the wrong category.
+    #[test]
+    fn sanitize_filename_truncation_keeps_the_extension() {
+        let long = format!("{}.mp4", "a".repeat(300));
+        let out = sanitize_filename(&long);
+        assert_eq!(out.len(), 200);
+        assert!(out.ends_with("aaa.mp4"), "{out}");
+
+        // Multi-byte stems still cut on a char boundary.
+        let out = sanitize_filename(&format!("{}.mkv", "字".repeat(100)));
+        assert!(out.len() <= 200 && out.ends_with("字.mkv"), "{out}");
+
+        // A dot deep inside a long name is not an extension.
+        let dotted = format!("v1.{}", "b".repeat(300));
+        assert_eq!(sanitize_filename(&dotted).len(), 200);
+    }
+
+    #[test]
+    fn sanitize_filename_trims_trailing_dots_and_spaces_together() {
+        // Windows drops both, so either left behind names a different file.
+        assert_eq!(sanitize_filename("report ."), "report");
+        assert_eq!(sanitize_filename("report. . "), "report");
+        assert_eq!(sanitize_filename("  report.pdf"), "report.pdf");
+    }
+
+    #[test]
+    fn sanitize_filename_prefixes_windows_device_names() {
+        for (input, expected) in [
+            ("CON", "_CON"),
+            ("nul.txt", "_nul.txt"),
+            ("Com1.log", "_Com1.log"),
+            ("lpt9", "_lpt9"),
+            ("AUX .tar.gz", "_AUX .tar.gz"),
+            ("conin$", "_conin$"),
+        ] {
+            assert_eq!(sanitize_filename(input), expected, "{input:?}");
+        }
+        // Only the exact names: these are ordinary files.
+        for ok in ["CONSOLE.txt", "com10", "lpt", "nullable.rs", "my con.txt"] {
+            assert_eq!(sanitize_filename(ok), ok, "{ok:?}");
+        }
+    }
+
+    /// `invoice<RLO>fdp.exe` renders as `invoiceexe.pdf`. The override and
+    /// its relatives are removed so the real extension shows.
+    #[test]
+    fn sanitize_filename_removes_bidi_and_zero_width_characters() {
+        assert_eq!(
+            sanitize_filename("invoice\u{202E}fdp.exe"),
+            "invoicefdp.exe"
+        );
+        assert_eq!(
+            sanitize_filename("a\u{200B}b\u{2066}c\u{2069}\u{FEFF}.txt"),
+            "abc.txt"
+        );
+        // DEL and C1 controls are replaced like C0 ones.
+        assert_eq!(sanitize_filename("a\u{7F}b\u{85}c"), "a_b_c");
     }
 
     #[test]
@@ -3537,7 +3798,7 @@ mod tests {
             torrent: None,
         };
         let rec = insert(&pool, input).await.unwrap();
-        let again = get(&pool, rec.id).await.unwrap();
+        let again = get_full(&pool, rec.id).await.unwrap();
         assert_eq!(again.headers.as_deref(), Some(headers.as_slice()));
         assert_eq!(again.source, DownloadSource::ExtensionPipe);
     }
@@ -4213,9 +4474,79 @@ mod tests {
             info_hash_from_magnet(m2).as_deref(),
             Some("abcdef0123456789abcdef0123456789abcdef01")
         );
-        // No xt param, or non-40-hex (base32) form → None (caller falls back).
+        // No xt param, or a malformed hash → None (caller falls back).
         assert!(info_hash_from_magnet("magnet:?dn=no-hash").is_none());
         assert!(info_hash_from_magnet("magnet:?xt=urn:btih:TOOSHORT").is_none());
+    }
+
+    /// A parameter without `=` used to end the scan (`split_once('=')?`
+    /// returned early), so everything after it was ignored.
+    #[test]
+    fn magnet_parsing_skips_bare_flags() {
+        let m = "magnet:?x.pe&xt=urn:btih:6f84758b0ddd8dc05840bf932a77935d8b5b8b93&flag&dn=Debian";
+        assert_eq!(
+            info_hash_from_magnet(m).as_deref(),
+            Some("6f84758b0ddd8dc05840bf932a77935d8b5b8b93")
+        );
+        assert_eq!(magnet_display_name(m).as_deref(), Some("Debian"));
+    }
+
+    /// The base32 spelling of a hash is the same swarm as the hex one, so it
+    /// must canonicalize to the same key or de-dup misses it.
+    #[test]
+    fn magnet_base32_hash_canonicalizes_to_hex() {
+        let hex = "6f84758b0ddd8dc05840bf932a77935d8b5b8b93";
+        for m in [
+            "magnet:?xt=urn:btih:N6CHLCYN3WG4AWCAX6JSU54TLWFVXC4T",
+            "magnet:?xt=urn:btih:n6chlcyn3wg4awcax6jsu54tlwfvxc4t",
+            // Percent-encoded, and as an indexed topic.
+            "magnet:?xt.1=urn%3Abtih%3AN6CHLCYN3WG4AWCAX6JSU54TLWFVXC4T",
+        ] {
+            assert_eq!(info_hash_from_magnet(m).as_deref(), Some(hex), "{m}");
+        }
+        assert_eq!(
+            canonical_info_hash("N6CHLCYN3WG4AWCAX6JSU54TLWFVXC4T").as_deref(),
+            Some(hex)
+        );
+        assert!(canonical_info_hash("N6CHLCYN3WG4AWCAX6JSU54TLWFVXC41").is_none());
+    }
+
+    /// The add dialog passes a base32 hash through as-is; the row must still
+    /// de-dup against the same torrent added by its hex magnet.
+    #[tokio::test]
+    async fn base32_and_hex_adds_of_one_swarm_dedup() {
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let add = |uri: &str, info_hash: &str| AddDownload {
+            url: uri.parse().unwrap(),
+            filename: None,
+            output_path: None,
+            output_dir: Some(tmp.path().to_path_buf()),
+            category: None,
+            priority: 0,
+            segments: None,
+            media_info: None,
+            headers: None,
+            source: DownloadSource::Manual,
+            kind: DownloadKind::Torrent,
+            torrent: Some(TorrentMeta {
+                info_hash: info_hash.into(),
+                source: TorrentSource::Magnet { uri: uri.into() },
+                selected_files: None,
+                files: None,
+                swarm: None,
+                owns_content_dir: false,
+            }),
+        };
+        let hex = "6f84758b0ddd8dc05840bf932a77935d8b5b8b93";
+        let first = insert(&pool, add(&format!("magnet:?xt=urn:btih:{hex}"), ""))
+            .await
+            .unwrap();
+        let b32 = "n6chlcyn3wg4awcax6jsu54tlwfvxc4t";
+        let second = insert(&pool, add(&format!("magnet:?xt=urn:btih:{b32}"), b32))
+            .await
+            .unwrap();
+        assert_eq!(first.id, second.id);
     }
 
     #[test]
@@ -5189,5 +5520,147 @@ mod tests {
             names.push(e.file_name().to_string_lossy().into_owned());
         }
         assert_eq!(names, vec!["dst.bin".to_string()]);
+    }
+
+    // ---- No add-time request (single-use links) ------------------------------
+
+    /// Adding an HTTP download without a name must not touch the server.
+    /// One-click / single-use-token hosts spend the token on ANY request,
+    /// so the add-time HEAD probe left the real download with an empty
+    /// body. The name now starts as the URL tail and is learned from the
+    /// download's own GET.
+    #[tokio::test]
+    async fn adding_without_a_filename_sends_no_request() {
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((_stream, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+
+        let mut add = http_add(tmp.path(), "unused");
+        add.filename = None;
+        add.url = format!("http://{addr}/dl/token-abc").parse().unwrap();
+        let rec = insert(&pool, add).await.unwrap();
+
+        assert_eq!(rec.filename, "token-abc");
+        // Give a stray connection time to land before counting.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// A URL with no path tail starts as `download.bin`; the learned name
+    /// must still replace it, now that no add-time probe runs first.
+    #[tokio::test]
+    async fn learned_name_replaces_the_download_bin_fallback() {
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let on_disk = tmp.path().join("download.bin");
+        tokio::fs::write(&on_disk, b"x").await.unwrap();
+        let url = "https://files.example.com/";
+        let id =
+            seed_row_with_url(&pool, url, "download.bin", on_disk.to_str().unwrap(), None).await;
+
+        let renamed = apply_engine_filename(&pool, id, &url.parse().unwrap(), "report.pdf")
+            .await
+            .unwrap()
+            .expect("the fallback name is ours to replace");
+
+        assert_eq!(renamed.filename, "report.pdf");
+    }
+
+    // ---- Captured headers at rest and on the wire ----------------------------
+
+    /// If encryption fails, cookies and tokens must not be written in the
+    /// clear; the ordinary browser headers are still kept.
+    #[test]
+    fn unencryptable_headers_keep_only_ordinary_browser_headers() {
+        let pairs = vec![
+            ("Cookie".to_string(), "session=secret".to_string()),
+            ("Authorization".to_string(), "Bearer t".to_string()),
+            ("X-Api-Key".to_string(), "k".to_string()),
+            ("User-Agent".to_string(), "browser/1".to_string()),
+            ("Referer".to_string(), "https://example.com/".to_string()),
+        ];
+        let stored = encode_headers_with(Some(&pairs), |_| None)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !stored.contains("secret")
+                && !stored.contains("Bearer")
+                && !stored.contains("X-Api-Key")
+        );
+        let back: Vec<(String, String)> = serde_json::from_str(&stored).unwrap();
+        assert_eq!(
+            back,
+            vec![
+                ("User-Agent".to_string(), "browser/1".to_string()),
+                ("Referer".to_string(), "https://example.com/".to_string()),
+            ]
+        );
+
+        // Nothing ordinary left: store nothing rather than an empty list.
+        let only_secret = vec![("Cookie".to_string(), "s=1".to_string())];
+        assert_eq!(
+            encode_headers_with(Some(&only_secret), |_| None).unwrap(),
+            None
+        );
+
+        // Encryption working: the sealed form is stored as is.
+        assert_eq!(
+            encode_headers_with(Some(&pairs), |_| Some("sealed".into())).unwrap(),
+            Some("sealed".to_string())
+        );
+    }
+
+    /// Records are sent to the webview and printed by the CLI; neither may
+    /// carry the decrypted cookies.
+    #[tokio::test]
+    async fn serialized_records_never_carry_captured_headers() {
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let id = insert_row(&pool, &tmp).await;
+        let rec = get_full(&pool, id).await.unwrap();
+        assert!(rec.headers.is_some(), "fixture must have headers");
+
+        let json = serde_json::to_value(&rec).unwrap();
+        assert!(json.get("headers").is_none(), "{json}");
+        assert!(!json.to_string().contains("session=old"));
+    }
+
+    /// UPnP reconfigures the user's router, so it is opt-in: a fresh
+    /// database (seeded 'true' by an older migration) ends up with it off.
+    #[tokio::test]
+    async fn upnp_is_off_after_migrations() {
+        let pool = fresh_pool().await;
+        let v = crate::settings::get(&pool, "torrent_enable_upnp")
+            .await
+            .unwrap();
+        assert_eq!(v.and_then(|v| v.as_bool()), Some(false));
+    }
+
+    /// Listing never decrypts captured headers (a DPAPI / Keychain call per
+    /// row); only `get_full` / `load_headers` do.
+    #[tokio::test]
+    async fn listing_leaves_headers_encrypted_and_get_full_loads_them() {
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let id = insert_row(&pool, &tmp).await;
+
+        assert!(get(&pool, id).await.unwrap().headers.is_none());
+        let listed = list(&pool, DownloadFilter::default()).await.unwrap();
+        assert!(listed.iter().all(|r| r.headers.is_none()));
+
+        let full = get_full(&pool, id).await.unwrap();
+        assert_eq!(
+            full.headers,
+            Some(vec![("Cookie".to_string(), "session=old".to_string())])
+        );
+        assert_eq!(list_queued_ids(&pool).await.unwrap(), vec![id]);
     }
 }

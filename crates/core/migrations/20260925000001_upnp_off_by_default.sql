@@ -1,0 +1,13 @@
+-- UPnP port mapping for torrents is now off by default.
+--
+-- With it on, the app asks the user's router to forward a port to this
+-- machine whenever torrents run — a change to network configuration the
+-- user never asked for, and one that outlives the app if it is not cleaned
+-- up. Torrents work without it (outbound connections, DHT); only inbound
+-- peers need it, and a user who wants that can turn it on in
+-- Settings → Torrent.
+--
+-- The old default was seeded as 'true' into every database, and a seeded
+-- value cannot be told apart from one the user chose, so this turns it off
+-- once for everyone. Anyone who relies on it switches it back on.
+UPDATE settings SET value = 'false' WHERE key = 'torrent_enable_upnp' AND value = 'true';

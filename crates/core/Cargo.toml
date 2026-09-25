@@ -42,6 +42,11 @@ ts-rs = { version = "9", optional = true }
 # `tests/export_wire_types.rs` test that writes the generated `.d.ts`
 # files. Run with `cargo test --features ts-rs-export export_wire_types`.
 ts-rs-export = ["dep:ts-rs"]
+# Tests only. On macOS, seal captured headers with an in-memory key instead
+# of the one kept in the login Keychain, which CI runners don't have. Other
+# crates' tests enable it as a dev-dependency feature, so it never reaches a
+# release build.
+ephemeral-header-key = []
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # DPAPI (CryptProtectData / CryptUnprotectData) for encrypting captured

@@ -8,7 +8,6 @@ use std::time::Duration;
 
 use reqwest::header::RANGE;
 use reqwest::{Response, StatusCode};
-use tokio::fs::OpenOptions;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -446,20 +445,55 @@ fn build_initial_meta(opts: &DownloadOptions, info: &RemoteInfo, ranges: bool) -
 }
 
 async fn preallocate(path: &Path, total: Option<u64>) -> Result<()> {
-    let f = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(path)
-        .await
-        .map_err(|e| EngineError::io(Some(path.to_path_buf()), e))?;
-    if let Some(total) = total {
-        if total > 0 {
-            f.set_len(total)
-                .await
-                .map_err(|e| EngineError::io(Some(path.to_path_buf()), e))?;
+    let owned = path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&owned)?;
+        if let Some(total) = total.filter(|t| *t > 0) {
+            // Before sizing it: on NTFS a sized, non-sparse file makes the
+            // first write far into it zero-fill everything before that
+            // offset — synchronously, stalling that connection, and writing
+            // those bytes twice. Segments start far into the file by design.
+            #[cfg(windows)]
+            mark_sparse(&f);
+            f.set_len(total)?;
         }
+        Ok(())
+    })
+    .await
+    .map_err(|e| EngineError::other(format!("preallocate task failed: {e}")))?
+    .map_err(|e| EngineError::io(Some(path.to_path_buf()), e))
+}
+
+/// Mark `f` sparse, so regions not yet written cost no disk writes (and no
+/// zero-filling) until they are. Best-effort: a file system without sparse
+/// support (FAT32, exFAT) just behaves as before.
+#[cfg(windows)]
+fn mark_sparse(f: &std::fs::File) {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Ioctl::FSCTL_SET_SPARSE;
+    use windows::Win32::System::IO::DeviceIoControl;
+
+    let mut returned = 0u32;
+    // SAFETY: the handle belongs to `f`, which outlives the call; the
+    // control code takes no input or output buffers.
+    let result = unsafe {
+        DeviceIoControl(
+            HANDLE(f.as_raw_handle()),
+            FSCTL_SET_SPARSE,
+            None,
+            0,
+            None,
+            0,
+            Some(&mut returned),
+            None,
+        )
+    };
+    if let Err(e) = result {
+        tracing::debug!(error = %e, "could not mark the download file sparse");
     }
-    drop(f);
-    Ok(())
 }

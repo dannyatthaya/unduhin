@@ -19,6 +19,14 @@ tracing = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+# FSCTL_SET_SPARSE for pre-sized download files (see `download::preallocate`).
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+] }
+
 [dev-dependencies]
 tokio = { workspace = true }
 hyper = { workspace = true }

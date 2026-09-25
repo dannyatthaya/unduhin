@@ -38,9 +38,12 @@ export interface ArmedRefresh {
   readonly filename: string | null;
   /** Expected size in bytes, or null when the row never learned one. */
   readonly sizeBytes: number | null;
-  /** Origin of the dead URL. Recorded for the app's confirmation prompt; not
-   *  used for matching, because a CDN legitimately moves hosts. */
+  /** Origin of the dead URL. A capture must share a *site* with this or
+   *  `referrerOrigin` (see `match`). Sites, not origins, because a CDN
+   *  legitimately moves hosts. */
   readonly origin: string | null;
+  /** Origin of the page the dead row was first captured from, when known. */
+  readonly referrerOrigin: string | null;
   /** Epoch milliseconds. */
   readonly expiresAt: number;
 }
@@ -48,14 +51,51 @@ export interface ArmedRefresh {
 export interface RefreshArmTable {
   arm(entry: ArmedRefresh): void;
   /** Best match for a capture, or null. Does NOT remove it — the caller
-   *  removes only after the send succeeds, so a failed send can be retried. */
-  match(filename: string, sizeBytes: number | null): ArmedRefresh | null;
+   *  removes only after the send succeeds, so a failed send can be retried.
+   *  `from` is the capture's URL and its referring page: one of them must
+   *  share a site with the arm, or any page could trigger a same-named
+   *  download while an arm is live and have its file folded into the row. */
+  match(
+    filename: string,
+    sizeBytes: number | null,
+    from: readonly (string | null | undefined)[],
+  ): ArmedRefresh | null;
   remove(downloadId: number): void;
   /** True when at least one entry is live. The interceptor checks this to
    *  decide whether an armed capture should override a passthrough rule. */
   hasAny(): boolean;
   /** Test seam. */
   clear(): void;
+}
+
+/** Second-level labels under which registrations sit one level deeper
+ *  (`example.co.uk`, `example.com.au`). A heuristic stand-in for the Public
+ *  Suffix List, which an extension cannot ship cheaply; it only has to tell
+ *  "same site" from "different site" for a refresh, and it errs towards
+ *  "different", which degrades to a normal new download. */
+const SECOND_LEVEL_LABELS = new Set([
+  "ac", "co", "com", "edu", "gob", "go", "gov", "ltd", "mil", "ne", "net", "nic", "or",
+  "org", "plc", "sch",
+]);
+
+/** The registrable domain ("site") of a URL or origin, or null. IP
+ *  addresses and single-label hosts are their own site. */
+export function siteOf(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  let host: string;
+  try {
+    host = new URL(raw).hostname.toLowerCase().replace(/\.$/, "");
+  } catch {
+    return null;
+  }
+  if (!host) return null;
+  if (host.startsWith("[") || /^\d+(\.\d+){3}$/.test(host)) return host;
+  const labels = host.split(".");
+  if (labels.length <= 2) return host;
+  const tld = labels[labels.length - 1]!;
+  const sld = labels[labels.length - 2]!;
+  const keep = tld.length === 2 && SECOND_LEVEL_LABELS.has(sld) ? 3 : 2;
+  return labels.slice(-keep).join(".");
 }
 
 /** Strip any directory part Chrome may have put in `DownloadItem.filename`,
@@ -98,10 +138,15 @@ export function createRefreshArmTable(now: () => number = Date.now): RefreshArmT
       log.info(`armed ${entry.downloadId} (${entry.filename ?? "any name"})`);
     },
 
-    match(filename: string, sizeBytes: number | null): ArmedRefresh | null {
+    match(
+      filename: string,
+      sizeBytes: number | null,
+      from: readonly (string | null | undefined)[],
+    ): ArmedRefresh | null {
       sweep();
       if (entries.size === 0) return null;
       const candidate = baseName(filename);
+      const captureSites = new Set(from.map(siteOf).filter((s): s is string => s !== null));
 
       // Prefer a name+size match over a name-only match: if the user armed
       // two refreshes for files that share a name, the size disambiguates.
@@ -109,6 +154,13 @@ export function createRefreshArmTable(now: () => number = Date.now): RefreshArmT
       for (const e of entries.values()) {
         if (e.filename === null) continue;
         if (baseName(e.filename) !== candidate) continue;
+        const armSites = [siteOf(e.origin), siteOf(e.referrerOrigin)].filter(
+          (s): s is string => s !== null,
+        );
+        if (armSites.length > 0 && !armSites.some((s) => captureSites.has(s))) {
+          log.info(`not refreshing ${e.downloadId}: ${filename} came from another site`);
+          continue;
+        }
         if (e.sizeBytes !== null && sizeBytes !== null) {
           if (e.sizeBytes === sizeBytes) return e;
           // A same-named file of a different size is a different file. Do not

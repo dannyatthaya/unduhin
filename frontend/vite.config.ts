@@ -14,6 +14,13 @@ export default defineConfig({
     // window chrome before an async platform lookup resolves.
     // Read it through `@/lib/platform`, never directly.
     __PLATFORM__: JSON.stringify(process.platform),
+    // vue-i18n's default message compiler builds each message with
+    // `new Function`, which the app's Content-Security-Policy (no
+    // 'unsafe-eval', see src-tauri/tauri.conf.json) refuses — the UI then
+    // renders nothing. JIT compilation turns messages into an AST that is
+    // interpreted without eval, the CSP-safe mode vue-i18n documents.
+    __INTLIFY_JIT_COMPILATION__: true,
+    __INTLIFY_DROP_MESSAGE_COMPILER__: false,
   },
   server: {
     port: 5173,

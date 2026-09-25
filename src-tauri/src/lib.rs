@@ -221,6 +221,7 @@ pub fn run() {
             commands::get_rule_metrics,
             commands::respond_handoff,
             commands::start_handoff_download,
+            commands::discard_handoff,
             commands::extension_folder_path,
         ])
         .build(tauri::generate_context!())

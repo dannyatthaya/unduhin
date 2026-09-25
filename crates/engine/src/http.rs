@@ -70,7 +70,15 @@ const MAX_REDIRECTS: usize = 10;
 /// `Cookie`, `Authorization`, a site's own `X-Api-Key` — is only ever sent
 /// to the origin it was captured for.
 fn is_cross_origin_safe(name: &HeaderName) -> bool {
-    let n = name.as_str();
+    is_ordinary_browser_header(name.as_str())
+}
+
+/// Whether `name` (any case) is one of the ordinary, non-credential headers
+/// a browser sends to any site — the set [`Client`] keeps across origins.
+/// Also what the app keeps when it cannot encrypt a capture at rest.
+pub fn is_ordinary_browser_header(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    let n = n.as_str();
     matches!(
         n,
         "accept"
@@ -81,6 +89,10 @@ fn is_cross_origin_safe(name: &HeaderName) -> bool {
             | "priority"
             | "referer"
             | "upgrade-insecure-requests"
+            // Set on the client builder rather than carried in the header
+            // map, so listing it changes nothing for `Client`; it is here
+            // for the other callers.
+            | "user-agent"
     ) || n.starts_with("sec-fetch-")
         || n.starts_with("sec-ch-")
 }
@@ -259,6 +271,13 @@ pub fn build_client(
             .read_timeout(read_timeout)
             .user_agent(ua.clone())
             .default_headers(headers)
+            // Save exactly the bytes the server sends. With decoding on,
+            // reqwest asked for `gzip` and decoded it, so a `.tar.gz` served
+            // with `Content-Encoding: gzip` (or a text file a CDN
+            // compresses) was not saved as served — and its range offsets
+            // and lengths no longer matched the bytes on disk. A download
+            // manager wants the representation, not a decoded view of it.
+            .no_gzip()
             // Followed by hand in `RequestBuilder::send`.
             .redirect(reqwest::redirect::Policy::none())
             .build()

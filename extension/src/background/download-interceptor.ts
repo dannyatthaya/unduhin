@@ -112,6 +112,16 @@ export function installDownloadInterceptor(deps: InterceptorDeps): void {
     // history rows restored on startup — but guard anyway.
     if (item.state !== "in_progress") return;
 
+    // Never capture from a private window. The app keeps a download history
+    // and would store the private session's cookies with the row — the
+    // opposite of what incognito promises. The browser handles it.
+    // (Explicit actions — the context menu, the popup — still work, with
+    // that tab's own cookies.)
+    if (item.incognito) {
+      log.debug("passthrough: incognito download");
+      return;
+    }
+
     const url = pickUrl(item);
 
     // A download we re-issued ourselves (post-decline / post-failure
@@ -137,7 +147,11 @@ export function installDownloadInterceptor(deps: InterceptorDeps): void {
     // it go to the browser must not strand them — they would click the link,
     // watch the browser save a duplicate, and the broken row would sit there
     // untouched. Checked before `shouldIntercept` for that reason.
-    const armed = deps.refreshArms?.match(filename, item.totalBytes > 0 ? item.totalBytes : null);
+    const armed = deps.refreshArms?.match(
+      filename,
+      item.totalBytes > 0 ? item.totalBytes : null,
+      [url, item.referrer],
+    );
     if (armed) {
       if (!deps.bridge.isHealthy()) {
         log.info("armed refresh but bridge unhealthy — leaving to the browser:", url);

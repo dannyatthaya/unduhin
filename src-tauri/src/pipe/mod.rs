@@ -151,6 +151,68 @@ pub async fn begin_credential_refresh(id: i64) -> Option<String> {
     Some(token)
 }
 
+/// How long a captured `ask-first` job waits for the user's answer before it
+/// is dropped. The browser's own download stays blocked meanwhile, so a
+/// prompt nobody answers for this long is abandoned anyway.
+const PENDING_HANDOFF_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Most `ask-first` jobs held at once; the oldest goes first past this.
+const MAX_PENDING_HANDOFFS: usize = 32;
+
+/// `ask-first` jobs waiting for the user's choice in the app's dialog,
+/// keyed by the handoff id.
+///
+/// The job carries the capture's cookies and request headers. Keeping it
+/// here means the webview only ever sees a copy without them (see
+/// [`redacted_for_prompt`]) and hands back just the id.
+fn pending_handoffs() -> &'static AsyncMutex<
+    std::collections::HashMap<String, (std::time::Instant, unduhin_core::wire::DownloadJob)>,
+> {
+    static PENDING: OnceLock<
+        AsyncMutex<
+            std::collections::HashMap<
+                String,
+                (std::time::Instant, unduhin_core::wire::DownloadJob),
+            >,
+        >,
+    > = OnceLock::new();
+    PENDING.get_or_init(|| AsyncMutex::new(std::collections::HashMap::new()))
+}
+
+/// Hold `job` until the user answers the prompt for `id`.
+async fn hold_handoff(id: String, job: unduhin_core::wire::DownloadJob) {
+    let mut pending = pending_handoffs().lock().await;
+    let now = std::time::Instant::now();
+    pending.retain(|_, (at, _)| now.duration_since(*at) < PENDING_HANDOFF_TTL);
+    while pending.len() >= MAX_PENDING_HANDOFFS {
+        let Some(oldest) = pending
+            .iter()
+            .min_by_key(|(_, (at, _))| *at)
+            .map(|(k, _)| k.clone())
+        else {
+            break;
+        };
+        pending.remove(&oldest);
+    }
+    pending.insert(id, (now, job));
+}
+
+/// Take the held job for `id`, if it is still there.
+pub async fn take_handoff(id: &str) -> Option<unduhin_core::wire::DownloadJob> {
+    let mut pending = pending_handoffs().lock().await;
+    let (at, job) = pending.remove(id)?;
+    (at.elapsed() < PENDING_HANDOFF_TTL).then_some(job)
+}
+
+/// What the prompt is shown: the job without its cookies and captured
+/// request headers, which the dialog never needs.
+fn redacted_for_prompt(job: &unduhin_core::wire::DownloadJob) -> unduhin_core::wire::DownloadJob {
+    let mut shown = job.clone();
+    shown.cookie_header = None;
+    shown.request_headers = Vec::new();
+    shown
+}
+
 /// Consume the pending entry for `id` when `token` matches. `false` means the
 /// reply is stale and must be ignored.
 async fn take_pending_credential_refresh(id: i64, token: &str) -> bool {
@@ -242,6 +304,7 @@ pub async fn broadcast_arm_refresh(
     filename: Option<String>,
     size_bytes: Option<u64>,
     origin: Option<String>,
+    referrer_origin: Option<String>,
     expires_at_ms: i64,
 ) {
     broadcast(
@@ -250,6 +313,7 @@ pub async fn broadcast_arm_refresh(
             filename,
             size_bytes,
             origin,
+            referrer_origin,
             expires_at_ms,
         },
         "ArmRefresh",
@@ -671,17 +735,21 @@ async fn dispatch(core: &Core, msg: unduhin_core::wire::Inbound) -> unduhin_core
                 id: &'a str,
                 job: &'a unduhin_core::wire::DownloadJob,
             }
+            let shown = redacted_for_prompt(&job);
+            hold_handoff(id.clone(), job).await;
             if let Some(app) = app_handle() {
                 if let Err(e) = app.emit(
                     "unduhin:ask-handoff",
-                    AskHandoffPayload { id: &id, job: &job },
+                    AskHandoffPayload {
+                        id: &id,
+                        job: &shown,
+                    },
                 ) {
                     tracing::warn!(error = %e, "failed to emit ask-handoff event");
                 }
             } else {
                 tracing::warn!("ask-handoff fired with no AppHandle — frontend will not prompt");
             }
-            let _ = (id, job);
             Outbound::Ack { id: 0 }
         }
         Inbound::SetSettings { patch } => {
@@ -819,8 +887,9 @@ async fn handle_credentials_refreshed(
         return Ok(());
     }
 
+    // Full: the row's original Referer is carried over below.
     let record = core
-        .get_download(download_id)
+        .get_download_full(download_id)
         .await
         .map_err(|e| format!("{e}"))?;
 
@@ -1015,7 +1084,18 @@ fn headers_from_media(stream: &unduhin_core::wire::MediaStream) -> Vec<(String, 
     out
 }
 
-#[cfg(all(windows, test))]
+/// Re-export the pipe path so tests under `src-tauri/tests/` can
+/// build a matching client. Kept module-public; the rest of the
+/// app doesn't need it.
+#[allow(dead_code)]
+pub(crate) fn default_pipe_path() -> PathBuf {
+    PathBuf::from(pipe_name())
+}
+
+// Platform-neutral: the dispatch and validation below are the same code on
+// every OS, so these run wherever the crate's tests run (macOS CI included),
+// not only on Windows.
+#[cfg(test)]
 mod tests {
     use super::*;
     use unduhin_core::wire::{headers_from_job, DownloadJob, MediaStream, RequestHeader};
@@ -1214,7 +1294,55 @@ mod tests {
         }
     }
 
-    /// The `DownloadTorrent` dispatch arm is Windows-only and was once missing —
+    /// An `ask-first` capture's cookies stay in the backend: the prompt gets
+    /// a redacted copy, and the real job is handed out once, by id.
+    #[tokio::test]
+    async fn ask_handoff_holds_the_job_and_shows_a_redacted_copy() {
+        use unduhin_core::wire::{Inbound, Outbound};
+
+        let dir = tempfile::tempdir().unwrap();
+        let core = Core::open(dir.path().join("pipe-ask.db")).await.unwrap();
+        let job = DownloadJob {
+            final_url: "https://x/y.zip".into(),
+            original_url: "https://x/y.zip".into(),
+            referrer: Some("https://x/page".into()),
+            filename: Some("y.zip".into()),
+            mime: None,
+            size: Some(10),
+            cookie_header: Some("session=secret".into()),
+            user_agent: Some("ua/1.0".into()),
+            request_headers: vec![RequestHeader {
+                name: "X-Api-Key".into(),
+                value: "k".into(),
+            }],
+            tab_id: None,
+            page_url: None,
+        };
+
+        let shown = redacted_for_prompt(&job);
+        assert_eq!(shown.cookie_header, None);
+        assert!(shown.request_headers.is_empty());
+        assert_eq!(shown.final_url, job.final_url);
+
+        let id = "ask-test-1".to_string();
+        match dispatch(
+            &core,
+            Inbound::AskHandoff {
+                id: id.clone(),
+                job: job.clone(),
+            },
+        )
+        .await
+        {
+            Outbound::Ack { .. } => {}
+            other => panic!("expected Ack, got {other:?}"),
+        }
+        let held = take_handoff(&id).await.expect("job held under its id");
+        assert_eq!(held.cookie_header.as_deref(), Some("session=secret"));
+        assert!(take_handoff(&id).await.is_none(), "handed out once");
+    }
+
+    /// The `DownloadTorrent` dispatch arm was once missing —
     /// the build broke at the Wave-3 merge and no test caught it (the core-side
     /// handoff test deliberately bypasses src-tauri). Drive the real
     /// `dispatch -> handle_download_torrent -> Core::add_download` path with a
@@ -1254,12 +1382,4 @@ mod tests {
             other => panic!("expected Ack on duplicate, got {other:?}"),
         }
     }
-}
-
-/// Re-export the pipe path so tests under `src-tauri/tests/` can
-/// build a matching client. Kept module-public; the rest of the
-/// app doesn't need it.
-#[allow(dead_code)]
-pub(crate) fn default_pipe_path() -> PathBuf {
-    PathBuf::from(pipe_name())
 }

@@ -99,8 +99,19 @@ async fn download_message_lands_with_captured_headers() {
     })
     .await
     .expect("DownloadAdded timed out");
+    // The UI snapshot never carries the captured cookies and headers; they
+    // stay encrypted in the row until a worker loads them.
+    assert!(
+        event.headers.is_none(),
+        "headers leaked into the UI snapshot"
+    );
 
-    let headers = event.headers.expect("captured headers stored");
+    let headers = core
+        .get_download_full(id)
+        .await
+        .expect("load row")
+        .headers
+        .expect("captured headers stored");
     assert!(
         headers
             .iter()

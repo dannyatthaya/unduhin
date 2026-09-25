@@ -384,12 +384,20 @@ pub async fn add_download(
 #[tauri::command]
 pub async fn start_handoff_download(
     core: State<'_, Core>,
-    job: DownloadJob,
+    handoff_id: String,
     filename: Option<String>,
     output_dir: Option<String>,
     category_id: Option<i64>,
     segments: Option<u32>,
 ) -> CommandResult<DownloadId> {
+    // The job (cookies included) never left the backend; the dialog only
+    // saw a redacted copy and hands back its id.
+    let job: DownloadJob = crate::pipe::take_handoff(&handoff_id)
+        .await
+        .ok_or_else(|| CommandError {
+            message: "this download is no longer available — click the link in the browser again"
+                .into(),
+        })?;
     let url = url::Url::parse(&job.final_url).map_err(|e| CommandError {
         message: format!("invalid URL: {e}"),
     })?;
@@ -512,18 +520,28 @@ const ARM_REFRESH_TTL_MS: i64 = 5 * 60 * 1000;
 /// deadline rather than an error — the dialog uses it to stop waiting.
 #[tauri::command]
 pub async fn arm_link_refresh(core: State<'_, Core>, id: DownloadId) -> CommandResult<i64> {
-    let record = core.get_download(id).await?;
+    // Full: the arm carries the page the row came from (its Referer).
+    let record = core.get_download_full(id).await?;
     if record.kind != DownloadKind::Http {
         return Err(CommandError::from(format!(
             "only direct HTTP downloads can have their link refreshed (this row is {})",
             record.kind
         )));
     }
-    let origin = record
-        .url
-        .parse::<url::Url>()
-        .ok()
-        .map(|u| u.origin().ascii_serialization());
+    let origin_of = |raw: &str| {
+        raw.parse::<url::Url>()
+            .ok()
+            .filter(|u| matches!(u.scheme(), "http" | "https"))
+            .map(|u| u.origin().ascii_serialization())
+    };
+    let origin = origin_of(&record.url);
+    // The page the row was first captured from. With the dead URL's own
+    // origin, these are the sites the extension accepts a refresh from.
+    let referrer_origin = record.headers.as_ref().and_then(|hs| {
+        hs.iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("referer"))
+            .and_then(|(_, value)| origin_of(value))
+    });
     let expires_at_ms = chrono::Utc::now().timestamp_millis() + ARM_REFRESH_TTL_MS;
 
     crate::pipe::broadcast_arm_refresh(
@@ -531,6 +549,7 @@ pub async fn arm_link_refresh(core: State<'_, Core>, id: DownloadId) -> CommandR
         Some(record.filename),
         record.total_bytes,
         origin,
+        referrer_origin,
         expires_at_ms,
     )
     .await;
@@ -949,6 +968,14 @@ pub async fn respond_handoff(
     decision: HandoffDecision,
 ) -> CommandResult<()> {
     crate::pipe::broadcast_handoff_decision(id, decision).await;
+    Ok(())
+}
+
+/// The user dismissed an `ask-first` prompt: drop the job held for it, and
+/// with it the capture's cookies.
+#[tauri::command]
+pub async fn discard_handoff(handoff_id: String) -> CommandResult<()> {
+    let _ = crate::pipe::take_handoff(&handoff_id).await;
     Ok(())
 }
 

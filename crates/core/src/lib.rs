@@ -279,8 +279,16 @@ impl Core {
         download::list(&self.inner.pool, filter).await
     }
 
+    /// One download, without its captured headers (`headers` is `None`):
+    /// decrypting them costs a DPAPI / Keychain call, and this backs the UI.
     pub async fn get_download(&self, id: DownloadId) -> Result<DownloadRecord> {
         download::get(&self.inner.pool, id).await
+    }
+
+    /// One download with its captured headers decrypted, for the few callers
+    /// that need them (arming a link refresh, applying fresh credentials).
+    pub async fn get_download_full(&self, id: DownloadId) -> Result<DownloadRecord> {
+        download::get_full(&self.inner.pool, id).await
     }
 
     /// Stop a download.

@@ -12,6 +12,7 @@
 // storing (we never want them to bleed across calls; the cookie forwarder
 // pulls them fresh per request).
 
+import { CAPTURE_RESOURCE_TYPES } from "./request-types.js";
 import { log } from "../shared/log.js";
 
 const MAX_ENTRIES = 200;
@@ -90,7 +91,7 @@ export function installHeaderCapture(): HeaderCache {
   // MV3 — without it Chrome hides them from the listener.
   chrome.webRequest.onBeforeSendHeaders.addListener(
     listener,
-    { urls: ["<all_urls>"] },
+    { urls: ["<all_urls>"], types: CAPTURE_RESOURCE_TYPES },
     ["requestHeaders", "extraHeaders"],
   );
 

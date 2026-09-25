@@ -93,24 +93,36 @@ where
 
 /// Encrypt `plaintext` for storage.
 ///
-/// On success returns `<scheme>:v1:<base64>`; if encryption is unavailable
-/// or fails for any reason, returns the plaintext unchanged so a download
-/// is never lost merely because DPAPI hiccuped or the Keychain was locked.
-/// The worst case degrades to the prior behavior rather than to an error.
-pub(crate) fn protect(plaintext: &str) -> String {
+/// Returns `<scheme>:v1:<base64>` on success, and `None` when encryption
+/// is available on this platform but failed (DPAPI error, a locked
+/// Keychain that timed out). Deciding what to store instead is the
+/// caller's call: storing the plaintext would put the very cookies this
+/// module exists to protect into the database in the clear.
+///
+/// On platforms with no at-rest scheme (neither Windows nor macOS — not a
+/// shipped target) the plaintext is returned as is.
+pub(crate) fn try_protect(plaintext: &str) -> Option<String> {
     #[cfg(target_os = "windows")]
     {
-        if let Some(cipher) = dpapi_protect(plaintext.as_bytes()) {
-            return format!("{TAG}{}", STANDARD.encode(cipher));
-        }
+        dpapi_protect(plaintext.as_bytes())
+            .map(|cipher| format!("{TAG}{}", STANDARD.encode(cipher)))
     }
     #[cfg(target_os = "macos")]
     {
-        if let Some(cipher) = keychain::protect(plaintext.as_bytes()) {
-            return format!("{KEYCHAIN_TAG}{}", STANDARD.encode(cipher));
-        }
+        keychain::protect(plaintext.as_bytes())
+            .map(|cipher| format!("{KEYCHAIN_TAG}{}", STANDARD.encode(cipher)))
     }
-    plaintext.to_string()
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        Some(plaintext.to_string())
+    }
+}
+
+/// [`try_protect`], falling back to the plaintext. Tests only: production
+/// code must decide what to do when encryption fails.
+#[cfg(test)]
+pub(crate) fn protect(plaintext: &str) -> String {
+    try_protect(plaintext).unwrap_or_else(|| plaintext.to_string())
 }
 
 /// Reverse of [`protect`]. A tagged value is base64-decoded and decrypted;
@@ -175,7 +187,25 @@ mod keychain {
     static MASTER_KEY: OnceLock<Option<[u8; KEY_LEN]>> = OnceLock::new();
 
     fn master_key() -> Option<&'static [u8; KEY_LEN]> {
-        MASTER_KEY.get_or_init(load_or_create).as_ref()
+        MASTER_KEY
+            .get_or_init(|| {
+                if cfg!(any(test, feature = "ephemeral-header-key")) {
+                    ephemeral_key()
+                } else {
+                    load_or_create()
+                }
+            })
+            .as_ref()
+    }
+
+    /// A fresh random key that lives only as long as the process. Test
+    /// builds use it so headers are really sealed and opened without a
+    /// Keychain, which a CI runner doesn't have. Never for a shipped build:
+    /// nothing sealed with it can be read after a restart.
+    fn ephemeral_key() -> Option<[u8; KEY_LEN]> {
+        let mut key = [0u8; KEY_LEN];
+        SystemRandom::new().fill(&mut key).ok()?;
+        Some(key)
     }
 
     /// Bounded wrapper around [`keychain_io`]. See [`super::with_timeout`]
@@ -411,26 +441,20 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_either_encrypts_or_degrades_visibly() {
-        // A headless CI runner has no unlocked login keychain, so this
-        // legitimately takes the plaintext fallback there. Assert the
-        // invariant that holds either way: the value is either sealed and
-        // tagged, or untouched — never a tagged blob we cannot read back.
+    fn macos_output_is_sealed_and_round_trips() {
+        // Test builds seal with an in-memory key (see `ephemeral_key`), so
+        // this runs the real AES-GCM path even on a runner with no Keychain.
         let secret = "sid=supersecret";
         let stored = protect(secret);
-
-        if stored.starts_with(KEYCHAIN_TAG) {
-            assert!(
-                !stored.contains("supersecret"),
-                "ciphertext must not contain the plaintext"
-            );
-            assert_eq!(unprotect(&stored), secret, "sealed value must round-trip");
-        } else {
-            assert_eq!(
-                stored, secret,
-                "without a keychain the value must pass through unchanged"
-            );
-        }
+        assert!(
+            stored.starts_with(KEYCHAIN_TAG),
+            "stored value should be tagged"
+        );
+        assert!(
+            !stored.contains("supersecret"),
+            "ciphertext must not contain the plaintext"
+        );
+        assert_eq!(unprotect(&stored), secret, "sealed value must round-trip");
     }
 
     #[test]

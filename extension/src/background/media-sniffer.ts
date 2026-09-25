@@ -10,6 +10,7 @@
 // its memory; that's fine, the badge will repopulate as soon as
 // playback fetches its next manifest.
 
+import { CAPTURE_RESOURCE_TYPES } from "./request-types.js";
 import { log } from "../shared/log.js";
 import type { MediaKind, MediaStream, RequestHeader } from "../shared/types.js";
 import { buildCookieHeader } from "./cookie-forwarder.js";
@@ -113,7 +114,7 @@ export function installMediaSniffer(deps: MediaSnifferDeps): MediaSniffer {
 
   chrome.webRequest.onResponseStarted.addListener(
     onResponse,
-    { urls: ["<all_urls>"] },
+    { urls: ["<all_urls>"], types: CAPTURE_RESOURCE_TYPES },
     ["responseHeaders"],
   );
   chrome.tabs.onRemoved.addListener(onTabRemoved);
@@ -126,7 +127,9 @@ export function installMediaSniffer(deps: MediaSnifferDeps): MediaSniffer {
       return byTab.get(tabId) ?? [];
     },
     async enrich(stream) {
-      const cookieHeader = await buildCookieHeader(stream.manifestUrl).catch(() => "");
+      const cookieHeader = await buildCookieHeader(stream.manifestUrl, stream.tabId).catch(
+        () => "",
+      );
       const cached = deps.headerCache.getHeadersFor(stream.manifestUrl) ?? [];
       const requestHeaders: RequestHeader[] = cached
         .filter((h) => typeof h.name === "string" && h.name.length > 0)

@@ -16,6 +16,11 @@
 // unpartitioned set by default. Cross-site embeds that depend on
 // partitioned cookies may not have their auth forwarded correctly — a
 // known limitation documented for users in the extension README.
+//
+// Cookie stores: `getAll` without a `storeId` reads the regular profile's
+// store. A tab in an incognito window has its own store, so a lookup made
+// on behalf of a tab passes that tab's store — otherwise an incognito tab
+// would be served the regular session's cookies.
 
 import { log } from "../shared/log.js";
 
@@ -26,10 +31,27 @@ interface SortableCookie extends chrome.cookies.Cookie {
   readonly [extra: string]: unknown;
 }
 
-export async function buildCookieHeader(url: string): Promise<string> {
+/** The id of the cookie store `tabId` belongs to, from a
+ *  `chrome.cookies.getAllCookieStores()` listing. `undefined` when no store
+ *  lists the tab — the caller then reads the default store, as before. */
+export function storeIdForTab(
+  stores: readonly Pick<chrome.cookies.CookieStore, "id" | "tabIds">[],
+  tabId: number,
+): string | undefined {
+  return stores.find((s) => s.tabIds.includes(tabId))?.id;
+}
+
+/** Build the `Cookie` header for `url`. Pass the originating tab when there
+ *  is one, so its own cookie store is read (see the note on cookie stores
+ *  above). */
+export async function buildCookieHeader(url: string, tabId?: number | null): Promise<string> {
   let cookies: chrome.cookies.Cookie[];
   try {
-    cookies = await chrome.cookies.getAll({ url });
+    let storeId: string | undefined;
+    if (typeof tabId === "number" && tabId >= 0) {
+      storeId = storeIdForTab(await chrome.cookies.getAllCookieStores(), tabId);
+    }
+    cookies = await chrome.cookies.getAll(storeId ? { url, storeId } : { url });
   } catch (err) {
     log.warn("cookies.getAll failed", url, err);
     return "";
