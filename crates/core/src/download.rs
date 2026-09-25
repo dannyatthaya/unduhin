@@ -2826,7 +2826,14 @@ async fn resolve_unique_output_path(
 ) -> Result<PathBuf> {
     // Reuse safe_join's path-traversal validation for the base candidate.
     let base = safe_join(folder, filename)?;
-    if !output_path_taken(pool, &base, kind).await {
+    // A media candidate is checked against every `<stem>.*` in the folder;
+    // list it once here rather than once per candidate.
+    let listing = if kind == DownloadKind::Media {
+        folder_names(folder).await
+    } else {
+        Vec::new()
+    };
+    if !output_path_taken(pool, &base, kind, &listing).await {
         return Ok(base);
     }
 
@@ -2842,7 +2849,7 @@ async fn resolve_unique_output_path(
             None => format!("{stem} ({i})"),
         };
         let candidate = folder.join(&candidate_name);
-        if !output_path_taken(pool, &candidate, kind).await {
+        if !output_path_taken(pool, &candidate, kind, &listing).await {
             return Ok(candidate);
         }
     }
@@ -2884,7 +2891,15 @@ const PATH_COLLATE: &str = if cfg!(any(windows, target_os = "macos")) {
 /// that file already exists it reports the old file as the new download.
 /// So for a media candidate any `<stem>.*` on disk or in flight is taken,
 /// and any candidate is taken by an in-flight media row with its stem.
-async fn output_path_taken(pool: &SqlitePool, path: &Path, kind: DownloadKind) -> bool {
+///
+/// `listing` is the names in the candidate's folder ([`folder_names`]), read
+/// once by the caller; only a media candidate consults it.
+async fn output_path_taken(
+    pool: &SqlitePool,
+    path: &Path,
+    kind: DownloadKind,
+    listing: &[String],
+) -> bool {
     if tokio::fs::metadata(path).await.is_ok() {
         return true;
     }
@@ -2894,22 +2909,35 @@ async fn output_path_taken(pool: &SqlitePool, path: &Path, kind: DownloadKind) -
         return false;
     };
     let stem = crate::queue::media_stem(name);
-    if media && stem_in_use_on_disk(folder, stem).await {
+    if media && stem_in_use(listing, stem) {
         return true;
     }
+    // Exact matches and the `LIKE` prefix match are separate queries: each is
+    // then answered from an `output_path` index, where one query `OR`ing all
+    // three would scan the table.
     let stem_path = folder.join(stem);
-    let stem_prefix = format!("{}.%", escape_like(&stem_path.to_string_lossy()));
     let claimed: Option<i64> = sqlx::query_scalar(&format!(
         "SELECT 1 FROM downloads \
          WHERE status IN ('queued', 'active', 'paused', 'muxing') \
            AND (output_path = ?1{PATH_COLLATE} \
-                OR (kind = 'media' AND output_path = ?2{PATH_COLLATE}) \
-                OR (?3 AND output_path LIKE ?4 ESCAPE '\\')) \
+                OR (kind = 'media' AND output_path = ?2{PATH_COLLATE})) \
          LIMIT 1"
     ))
     .bind(path.to_string_lossy().as_ref())
     .bind(stem_path.to_string_lossy().as_ref())
-    .bind(media)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None);
+    if claimed.is_some() || !media {
+        return claimed.is_some();
+    }
+    let stem_prefix = format!("{}.%", escape_like(&stem_path.to_string_lossy()));
+    let claimed: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM downloads \
+         WHERE status IN ('queued', 'active', 'paused', 'muxing') \
+           AND output_path LIKE ?1 ESCAPE '\\' \
+         LIMIT 1",
+    )
     .bind(stem_prefix)
     .fetch_optional(pool)
     .await
@@ -2917,25 +2945,32 @@ async fn output_path_taken(pool: &SqlitePool, path: &Path, kind: DownloadKind) -
     claimed.is_some()
 }
 
-/// True when `folder` holds `stem` or any `stem.<something>` — what a yt-dlp
-/// run for `stem` would write or collide with.
-async fn stem_in_use_on_disk(folder: &Path, stem: &str) -> bool {
+/// The names of the entries in `folder` (empty when it can't be read, e.g.
+/// it doesn't exist yet). Names that aren't valid UTF-8 are skipped: no
+/// candidate built from a `&str` file name can match them.
+async fn folder_names(folder: &Path) -> Vec<String> {
+    let mut names = Vec::new();
     let Ok(mut entries) = tokio::fs::read_dir(folder).await else {
-        return false;
+        return names;
     };
-    let dotted = format!("{stem}.");
     while let Ok(Some(entry)) = entries.next_entry().await {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if same_file_name(name, stem)
+        if let Ok(name) = entry.file_name().into_string() {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// True when `listing` holds `stem` or any `stem.<something>` — what a yt-dlp
+/// run for `stem` would write or collide with.
+fn stem_in_use(listing: &[String], stem: &str) -> bool {
+    let dotted = format!("{stem}.");
+    listing.iter().any(|name| {
+        same_file_name(name, stem)
             || name
                 .get(..dotted.len())
                 .is_some_and(|head| same_file_name(head, &dotted))
-        {
-            return true;
-        }
-    }
-    false
+    })
 }
 
 /// Escape `%`, `_` and the escape character itself for a SQL `LIKE`.
