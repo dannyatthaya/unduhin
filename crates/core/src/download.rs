@@ -4620,7 +4620,10 @@ mod tests {
         )
         .await;
 
-        assert!(reconcile_category_folder(&pool, id).await.unwrap().is_none());
+        assert!(reconcile_category_folder(&pool, id)
+            .await
+            .unwrap()
+            .is_none());
         assert!(tokio::fs::metadata(&on_disk).await.is_ok());
     }
 
@@ -4643,7 +4646,10 @@ mod tests {
         )
         .await;
 
-        assert!(reconcile_category_folder(&pool, id).await.unwrap().is_none());
+        assert!(reconcile_category_folder(&pool, id)
+            .await
+            .unwrap()
+            .is_none());
         assert!(tokio::fs::metadata(&on_disk).await.is_ok());
     }
 
@@ -4718,7 +4724,10 @@ mod tests {
         )
         .await;
 
-        assert!(reconcile_category_folder(&pool, id).await.unwrap().is_none());
+        assert!(reconcile_category_folder(&pool, id)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     // ---- Folder picked in the add dialog (`output_dir`) ----------------------
