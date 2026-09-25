@@ -47,7 +47,7 @@ import type { ProbeViaApp } from "./hls-master.js";
 import { assembleStreams, sameStreams } from "./stream-view.js";
 import { installContextMenu } from "./context-menu.js";
 import { mergeStatus, readRecentJobs, recordAck } from "./recent-jobs.js";
-import { pruneTo, snapshotForWire } from "./rule-metrics.js";
+import { pruneTo, RULE_METRICS_KEY, snapshotForWire } from "./rule-metrics.js";
 
 /** Placeholder for a manifest nothing has resolved yet. Renders as a
  *  plain row with no size and no duration. */
@@ -169,7 +169,11 @@ const rawBridge = createNativeBridge(
   // storage→bridge forward in `chrome.storage.onChanged` fails silently
   // while the host is down and nothing else replays it, so edits made
   // during an outage would never reach the host until the *next* edit.
-  pushCurrentSettings,
+  // Rule metrics are replayed for the same reason.
+  () => {
+    pushCurrentSettings();
+    scheduleRuleMetricsPush();
+  },
 );
 
 // True once a reload is scheduled — the post-sync broadcast and the
@@ -712,17 +716,33 @@ chrome.storage.onChanged.addListener((changes, area) => {
 // idle-resume, where neither lifecycle event fires.
 kickBridge("boot");
 
-// Periodic rule-metrics push. The alarm fires every 6 s
-// (`periodInMinutes: 0.1`); the handler snapshots
-// `chrome.storage.local.ruleMetrics` and forwards it as
-// `Inbound::RuleMetrics`. Best-effort — a missed tick (host down, SW
-// suspended) is fine because the snapshot is full each time, not a
-// delta.
+// Rule-metrics push: the stored snapshot is forwarded as
+// `Inbound::RuleMetrics` when it changes (it is only written when a rule
+// matches, or when deleted rules are pruned) and when the bridge connects.
+// Best-effort — the snapshot is full each time, not a delta, so a missed
+// push is repaired by the next one.
+//
+// This used to be a repeating alarm every 6 s (Chrome clamps it to 30 s),
+// which woke the service worker forever and re-sent unchanged numbers once
+// any rule had ever matched. Alarms survive browser restarts, so the old
+// one is cleared for installs that still have it.
 const RULE_METRICS_ALARM = "rule-metrics-push";
-chrome.alarms.create(RULE_METRICS_ALARM, { periodInMinutes: 0.1 });
-chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name !== RULE_METRICS_ALARM) return;
-  void pushRuleMetrics();
+void chrome.alarms.clear(RULE_METRICS_ALARM).catch(() => {});
+
+/** Coalesces a burst of metric writes into one push. */
+const RULE_METRICS_PUSH_DELAY_MS = 3_000;
+let ruleMetricsTimer: ReturnType<typeof setTimeout> | null = null;
+
+function scheduleRuleMetricsPush(): void {
+  if (ruleMetricsTimer) return;
+  ruleMetricsTimer = setTimeout(() => {
+    ruleMetricsTimer = null;
+    void pushRuleMetrics();
+  }, RULE_METRICS_PUSH_DELAY_MS);
+}
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && RULE_METRICS_KEY in changes) scheduleRuleMetricsPush();
 });
 
 async function pushRuleMetrics(): Promise<void> {
