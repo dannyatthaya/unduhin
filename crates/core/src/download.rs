@@ -684,32 +684,77 @@ fn normalize_torrent_meta(meta: &mut TorrentMeta, url: &url::Url) {
             meta.info_hash = h;
         }
     }
-    meta.info_hash = meta.info_hash.trim().to_ascii_lowercase();
+    // A caller-supplied hash may be base32 (the add dialog passes one
+    // through as-is); de-dup needs the one canonical hex spelling.
+    meta.info_hash = canonical_info_hash(&meta.info_hash)
+        .unwrap_or_else(|| meta.info_hash.trim().to_ascii_lowercase());
 }
 
 /// Extract the BitTorrent v1 info-hash from a magnet URI's
 /// `xt=urn:btih:<hash>` parameter, normalized to lowercase hex. Accepts the
-/// 40-char hex form; returns `None` for the (rarer) base32 form or when the
-/// parameter is absent — callers fall back to other hash sources. No
+/// 40-char hex form and the 32-char base32 form (converted to hex, so both
+/// spellings of one swarm de-dup together); returns `None` when there is no
+/// usable `btih` topic — callers fall back to other hash sources. No
 /// network / metadata fetch is involved (design §5.7).
 fn info_hash_from_magnet(uri: &str) -> Option<String> {
     // Magnets are not always valid `Url`s for `url::Url`, but the query is a
     // simple `&`-joined list of `key=value`s after the first `?`.
     let query = uri.split_once('?').map(|(_, q)| q).unwrap_or(uri);
     for pair in query.split('&') {
-        let (k, v) = pair.split_once('=')?;
-        if !k.eq_ignore_ascii_case("xt") {
+        // A bare flag (`&foo&`) is not a key/value pair; skip it rather than
+        // giving up on the parameters after it.
+        let Some((k, v)) = pair.split_once('=') else {
+            continue;
+        };
+        // `xt`, or an indexed topic `xt.1`, `xt.2`, … (BEP 9).
+        let k = k.to_ascii_lowercase();
+        if k != "xt"
+            && !k
+                .strip_prefix("xt.")
+                .is_some_and(|n| n.parse::<u32>().is_ok())
+        {
             continue;
         }
-        // urn:btih:<hash> (case-insensitive scheme).
-        let lower = v.to_ascii_lowercase();
-        if let Some(hash) = lower.strip_prefix("urn:btih:") {
-            if hash.len() == 40 && hash.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Some(hash.to_string());
-            }
+        // urn:btih:<hash> (case-insensitive scheme), possibly percent-encoded.
+        let decoded = urlencoding_decode(v);
+        let lower = decoded.trim().to_ascii_lowercase();
+        if let Some(hash) = lower
+            .strip_prefix("urn:btih:")
+            .and_then(canonical_info_hash)
+        {
+            return Some(hash);
         }
     }
     None
+}
+
+/// Lowercase-hex form of a v1 info-hash given as 40 hex digits or 32
+/// base32 characters (RFC 4648, as magnets use), else `None`.
+fn canonical_info_hash(hash: &str) -> Option<String> {
+    let hash = hash.trim();
+    if hash.len() == 40 && hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Some(hash.to_ascii_lowercase());
+    }
+    if hash.len() != 32 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(20);
+    let (mut acc, mut bits) = (0u64, 0u32);
+    for c in hash.bytes() {
+        let v = match c.to_ascii_uppercase() {
+            c @ b'A'..=b'Z' => c - b'A',
+            c @ b'2'..=b'7' => c - b'2' + 26,
+            _ => return None,
+        };
+        acc = (acc << 5) | u64::from(v);
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            bytes.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Provisional display name for a torrent before librqbit resolves
@@ -745,7 +790,9 @@ fn provisional_torrent_name(torrent: Option<&TorrentMeta>, url: &url::Url) -> St
 fn magnet_display_name(uri: &str) -> Option<String> {
     let query = uri.split_once('?').map(|(_, q)| q).unwrap_or(uri);
     for pair in query.split('&') {
-        let (k, v) = pair.split_once('=')?;
+        let Some((k, v)) = pair.split_once('=') else {
+            continue;
+        };
         if k.eq_ignore_ascii_case("dn") {
             // Magnet `dn=` uses `+` for spaces in addition to percent-encoding.
             let decoded = urlencoding_decode(&v.replace('+', " "));
@@ -4361,9 +4408,79 @@ mod tests {
             info_hash_from_magnet(m2).as_deref(),
             Some("abcdef0123456789abcdef0123456789abcdef01")
         );
-        // No xt param, or non-40-hex (base32) form → None (caller falls back).
+        // No xt param, or a malformed hash → None (caller falls back).
         assert!(info_hash_from_magnet("magnet:?dn=no-hash").is_none());
         assert!(info_hash_from_magnet("magnet:?xt=urn:btih:TOOSHORT").is_none());
+    }
+
+    /// A parameter without `=` used to end the scan (`split_once('=')?`
+    /// returned early), so everything after it was ignored.
+    #[test]
+    fn magnet_parsing_skips_bare_flags() {
+        let m = "magnet:?x.pe&xt=urn:btih:6f84758b0ddd8dc05840bf932a77935d8b5b8b93&flag&dn=Debian";
+        assert_eq!(
+            info_hash_from_magnet(m).as_deref(),
+            Some("6f84758b0ddd8dc05840bf932a77935d8b5b8b93")
+        );
+        assert_eq!(magnet_display_name(m).as_deref(), Some("Debian"));
+    }
+
+    /// The base32 spelling of a hash is the same swarm as the hex one, so it
+    /// must canonicalize to the same key or de-dup misses it.
+    #[test]
+    fn magnet_base32_hash_canonicalizes_to_hex() {
+        let hex = "6f84758b0ddd8dc05840bf932a77935d8b5b8b93";
+        for m in [
+            "magnet:?xt=urn:btih:N6CHLCYN3WG4AWCAX6JSU54TLWFVXC4T",
+            "magnet:?xt=urn:btih:n6chlcyn3wg4awcax6jsu54tlwfvxc4t",
+            // Percent-encoded, and as an indexed topic.
+            "magnet:?xt.1=urn%3Abtih%3AN6CHLCYN3WG4AWCAX6JSU54TLWFVXC4T",
+        ] {
+            assert_eq!(info_hash_from_magnet(m).as_deref(), Some(hex), "{m}");
+        }
+        assert_eq!(
+            canonical_info_hash("N6CHLCYN3WG4AWCAX6JSU54TLWFVXC4T").as_deref(),
+            Some(hex)
+        );
+        assert!(canonical_info_hash("N6CHLCYN3WG4AWCAX6JSU54TLWFVXC41").is_none());
+    }
+
+    /// The add dialog passes a base32 hash through as-is; the row must still
+    /// de-dup against the same torrent added by its hex magnet.
+    #[tokio::test]
+    async fn base32_and_hex_adds_of_one_swarm_dedup() {
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let add = |uri: &str, info_hash: &str| AddDownload {
+            url: uri.parse().unwrap(),
+            filename: None,
+            output_path: None,
+            output_dir: Some(tmp.path().to_path_buf()),
+            category: None,
+            priority: 0,
+            segments: None,
+            media_info: None,
+            headers: None,
+            source: DownloadSource::Manual,
+            kind: DownloadKind::Torrent,
+            torrent: Some(TorrentMeta {
+                info_hash: info_hash.into(),
+                source: TorrentSource::Magnet { uri: uri.into() },
+                selected_files: None,
+                files: None,
+                swarm: None,
+                owns_content_dir: false,
+            }),
+        };
+        let hex = "6f84758b0ddd8dc05840bf932a77935d8b5b8b93";
+        let first = insert(&pool, add(&format!("magnet:?xt=urn:btih:{hex}"), ""))
+            .await
+            .unwrap();
+        let b32 = "n6chlcyn3wg4awcax6jsu54tlwfvxc4t";
+        let second = insert(&pool, add(&format!("magnet:?xt=urn:btih:{b32}"), b32))
+            .await
+            .unwrap();
+        assert_eq!(first.id, second.id);
     }
 
     #[test]
