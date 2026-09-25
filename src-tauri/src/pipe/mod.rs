@@ -1015,7 +1015,18 @@ fn headers_from_media(stream: &unduhin_core::wire::MediaStream) -> Vec<(String, 
     out
 }
 
-#[cfg(all(windows, test))]
+/// Re-export the pipe path so tests under `src-tauri/tests/` can
+/// build a matching client. Kept module-public; the rest of the
+/// app doesn't need it.
+#[allow(dead_code)]
+pub(crate) fn default_pipe_path() -> PathBuf {
+    PathBuf::from(pipe_name())
+}
+
+// Platform-neutral: the dispatch and validation below are the same code on
+// every OS, so these run wherever the crate's tests run (macOS CI included),
+// not only on Windows.
+#[cfg(test)]
 mod tests {
     use super::*;
     use unduhin_core::wire::{headers_from_job, DownloadJob, MediaStream, RequestHeader};
@@ -1214,7 +1225,7 @@ mod tests {
         }
     }
 
-    /// The `DownloadTorrent` dispatch arm is Windows-only and was once missing —
+    /// The `DownloadTorrent` dispatch arm was once missing —
     /// the build broke at the Wave-3 merge and no test caught it (the core-side
     /// handoff test deliberately bypasses src-tauri). Drive the real
     /// `dispatch -> handle_download_torrent -> Core::add_download` path with a
@@ -1254,12 +1265,4 @@ mod tests {
             other => panic!("expected Ack on duplicate, got {other:?}"),
         }
     }
-}
-
-/// Re-export the pipe path so tests under `src-tauri/tests/` can
-/// build a matching client. Kept module-public; the rest of the
-/// app doesn't need it.
-#[allow(dead_code)]
-pub(crate) fn default_pipe_path() -> PathBuf {
-    PathBuf::from(pipe_name())
 }
