@@ -709,8 +709,11 @@ async fn run_worker(
         // Progress reaches SQLite at most once per `PROGRESS_PERSIST_EVERY`
         // (the UI event still goes out on every tick). The last unsaved tick
         // is written when the stream ends, so a pause or stop still records
-        // the final byte count.
+        // the final byte count. The first tick that carries bytes is always
+        // written straight away, so a row that has shown progress never reads
+        // back as untouched (a pause lands before the final flush does).
         let mut last_persist: Option<std::time::Instant> = None;
+        let mut persisted_bytes = false;
         let mut unsaved: Option<(u64, Option<u64>)> = None;
         loop {
             match rx.recv().await {
@@ -746,9 +749,12 @@ async fn run_worker(
                     let downloaded = downloaded.saturating_add(stream_base);
                     let total = total.map(|t| t.saturating_add(stream_base));
 
-                    if last_persist.map_or(true, |t| t.elapsed() >= PROGRESS_PERSIST_EVERY) {
+                    if last_persist.map_or(true, |t| t.elapsed() >= PROGRESS_PERSIST_EVERY)
+                        || (!persisted_bytes && downloaded > 0)
+                    {
                         persist_tick(&pump_pool, id, &pump_meta_path, downloaded, total).await;
                         last_persist = Some(std::time::Instant::now());
+                        persisted_bytes |= downloaded > 0;
                         unsaved = None;
                     } else {
                         unsaved = Some((downloaded, total));
