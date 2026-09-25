@@ -135,6 +135,12 @@ impl Meta {
             f.flush()
                 .await
                 .map_err(|e| EngineError::io(Some(tmp.clone()), e))?;
+            // On disk before the rename makes it the sidecar: renaming a
+            // file whose data is still only in the page cache can leave an
+            // empty sidecar after a power cut, and then nothing resumes.
+            f.sync_data()
+                .await
+                .map_err(|e| EngineError::io(Some(tmp.clone()), e))?;
         }
         fs::rename(&tmp, path)
             .await

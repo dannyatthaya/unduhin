@@ -46,6 +46,12 @@ use crate::retry::{classify_reqwest, Backoff, RetryClass};
 use crate::segment::Segment;
 
 pub(crate) const TICK_INTERVAL: Duration = Duration::from_millis(250);
+
+/// The resume sidecar is rewritten every this many ticks (once a second),
+/// not on every tick: each save is a create + write + fsync + rename, and
+/// the final save when the transfer stops (pause included) is what a
+/// resume really depends on.
+const SIDECAR_SAVE_EVERY_TICKS: u32 = 4;
 pub(crate) const SPEED_ALPHA: f64 = 0.3;
 
 /// Slow-start cadence: when ramping toward the target connection count, add
@@ -742,21 +748,33 @@ fn median_of_active(speeds: &[f64], done: &[bool]) -> f64 {
 async fn ticker_loop(shared: Arc<SharedState>, total: Option<u64>, cancel: CancellationToken) {
     let mut global = SpeedMeter::new(TICK_INTERVAL, SPEED_ALPHA);
     let mut samplers: Vec<SegmentSampler> = Vec::new();
+    let mut ticks: u32 = 0;
 
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = sleep(TICK_INTERVAL) => {}
         }
+        ticks = ticks.wrapping_add(1);
+        let save_due = ticks % SIDECAR_SAVE_EVERY_TICKS == 0;
 
-        let snapshot: Vec<(u64, u64)> = {
+        // Copy out under the lock, write after releasing it. Every worker
+        // takes this lock on every chunk it writes, so saving the sidecar
+        // (file create + write + rename) while holding it stalled every
+        // connection several times a second.
+        let (snapshot, to_save): (Vec<(u64, u64)>, Option<Meta>) = {
             let m = shared.meta.lock().await;
-            let _ = m.save(&shared.meta_path).await;
-            m.segments
-                .iter()
-                .map(|s| (s.bytes_downloaded, s.segment.len()))
-                .collect()
+            (
+                m.segments
+                    .iter()
+                    .map(|s| (s.bytes_downloaded, s.segment.len()))
+                    .collect(),
+                save_due.then(|| m.clone()),
+            )
         };
+        if let Some(meta) = to_save {
+            let _ = meta.save(&shared.meta_path).await;
+        }
         let segment_count = snapshot.len();
         while samplers.len() < segment_count {
             samplers.push(SegmentSampler::new());
