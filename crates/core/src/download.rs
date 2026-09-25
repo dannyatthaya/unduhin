@@ -485,26 +485,6 @@ pub(crate) async fn insert(pool: &SqlitePool, input: AddDownload) -> Result<Down
         None => None,
     };
 
-    // Q7 front-door de-dup: a second add of the same swarm (matched on the
-    // canonical `info_hash`) is a NO-OP that hands back the existing row,
-    // never a new one — so the UI never shows two rows for one swarm. Only
-    // checked against rows that are still meaningful (not removed/cancelled
-    // — a cancelled row can be retried, so it counts; a separate explicit
-    // re-add of a removed torrent legitimately makes a fresh row because
-    // the old row is gone). See design §5.7.
-    if let Some(meta) = torrent.as_ref() {
-        if !meta.info_hash.is_empty() {
-            if let Some(existing) = find_active_torrent_by_hash(pool, &meta.info_hash).await? {
-                tracing::info!(
-                    info_hash = %meta.info_hash,
-                    existing_id = existing.id,
-                    "add_download: duplicate torrent — returning existing row"
-                );
-                return Ok(existing);
-            }
-        }
-    }
-
     // Provisional name. Torrents skip the HEAD probe entirely (there is no
     // HTTP resource to probe) and take a provisional name now — magnet
     // `dn=` → `.torrent` stem → `"torrent"` — reconciled to the real
@@ -532,6 +512,35 @@ pub(crate) async fn insert(pool: &SqlitePool, input: AddDownload) -> Result<Down
     // separators, drive colons, and `..` so the `resolve_output_path`
     // join below can never escape the target folder.
     let filename = sanitize_filename(&filename);
+
+    // Everything from here to the INSERT runs under one process-wide lock.
+    // Both the free-name search below and the torrent de-dup check are
+    // check-then-insert against rows other adds are creating: two captures
+    // landing together (the pipe serves connections concurrently) could
+    // otherwise both pick `uc` for two different files, or both add the
+    // same magnet. The slow part of an add — the HEAD probe above — stays
+    // outside it.
+    let _insert_guard = insert_lock().lock().await;
+
+    // Q7 front-door de-dup: a second add of the same swarm (matched on the
+    // canonical `info_hash`) is a NO-OP that hands back the existing row,
+    // never a new one — so the UI never shows two rows for one swarm. Only
+    // checked against rows that are still meaningful (not removed/cancelled
+    // — a cancelled row can be retried, so it counts; a separate explicit
+    // re-add of a removed torrent legitimately makes a fresh row because
+    // the old row is gone). See design §5.7.
+    if let Some(meta) = torrent.as_ref() {
+        if !meta.info_hash.is_empty() {
+            if let Some(existing) = find_active_torrent_by_hash(pool, &meta.info_hash).await? {
+                tracing::info!(
+                    info_hash = %meta.info_hash,
+                    existing_id = existing.id,
+                    "add_download: duplicate torrent — returning existing row"
+                );
+                return Ok(existing);
+            }
+        }
+    }
 
     // Resolve category: explicit selector wins; otherwise auto-detect by
     // filename extension; otherwise fall back to "Other".
@@ -570,6 +579,7 @@ pub(crate) async fn insert(pool: &SqlitePool, input: AddDownload) -> Result<Down
                 &output_path,
                 output_dir.as_deref(),
                 category_id,
+                kind,
             )
             .await?
         }
@@ -644,6 +654,12 @@ pub(crate) async fn insert(pool: &SqlitePool, input: AddDownload) -> Result<Down
 
     let id: i64 = row.get("id");
     get(pool, id).await
+}
+
+/// Serializes the resolve-and-insert tail of [`insert`]; see there.
+fn insert_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 /// Lowercase the canonical `info_hash` and, when the caller left it blank,
@@ -818,7 +834,7 @@ async fn resolve_torrent_output_dir(
         // one. With a hash the name is already per-swarm, and reusing an
         // existing folder of the same swarm is what lets a re-add pick up the
         // data already on disk.
-        resolve_unique_output_path(pool, &base, &subdir).await
+        resolve_unique_output_path(pool, &base, &subdir, DownloadKind::Torrent).await
     } else {
         safe_join(&base, &subdir)
     }
@@ -867,7 +883,7 @@ pub(crate) async fn repair_unwritable_output_paths(pool: &SqlitePool) -> Result<
                 resolve_torrent_output_dir(pool, &r.filename, &None, None, r.torrent.as_ref())
                     .await?
             }
-            _ => resolve_output_path(pool, &r.filename, &None, None, r.category_id).await?,
+            _ => resolve_output_path(pool, &r.filename, &None, None, r.category_id, r.kind).await?,
         };
         tracing::info!(
             id = r.id,
@@ -2524,6 +2540,7 @@ async fn resolve_output_path(
     explicit: &Option<PathBuf>,
     folder: Option<&Path>,
     category_id: Option<i64>,
+    kind: DownloadKind,
 ) -> Result<PathBuf> {
     if let Some(path) = explicit {
         return Ok(absolutize(path));
@@ -2533,14 +2550,14 @@ async fn resolve_output_path(
     // folder, never the file itself: the name is resolved and de-duplicated
     // inside it exactly as it would be in a category folder.
     if let Some(folder) = folder.filter(|f| !f.as_os_str().is_empty()) {
-        return resolve_unique_output_path(pool, &absolutize(folder), filename).await;
+        return resolve_unique_output_path(pool, &absolutize(folder), filename, kind).await;
     }
 
     if let Some(id) = category_id {
         if let Ok(cat) = crate::category::get(pool, id).await {
             if let Some(folder) = cat.default_output_path {
                 if !folder.as_os_str().is_empty() {
-                    return resolve_unique_output_path(pool, &folder, filename).await;
+                    return resolve_unique_output_path(pool, &folder, filename, kind).await;
                 }
             }
         }
@@ -2551,10 +2568,10 @@ async fn resolve_output_path(
         .and_then(|v| v.as_str().map(|s| s.to_string()))
         .filter(|s| !s.is_empty());
     if let Some(g) = global {
-        return resolve_unique_output_path(pool, Path::new(&g), filename).await;
+        return resolve_unique_output_path(pool, Path::new(&g), filename, kind).await;
     }
 
-    resolve_unique_output_path(pool, &crate::fallback_download_dir(), filename).await
+    resolve_unique_output_path(pool, &crate::fallback_download_dir(), filename, kind).await
 }
 
 /// Join a download `filename` onto a base `folder`, guaranteeing the
@@ -2592,10 +2609,11 @@ async fn resolve_unique_output_path(
     pool: &SqlitePool,
     folder: &Path,
     filename: &str,
+    kind: DownloadKind,
 ) -> Result<PathBuf> {
     // Reuse safe_join's path-traversal validation for the base candidate.
     let base = safe_join(folder, filename)?;
-    if !output_path_taken(pool, &base).await {
+    if !output_path_taken(pool, &base, kind).await {
         return Ok(base);
     }
 
@@ -2611,35 +2629,112 @@ async fn resolve_unique_output_path(
             None => format!("{stem} ({i})"),
         };
         let candidate = folder.join(&candidate_name);
-        if !output_path_taken(pool, &candidate).await {
+        if !output_path_taken(pool, &candidate, kind).await {
             return Ok(candidate);
         }
     }
-    // Pathological (10k collisions): better to risk one collision than loop
-    // forever. The DB has no unique constraint, so this stays a soft guard.
-    Ok(base)
+    // Pathological (10k collisions). Sharing a path means two downloads
+    // writing one file, so refuse rather than guess.
+    Err(CoreError::InvalidArgument(format!(
+        "no free file name for {filename:?} in {}",
+        folder.display()
+    )))
 }
+
+/// Whether two file names name the same file here. Windows and macOS
+/// (APFS/HFS+ by default) compare names case-insensitively; so must we, or
+/// `File.zip` and `file.zip` are "different" paths to one file.
+fn same_file_name(a: &str, b: &str) -> bool {
+    if cfg!(any(windows, target_os = "macos")) {
+        a.to_lowercase() == b.to_lowercase()
+    } else {
+        a == b
+    }
+}
+
+/// `COLLATE` clause matching [`same_file_name`] for path comparisons in SQL.
+/// (`NOCASE` folds ASCII only, which covers the common case.)
+const PATH_COLLATE: &str = if cfg!(any(windows, target_os = "macos")) {
+    " COLLATE NOCASE"
+} else {
+    ""
+};
 
 /// Is `path` already occupied? True when a real file exists there, OR an
 /// in-flight (`queued`/`active`/`paused`/`muxing`) download row already claims
 /// it. Terminal rows (completed/failed/cancelled) are intentionally ignored so
 /// a fresh download may reuse a freed name; the on-disk check still prevents
 /// clobbering a finished file that's still present.
-async fn output_path_taken(pool: &SqlitePool, path: &Path) -> bool {
+///
+/// A media row's path is not the file yt-dlp writes: yt-dlp saves
+/// `<stem>.<ext>` (see `queue::media_stem`) with `--no-overwrites`, and if
+/// that file already exists it reports the old file as the new download.
+/// So for a media candidate any `<stem>.*` on disk or in flight is taken,
+/// and any candidate is taken by an in-flight media row with its stem.
+async fn output_path_taken(pool: &SqlitePool, path: &Path, kind: DownloadKind) -> bool {
     if tokio::fs::metadata(path).await.is_ok() {
         return true;
     }
-    let claimed: Option<i64> = sqlx::query_scalar(
+    let media = kind == DownloadKind::Media;
+    let (Some(folder), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
+    else {
+        return false;
+    };
+    let stem = crate::queue::media_stem(name);
+    if media && stem_in_use_on_disk(folder, stem).await {
+        return true;
+    }
+    let stem_path = folder.join(stem);
+    let stem_prefix = format!("{}.%", escape_like(&stem_path.to_string_lossy()));
+    let claimed: Option<i64> = sqlx::query_scalar(&format!(
         "SELECT 1 FROM downloads \
-         WHERE output_path = ? \
-           AND status IN ('queued', 'active', 'paused', 'muxing') \
-         LIMIT 1",
-    )
+         WHERE status IN ('queued', 'active', 'paused', 'muxing') \
+           AND (output_path = ?1{PATH_COLLATE} \
+                OR (kind = 'media' AND output_path = ?2{PATH_COLLATE}) \
+                OR (?3 AND output_path LIKE ?4 ESCAPE '\\')) \
+         LIMIT 1"
+    ))
     .bind(path.to_string_lossy().as_ref())
+    .bind(stem_path.to_string_lossy().as_ref())
+    .bind(media)
+    .bind(stem_prefix)
     .fetch_optional(pool)
     .await
     .unwrap_or(None);
     claimed.is_some()
+}
+
+/// True when `folder` holds `stem` or any `stem.<something>` — what a yt-dlp
+/// run for `stem` would write or collide with.
+async fn stem_in_use_on_disk(folder: &Path, stem: &str) -> bool {
+    let Ok(mut entries) = tokio::fs::read_dir(folder).await else {
+        return false;
+    };
+    let dotted = format!("{stem}.");
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if same_file_name(name, stem)
+            || name
+                .get(..dotted.len())
+                .is_some_and(|head| same_file_name(head, &dotted))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Escape `%`, `_` and the escape character itself for a SQL `LIKE`.
+fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -2974,14 +3069,21 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let p = resolve_output_path(&pool, "song.mp3", &None, None, Some(music.id))
-            .await
-            .unwrap();
+        let p = resolve_output_path(
+            &pool,
+            "song.mp3",
+            &None,
+            None,
+            Some(music.id),
+            DownloadKind::Http,
+        )
+        .await
+        .unwrap();
         assert!(p.is_absolute(), "resolved path must be absolute: {p:?}");
         assert_eq!(p.parent(), Some(downloads.as_path()));
 
         // No category at all resolves the same way.
-        let p = resolve_output_path(&pool, "blob", &None, None, None)
+        let p = resolve_output_path(&pool, "blob", &None, None, None, DownloadKind::Http)
             .await
             .unwrap();
         assert_eq!(p.parent(), Some(downloads.as_path()));
@@ -3079,9 +3181,16 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let p = resolve_output_path(&pool, "song.mp3", &None, None, Some(music.id))
-            .await
-            .unwrap();
+        let p = resolve_output_path(
+            &pool,
+            "song.mp3",
+            &None,
+            None,
+            Some(music.id),
+            DownloadKind::Http,
+        )
+        .await
+        .unwrap();
         assert_eq!(p, tmp.path().join("song.mp3"));
     }
 
@@ -4464,10 +4573,7 @@ mod tests {
         )
         .await;
 
-        assert!(reconcile_category_folder(&pool, id)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(reconcile_category_folder(&pool, id).await.unwrap().is_none());
         assert!(tokio::fs::metadata(&on_disk).await.is_ok());
     }
 
@@ -4490,10 +4596,7 @@ mod tests {
         )
         .await;
 
-        assert!(reconcile_category_folder(&pool, id)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(reconcile_category_folder(&pool, id).await.unwrap().is_none());
         assert!(tokio::fs::metadata(&on_disk).await.is_ok());
     }
 
@@ -4568,10 +4671,7 @@ mod tests {
         )
         .await;
 
-        assert!(reconcile_category_folder(&pool, id)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(reconcile_category_folder(&pool, id).await.unwrap().is_none());
     }
 
     // ---- Folder picked in the add dialog (`output_dir`) ----------------------
@@ -4850,5 +4950,120 @@ mod tests {
 
         assert_eq!(renamed.path, picked.join("clip.mp4"));
         assert!(picked.join("clip.mp4").exists());
+    }
+
+    // ---- Name collisions (media stems, case, concurrency) --------------------
+
+    fn media_add(folder: &Path, title: &str) -> AddDownload {
+        AddDownload {
+            url: "https://video.example.com/watch?v=1".parse().unwrap(),
+            filename: None,
+            output_path: None,
+            output_dir: Some(folder.to_path_buf()),
+            category: None,
+            priority: 0,
+            segments: None,
+            media_info: Some(MediaInfo {
+                extractor: "youtube".into(),
+                format_selector: "best".into(),
+                title: title.into(),
+                original_url: "https://video.example.com/watch?v=1".into(),
+                needs_ffmpeg: false,
+            }),
+            headers: None,
+            source: DownloadSource::Manual,
+            kind: DownloadKind::Media,
+            torrent: None,
+        }
+    }
+
+    fn http_add(folder: &Path, filename: &str) -> AddDownload {
+        AddDownload {
+            url: "https://example.com/f".parse().unwrap(),
+            filename: Some(filename.into()),
+            output_path: None,
+            output_dir: Some(folder.to_path_buf()),
+            category: None,
+            priority: 0,
+            segments: Some(1),
+            media_info: None,
+            headers: None,
+            source: DownloadSource::Manual,
+            kind: DownloadKind::Http,
+            torrent: None,
+        }
+    }
+
+    /// yt-dlp writes `<title>.<ext>` with `--no-overwrites`, and when that
+    /// file exists it reports the OLD file as this download. Two videos with
+    /// the same title (or two captures falling back to "media") must not
+    /// share a stem.
+    #[tokio::test]
+    async fn media_title_avoids_an_existing_file_with_its_stem() {
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("media.mp4"), b"first video")
+            .await
+            .unwrap();
+
+        let rec = insert(&pool, media_add(tmp.path(), "media")).await.unwrap();
+
+        assert_eq!(rec.output_path, tmp.path().join("media (1)"));
+    }
+
+    #[tokio::test]
+    async fn media_and_http_rows_in_flight_do_not_share_a_stem() {
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+
+        // An HTTP `clip.mp4` in flight takes the stem `clip` from a video…
+        let http = insert(&pool, http_add(tmp.path(), "clip.mp4"))
+            .await
+            .unwrap();
+        let media = insert(&pool, media_add(tmp.path(), "clip")).await.unwrap();
+        assert_eq!(http.output_path, tmp.path().join("clip.mp4"));
+        assert_eq!(media.output_path, tmp.path().join("clip (1)"));
+
+        // …and a video in flight takes `<stem>.mp4` from an HTTP download.
+        let media = insert(&pool, media_add(tmp.path(), "talk")).await.unwrap();
+        let http = insert(&pool, http_add(tmp.path(), "talk.mp4"))
+            .await
+            .unwrap();
+        assert_eq!(media.output_path, tmp.path().join("talk"));
+        assert_eq!(http.output_path, tmp.path().join("talk (1).mp4"));
+    }
+
+    /// The same stem as a DIFFERENT name must not count: `media-extra.mp4`
+    /// does not block `media`.
+    #[tokio::test]
+    async fn media_stem_match_is_on_the_whole_stem() {
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("media-extra.mp4"), b"x")
+            .await
+            .unwrap();
+        let rec = insert(&pool, media_add(tmp.path(), "media")).await.unwrap();
+        assert_eq!(rec.output_path, tmp.path().join("media"));
+    }
+
+    /// Windows and macOS file systems ignore case, so an in-flight
+    /// `File.zip` and a new `file.zip` are one file.
+    #[cfg(any(windows, target_os = "macos"))]
+    #[tokio::test]
+    async fn in_flight_paths_compare_case_insensitively() {
+        let pool = fresh_pool().await;
+        let tmp = tempfile::tempdir().unwrap();
+        insert(&pool, http_add(tmp.path(), "File.zip"))
+            .await
+            .unwrap();
+        let second = insert(&pool, http_add(tmp.path(), "file.zip"))
+            .await
+            .unwrap();
+        assert_eq!(second.output_path, tmp.path().join("file (1).zip"));
+    }
+
+    #[test]
+    fn escape_like_escapes_wildcards() {
+        assert_eq!(escape_like(r"C:\a_b%c"), r"C:\\a\_b\%c");
     }
 }

@@ -1166,6 +1166,50 @@ async fn refresh_source_changes_nothing_if_the_row_resumed_during_the_probe() ->
     Ok(())
 }
 
+/// Captures that land together (the pipe serves connections concurrently)
+/// and reduce to the same name — every `drive.google.com/uc?id=…` link is
+/// `uc` — must still get distinct files. The free-name search and the
+/// INSERT used to interleave, so several could pick the same path and
+/// share one file and one sidecar.
+#[tokio::test]
+async fn concurrent_adds_with_the_same_name_get_distinct_paths() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let core = Core::open(dir.path().join("concurrent.db")).await?;
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(&out)?;
+
+    let adds = (0..16).map(|i| {
+        let core = core.clone();
+        let out = out.clone();
+        tokio::spawn(async move {
+            core.add_download(AddDownload {
+                url: format!("https://drive.example.com/uc?id={i}")
+                    .parse()
+                    .unwrap(),
+                filename: Some("uc".into()),
+                output_path: None,
+                output_dir: Some(out),
+                category: None,
+                priority: 0,
+                segments: Some(1),
+                media_info: None,
+                headers: None,
+                source: DownloadSource::ExtensionPipe,
+                kind: DownloadKind::Http,
+                torrent: None,
+            })
+            .await
+        })
+    });
+    let mut paths = std::collections::HashSet::new();
+    for add in adds.collect::<Vec<_>>() {
+        let id = add.await??;
+        paths.insert(core.get_download(id).await?.output_path);
+    }
+    assert_eq!(paths.len(), 16, "two downloads were given the same file");
+    Ok(())
+}
+
 /// A signed URL that has expired answers 403. `retry::classify` files every
 /// 4xx under `Terminal`, which is right for the transfer but too coarse for
 /// the UI: 403 is fixable with a fresh link, 404 is not. The row must record
