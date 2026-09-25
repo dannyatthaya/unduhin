@@ -153,8 +153,9 @@ pub struct TorrentConfig {
 }
 
 impl TorrentConfig {
-    /// Sensible defaults matching the seeded settings (design §3.G): DHT + UPnP
-    /// on, OS-assigned port, no seeding. Caller must still set `download_dir` /
+    /// Sensible defaults matching the seeded settings (design §3.G): DHT on,
+    /// UPnP off (it reconfigures the user's router, so it is opt-in),
+    /// OS-assigned port, no seeding. Caller must still set `download_dir` /
     /// `state_dir`.
     pub fn new(download_dir: PathBuf, state_dir: PathBuf) -> Self {
         Self {
@@ -162,7 +163,7 @@ impl TorrentConfig {
             state_dir,
             listen_port: 0,
             enable_dht: true,
-            enable_upnp: true,
+            enable_upnp: false,
             seed_ratio_milli: 0,
             download_limit_bps: 0,
         }

@@ -5563,4 +5563,15 @@ mod tests {
         assert!(json.get("headers").is_none(), "{json}");
         assert!(!json.to_string().contains("session=old"));
     }
+
+    /// UPnP reconfigures the user's router, so it is opt-in: a fresh
+    /// database (seeded 'true' by an older migration) ends up with it off.
+    #[tokio::test]
+    async fn upnp_is_off_after_migrations() {
+        let pool = fresh_pool().await;
+        let v = crate::settings::get(&pool, "torrent_enable_upnp")
+            .await
+            .unwrap();
+        assert_eq!(v.and_then(|v| v.as_bool()), Some(false));
+    }
 }

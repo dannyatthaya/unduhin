@@ -578,7 +578,7 @@
     "torrentEnableDht": "Aktifkan DHT",
     "torrentEnableDhtDesc": "Distributed hash table. Diperlukan untuk meresolusi tautan magnet tanpa tracker.",
     "torrentEnableUpnp": "Pemetaan port UPnP",
-    "torrentEnableUpnpDesc": "Minta router meneruskan port dengar agar peer jarak jauh dapat menjangkau Anda.",
+    "torrentEnableUpnpDesc": "Minta router meneruskan port dengar agar peer jarak jauh dapat menjangkau Anda. Ini mengubah konfigurasi router Anda selama torrent berjalan, jadi nonaktif secara bawaan.",
     "torrentMaxPeers": "Maks peer per torrent",
     "torrentMaxPeersDesc": "Batas atas koneksi peer serentak untuk satu torrent.",
     "cardTorrentStorage": "Penyimpanan",

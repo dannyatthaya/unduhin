@@ -578,7 +578,7 @@
     "torrentEnableDht": "Enable DHT",
     "torrentEnableDhtDesc": "Distributed hash table. Required to resolve trackerless magnet links.",
     "torrentEnableUpnp": "UPnP port mapping",
-    "torrentEnableUpnpDesc": "Ask the router to forward the listen port so remote peers can reach you.",
+    "torrentEnableUpnpDesc": "Ask the router to forward the listen port so remote peers can reach you. This changes your router's configuration while torrents run, so it is off by default.",
     "torrentMaxPeers": "Max peers per torrent",
     "torrentMaxPeersDesc": "Upper bound on simultaneous peer connections for a single torrent.",
     "cardTorrentStorage": "Storage",

@@ -34,7 +34,7 @@ describe("useTorrentSettings", () => {
     const s = useTorrentSettings();
     expect(s.listenPort.value).toBe(0);
     expect(s.enableDht.value).toBe(true);
-    expect(s.enableUpnp.value).toBe(true);
+    expect(s.enableUpnp.value).toBe(false);
     expect(s.maxPeers.value).toBe(100);
     expect(s.downloadDir.value).toBe("");
     expect(s.seedRatioMilli.value).toBe(0);

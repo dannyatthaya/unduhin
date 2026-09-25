@@ -7,7 +7,7 @@
 // defaults are seeded by the torrent migration (design §3.G):
 //   torrent_listen_port      0      0 = OS-assigned random port
 //   torrent_enable_dht       true   required for trackerless magnets
-//   torrent_enable_upnp      true   port-map for inbound peers
+//   torrent_enable_upnp      false  port-map for inbound peers (opt-in)
 //   torrent_max_peers        100    per-torrent peer budget
 //   torrent_download_dir     ""     empty = fall back to default output path
 //   torrent_seed_ratio_milli 0      0 = stop at 100%, no seeding
@@ -71,7 +71,7 @@ export function useTorrentSettings() {
   return {
     listenPort: typedNumber("torrent_listen_port", 0, { min: 0, max: 65535 }),
     enableDht: typedBoolean("torrent_enable_dht", true),
-    enableUpnp: typedBoolean("torrent_enable_upnp", true),
+    enableUpnp: typedBoolean("torrent_enable_upnp", false),
     maxPeers: typedNumber("torrent_max_peers", 100, { min: 1, max: 2000 }),
     downloadDir: typedString("torrent_download_dir", ""),
     seedRatioMilli: typedNumber("torrent_seed_ratio_milli", 0, {

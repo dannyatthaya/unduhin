@@ -133,12 +133,13 @@ async fn build_torrent_config(
         .flatten()
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
+    // Off unless the user turned it on: UPnP reconfigures their router.
     let enable_upnp = settings::get(pool, "torrent_enable_upnp")
         .await
         .ok()
         .flatten()
         .and_then(|v| v.as_bool())
-        .unwrap_or(true);
+        .unwrap_or(false);
     // Seed-until ratio in thousandths; `0` (the seeded default) = forget at
     // 100 %, no seeding. Clamp into u32 — the UI bounds it to 0..=100_000.
     let seed_ratio_milli = settings::get(pool, "torrent_seed_ratio_milli")

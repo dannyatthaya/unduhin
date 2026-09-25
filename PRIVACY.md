@@ -39,6 +39,15 @@ and every file named under it keeps the same name.
   recognizes, the app runs `yt-dlp --dump-single-json <url>` and then
   `yt-dlp ... -o <path> <url>`. Networking is done by yt-dlp itself —
   see [yt-dlp's privacy notes](https://github.com/yt-dlp/yt-dlp).
+- **Download a torrent or magnet link.** BitTorrent is peer-to-peer:
+  while a torrent runs, the app connects to the torrent's trackers and to
+  other peers, and all of them see your IP address and which torrent you
+  are downloading. It also joins the BitTorrent DHT (Settings → Torrent,
+  on by default) to find peers without a tracker, which makes your IP
+  address visible to DHT nodes. With seeding on, other peers download
+  from you. **UPnP port mapping** (off by default) asks your router to
+  forward a port to this computer so peers can connect in; turning it on
+  changes your router's configuration while torrents run.
 
 ## What Unduhin can do, but only with your consent
 
