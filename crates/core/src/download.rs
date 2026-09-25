@@ -335,7 +335,8 @@ pub struct DownloadRecord {
     pub media_info: Option<MediaInfo>,
     /// Captured browser request headers (Cookie, Referer, User-Agent,
     /// observed `webRequest` headers) replayed on every engine request
-    /// and forwarded to yt-dlp via `--add-header`. `None` when the row
+    /// and forwarded to yt-dlp via `--add-header` (in an options file, not
+    /// argv). `None` when the row
     /// was added without browser capture context (CLI, Add URL dialog).
     pub headers: Option<Vec<(String, String)>>,
     /// Which surface added this row. Used by the Settings → Browser
@@ -4441,7 +4442,10 @@ mod tests {
         )
         .await;
 
-        assert!(reconcile_category_folder(&pool, id).await.unwrap().is_none());
+        assert!(reconcile_category_folder(&pool, id)
+            .await
+            .unwrap()
+            .is_none());
         assert!(tokio::fs::metadata(&on_disk).await.is_ok());
     }
 
@@ -4464,7 +4468,10 @@ mod tests {
         )
         .await;
 
-        assert!(reconcile_category_folder(&pool, id).await.unwrap().is_none());
+        assert!(reconcile_category_folder(&pool, id)
+            .await
+            .unwrap()
+            .is_none());
         assert!(tokio::fs::metadata(&on_disk).await.is_ok());
     }
 
@@ -4539,7 +4546,10 @@ mod tests {
         )
         .await;
 
-        assert!(reconcile_category_folder(&pool, id).await.unwrap().is_none());
+        assert!(reconcile_category_folder(&pool, id)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     // ---- Folder picked in the add dialog (`output_dir`) ----------------------
