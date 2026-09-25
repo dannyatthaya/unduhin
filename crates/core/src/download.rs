@@ -1956,35 +1956,103 @@ async fn move_into_folder(from: &Path, dest_dir: &Path) -> PathBuf {
 /// Returns the path the file ended up at, or `from` unchanged on any IO
 /// failure (so the DB keeps pointing at the real file rather than a path that
 /// doesn't exist). [`move_into_folder`] is the keep-the-current-name case.
+///
+/// Never overwrites anything: each candidate name is claimed with
+/// [`move_no_clobber`], and a name that turns out to be taken — even one
+/// that appeared a moment ago — just moves on to the next ` (n)`.
 async fn move_renamed(from: &Path, dest_dir: &Path, new_name: &std::ffi::OsStr) -> PathBuf {
     if tokio::fs::create_dir_all(dest_dir).await.is_err() {
         return from.to_path_buf();
     }
-    let mut dest = dest_dir.join(new_name);
-    if dest == from {
+    let first = dest_dir.join(new_name);
+    if first == from {
         return from.to_path_buf();
     }
-    if tokio::fs::metadata(&dest).await.is_ok() {
-        dest = dedupe_path(dest_dir, new_name).await;
-    }
-    match tokio::fs::rename(from, &dest).await {
-        Ok(()) => dest,
-        // Cross-volume rename fails on Windows; fall back to copy + delete.
-        Err(_) => match tokio::fs::copy(from, &dest).await {
-            Ok(_) => {
-                let _ = tokio::fs::remove_file(from).await;
-                dest
-            }
+    for i in 0..1000 {
+        let dest = if i == 0 {
+            first.clone()
+        } else {
+            dedup_candidate(dest_dir, new_name, i)
+        };
+        match move_no_clobber(from, &dest).await {
+            Ok(()) => return dest,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => {
                 tracing::warn!(error = %e, from = %from.display(), to = %dest.display(),
-                    "failed to move completed download to learned path");
-                from.to_path_buf()
+                    "failed to move completed download");
+                return from.to_path_buf();
             }
-        },
+        }
+    }
+    tracing::warn!(from = %from.display(), dir = %dest_dir.display(),
+        "no free name to move the completed download to; leaving it in place");
+    from.to_path_buf()
+}
+
+/// `stem (n).ext` for the `n`th collision on `file_name`.
+fn dedup_candidate(dir: &Path, file_name: &std::ffi::OsStr, n: usize) -> PathBuf {
+    let name = Path::new(file_name);
+    let stem = name
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    match name.extension() {
+        Some(e) => dir.join(format!("{stem} ({n}).{}", e.to_string_lossy())),
+        None => dir.join(format!("{stem} ({n})")),
     }
 }
 
-/// Inverse of the `stem (n).ext` de-dup that [`dedupe_path`] /
+/// Move `from` to `dest`, failing with `AlreadyExists` instead of replacing
+/// anything already there.
+///
+/// A plain rename replaces an existing destination on every platform
+/// (`MoveFileEx(MOVEFILE_REPLACE_EXISTING)` on Windows), so checking first
+/// and renaming second can still clobber a file that appears in between.
+/// Instead the name is claimed with `create_new` — atomic, and refused if
+/// anything exists — and the rename then only ever replaces that empty
+/// placeholder of our own.
+///
+/// Across volumes the file is copied in next to the placeholder and swapped
+/// into place (`fs::copy` keeps the Mark-of-the-Web stream and extended
+/// attributes). If the original cannot be removed afterwards the copy is
+/// discarded, so there are never two copies with the row pointing at one.
+async fn move_no_clobber(from: &Path, dest: &Path) -> std::io::Result<()> {
+    tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)
+        .await?;
+    let moved = match tokio::fs::rename(from, dest).await {
+        Ok(()) => Ok(()),
+        Err(_) => copy_over_placeholder(from, dest).await,
+    };
+    if moved.is_err() {
+        let _ = tokio::fs::remove_file(dest).await;
+    }
+    moved
+}
+
+async fn copy_over_placeholder(from: &Path, dest: &Path) -> std::io::Result<()> {
+    let tmp = {
+        let mut name = std::ffi::OsString::from(".");
+        name.push(dest.file_name().unwrap_or_default());
+        name.push(format!(".{}.unduhin-move", std::process::id()));
+        dest.with_file_name(name)
+    };
+    if let Err(e) = tokio::fs::copy(from, &tmp).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(e);
+    }
+    if let Err(e) = tokio::fs::rename(&tmp, dest).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(e);
+    }
+    // Only now is the original redundant. If it will not go (locked by a
+    // scanner, say), the caller removes the copy and the file stays put.
+    tokio::fs::remove_file(from).await
+}
+
+/// Inverse of the `stem (n).ext` de-dup that [`move_renamed`] /
 /// [`resolve_unique_output_path`] apply: strip a trailing " (n)" from the stem,
 /// preserving the extension. "download (1)" → "download", "clip (2).mp4" →
 /// "clip.mp4", "file.zip" → "file.zip" (unchanged), "My File (final).pdf" →
@@ -2010,27 +2078,6 @@ fn strip_dedup_suffix(name: &str) -> String {
         Some(e) => format!("{base}.{e}"),
         None => base.to_string(),
     }
-}
-
-/// Find the first non-colliding `stem (n).ext` path in `dir`.
-async fn dedupe_path(dir: &Path, file_name: &std::ffi::OsStr) -> PathBuf {
-    let name = Path::new(file_name);
-    let stem = name
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let ext = name.extension().map(|e| e.to_string_lossy().into_owned());
-    for i in 1..1000 {
-        let candidate_name = match &ext {
-            Some(e) => format!("{stem} ({i}).{e}"),
-            None => format!("{stem} ({i})"),
-        };
-        let candidate = dir.join(candidate_name);
-        if tokio::fs::metadata(&candidate).await.is_err() {
-            return candidate;
-        }
-    }
-    dir.join(file_name)
 }
 
 /// Mark a download `completed`. Called by the queue manager.
@@ -5065,5 +5112,73 @@ mod tests {
     #[test]
     fn escape_like_escapes_wildcards() {
         assert_eq!(escape_like(r"C:\a_b%c"), r"C:\\a\_b\%c");
+    }
+
+    // ---- Moving without overwriting ------------------------------------------
+
+    /// With every candidate name taken, the file stays where it is. The old
+    /// fallback moved it onto the plain name anyway, replacing the file
+    /// already there.
+    #[tokio::test]
+    async fn move_renamed_never_overwrites_when_every_name_is_taken() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        let dst_dir = tmp.path().join("dst");
+        tokio::fs::create_dir_all(&src_dir).await.unwrap();
+        tokio::fs::create_dir_all(&dst_dir).await.unwrap();
+        let src = src_dir.join("a.bin");
+        tokio::fs::write(&src, b"new").await.unwrap();
+        tokio::fs::write(dst_dir.join("a.bin"), b"keep")
+            .await
+            .unwrap();
+        for i in 1..1000 {
+            tokio::fs::write(dst_dir.join(format!("a ({i}).bin")), b"keep")
+                .await
+                .unwrap();
+        }
+
+        let moved = move_into_folder(&src, &dst_dir).await;
+
+        assert_eq!(moved, src, "must stay put");
+        assert_eq!(tokio::fs::read(&src).await.unwrap(), b"new");
+        assert_eq!(
+            tokio::fs::read(dst_dir.join("a.bin")).await.unwrap(),
+            b"keep"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_no_clobber_refuses_an_existing_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, dst) = (tmp.path().join("src.bin"), tmp.path().join("dst.bin"));
+        tokio::fs::write(&src, b"new").await.unwrap();
+        tokio::fs::write(&dst, b"keep").await.unwrap();
+
+        let err = move_no_clobber(&src, &dst).await.unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(tokio::fs::read(&dst).await.unwrap(), b"keep");
+        assert!(src.exists());
+    }
+
+    /// The cross-volume path, driven directly: the bytes land on the
+    /// claimed name, the original goes, and no temp file is left behind.
+    #[tokio::test]
+    async fn copy_over_placeholder_replaces_only_the_placeholder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, dst) = (tmp.path().join("src.bin"), tmp.path().join("dst.bin"));
+        tokio::fs::write(&src, b"payload").await.unwrap();
+        tokio::fs::write(&dst, b"").await.unwrap(); // the claimed placeholder
+
+        copy_over_placeholder(&src, &dst).await.unwrap();
+
+        assert_eq!(tokio::fs::read(&dst).await.unwrap(), b"payload");
+        assert!(!src.exists());
+        let mut entries = tokio::fs::read_dir(tmp.path()).await.unwrap();
+        let mut names = Vec::new();
+        while let Some(e) = entries.next_entry().await.unwrap() {
+            names.push(e.file_name().to_string_lossy().into_owned());
+        }
+        assert_eq!(names, vec!["dst.bin".to_string()]);
     }
 }
