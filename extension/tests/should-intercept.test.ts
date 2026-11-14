@@ -8,6 +8,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  looksLikeBrowserSaveAs,
   shouldIntercept,
   type InterceptInputs,
 } from "../src/background/intercept-rules.js";
@@ -239,5 +240,40 @@ describe("shouldIntercept", () => {
         }),
       ),
     ).toEqual({ kind: "intercept" });
+  });
+});
+
+describe("looksLikeBrowserSaveAs", () => {
+  it("passes through an image the page displayed and nothing navigated to", () => {
+    expect(looksLikeBrowserSaveAs({ mime: "image/png", lastRequestType: "image" })).toBe(true);
+  });
+
+  it("passes through a video the page was playing", () => {
+    expect(looksLikeBrowserSaveAs({ mime: "video/mp4", lastRequestType: "media" })).toBe(true);
+  });
+
+  it("passes through an image with no tab request on record", () => {
+    expect(looksLikeBrowserSaveAs({ mime: "IMAGE/JPEG", lastRequestType: null })).toBe(true);
+  });
+
+  it("passes through an image whose only request on record is not a navigation", () => {
+    expect(looksLikeBrowserSaveAs({ mime: "image/webp", lastRequestType: "other" })).toBe(true);
+  });
+
+  it("captures an image the user navigated to", () => {
+    expect(looksLikeBrowserSaveAs({ mime: "image/png", lastRequestType: "main_frame" })).toBe(
+      false,
+    );
+  });
+
+  it("captures a non-image download with no tab request on record", () => {
+    expect(looksLikeBrowserSaveAs({ mime: "application/zip", lastRequestType: null })).toBe(false);
+    expect(looksLikeBrowserSaveAs({ mime: "", lastRequestType: null })).toBe(false);
+  });
+
+  it("captures an ordinary link-click download", () => {
+    expect(
+      looksLikeBrowserSaveAs({ mime: "application/zip", lastRequestType: "main_frame" }),
+    ).toBe(false);
   });
 });

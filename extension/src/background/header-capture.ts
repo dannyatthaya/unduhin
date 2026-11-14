@@ -38,16 +38,47 @@ const STRIP = new Set([
   "connection",
   "proxy-authorization",
   "proxy-authenticate",
+  // Conditional / range headers describe the BROWSER's cache and its own
+  // partial copy, not ours. Replayed by the engine they turn a download into
+  // a `304 Not Modified` (no body) or pin a range to a validator we never saw.
+  "if-none-match",
+  "if-modified-since",
+  "if-match",
+  "if-unmodified-since",
+  "if-range",
+  "range",
 ]);
+
+/**
+ * How long we remember what KIND of request a tab made for a URL. Much
+ * longer than the header TTL on purpose: "Save image as…" is routinely used
+ * minutes after the page loaded the image, and the answer is only useful if
+ * it is still here by then.
+ */
+const TYPE_TTL_MS = 30 * 60_000;
+const MAX_TYPE_ENTRIES = 4000;
 
 interface CacheEntry {
   readonly headers: readonly chrome.webRequest.HttpHeader[];
   readonly expiresAt: number;
 }
 
+interface TypeEntry {
+  readonly type: chrome.webRequest.ResourceType;
+  readonly expiresAt: number;
+}
+
 export interface HeaderCache {
   /** Returns a copy of cached headers for `url` or `null` if absent/expired. */
   getHeadersFor(url: string): chrome.webRequest.HttpHeader[] | null;
+  /**
+   * How a tab most recently requested `url` — `"image"` / `"media"` when the
+   * page loaded it as a picture or a player source, `"main_frame"` when the
+   * user navigated to it, and so on. `null` when no tab requested it within
+   * the last {@link TYPE_TTL_MS}. The interceptor uses this to tell a link
+   * click from the browser's own "Save image as…".
+   */
+  getResourceTypeFor(url: string): chrome.webRequest.ResourceType | null;
   /** Number of live (non-expired) entries — exported for tests / debugging. */
   size(): number;
   /** Tear down listeners. Currently only used for tests. */
@@ -59,12 +90,24 @@ export function installHeaderCapture(): HeaderCache {
   // on each write we delete-then-set so the most recently touched URL
   // ends up last. On overflow, we evict the head (least recently used).
   const cache = new Map<string, CacheEntry>();
+  // Same LRU discipline as `cache`, but tracking only the resource type and
+  // kept far longer — see `TYPE_TTL_MS`.
+  const types = new Map<string, TypeEntry>();
 
   const listener = (
     details: chrome.webRequest.WebRequestHeadersDetails,
   ): void => {
-    if (!details.requestHeaders) return;
     if (details.tabId < 0) return; // service worker / extension internal — skip.
+
+    types.delete(details.url);
+    types.set(details.url, { type: details.type, expiresAt: Date.now() + TYPE_TTL_MS });
+    while (types.size > MAX_TYPE_ENTRIES) {
+      const oldest = types.keys().next().value;
+      if (oldest === undefined) break;
+      types.delete(oldest);
+    }
+
+    if (!details.requestHeaders) return;
 
     const filtered: chrome.webRequest.HttpHeader[] = [];
     for (const h of details.requestHeaders) {
@@ -117,6 +160,17 @@ export function installHeaderCapture(): HeaderCache {
       // Return a shallow copy so callers can't mutate the cached slot.
       return entry.headers.map((h) => ({ ...h }));
     },
+    getResourceTypeFor(url) {
+      const hash = url.indexOf("#");
+      const key = hash >= 0 ? url.slice(0, hash) : url;
+      const entry = types.get(key);
+      if (!entry) return null;
+      if (entry.expiresAt < Date.now()) {
+        types.delete(key);
+        return null;
+      }
+      return entry.type;
+    },
     size() {
       let n = 0;
       const now = Date.now();
@@ -128,6 +182,7 @@ export function installHeaderCapture(): HeaderCache {
     dispose() {
       chrome.webRequest.onBeforeSendHeaders.removeListener(listener);
       cache.clear();
+      types.clear();
     },
   };
 }

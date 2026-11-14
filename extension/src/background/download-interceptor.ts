@@ -39,7 +39,11 @@ import { buildCookieHeader } from "./cookie-forwarder.js";
 import type { HeaderCache } from "./header-capture.js";
 import type { NativeBridge } from "./native-bridge.js";
 import type { ArmedRefresh, RefreshArmTable } from "./refresh-arm.js";
-import { shouldIntercept, type ShouldInterceptDecision } from "./intercept-rules.js";
+import {
+  looksLikeBrowserSaveAs,
+  shouldIntercept,
+  type ShouldInterceptDecision,
+} from "./intercept-rules.js";
 import { recordRuleHit } from "./rule-metrics.js";
 import type { SettingsReader } from "../shared/settings.js";
 
@@ -177,6 +181,16 @@ export function installDownloadInterceptor(deps: InterceptorDeps): void {
       return; // let Chrome name + save it normally (dialog included).
     }
 
+    // The browser's own "Save image as…" / "Save video as…". The user picked
+    // the browser's save on purpose (ours is right next to it in the same
+    // menu), so honour that. An always-intercept host still wins — that rule
+    // is an explicit "everything from here goes to Unduhin".
+    const hostForced = decision.kind === "intercept" && decision.matchedPattern !== undefined;
+    if (!hostForced && isBrowserSaveAs(item, url, deps.headerCache)) {
+      log.debug("passthrough: browser save-as →", url);
+      return;
+    }
+
     // Bridge unreachable: do NOT hold. The user's download proceeds in the
     // browser, and we toast once per session so they know why we let it go.
     if (!deps.bridge.isHealthy()) {
@@ -198,6 +212,21 @@ export function installDownloadInterceptor(deps: InterceptorDeps): void {
   // is accepted by the void-returning-callback rule and honoured at runtime.
   chrome.downloads.onDeterminingFilename.addListener(onDetermining);
   log.info("download-interceptor installed (onDeterminingFilename barrier)");
+}
+
+/**
+ * Wire `looksLikeBrowserSaveAs` to what the header capture saw. The URL the
+ * page displayed is the pre-redirect one, so that is checked first; the
+ * post-redirect URL is the fallback.
+ */
+function isBrowserSaveAs(
+  item: chrome.downloads.DownloadItem,
+  finalUrl: string,
+  headerCache: HeaderCache,
+): boolean {
+  const lastRequestType =
+    headerCache.getResourceTypeFor(item.url ?? "") ?? headerCache.getResourceTypeFor(finalUrl);
+  return looksLikeBrowserSaveAs({ mime: item.mime ?? "", lastRequestType });
 }
 
 /** Cancel the browser's copy of `id`, then erase it from the shelf when

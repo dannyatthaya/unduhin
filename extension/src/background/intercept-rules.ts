@@ -125,6 +125,48 @@ export function shouldIntercept(input: InterceptInputs): ShouldInterceptDecision
     : { kind: "intercept" };
 }
 
+export interface SaveAsInputs {
+  /** `DownloadItem.mime`, or empty when Chrome did not report one. */
+  readonly mime: string;
+  /**
+   * How a tab most recently requested this URL (`webRequest` resource type),
+   * or `null` when no tab request for it is on record.
+   */
+  readonly lastRequestType: string | null;
+}
+
+/** Resource types a page uses to DISPLAY something, as opposed to navigating to it. */
+const DISPLAY_TYPES = new Set(["image", "media"]);
+
+/** Resource types that mean the user went TO the URL (a link click, an address-bar load). */
+const NAVIGATION_TYPES = new Set(["main_frame", "sub_frame"]);
+
+/**
+ * Does this download look like the browser's own "Save image as…" /
+ * "Save video as…" rather than a link the user clicked to download?
+ *
+ * `chrome.downloads` reports both identically, so this reads the one trace
+ * that differs: how the page last asked for the URL.
+ *
+ *   - The page loaded it as a picture or a player source (`image` / `media`)
+ *     and nothing navigated to it since → the user is saving something they
+ *     are looking at. Leave it to the browser.
+ *   - It is an image and no tab navigated to it → same conclusion. An image
+ *     only becomes a click-download through a navigation, which would be on
+ *     record. (Image subresource loads are not observed at all — see
+ *     `request-types.ts` — so "no navigation on record" is the signal.)
+ *
+ * Anything else — including every non-image download with no request on
+ * record — is NOT treated as a save-as, so an unknown case keeps being
+ * captured exactly as before.
+ */
+export function looksLikeBrowserSaveAs(input: SaveAsInputs): boolean {
+  const { mime, lastRequestType } = input;
+  if (lastRequestType !== null && DISPLAY_TYPES.has(lastRequestType)) return true;
+  if (!mime.toLowerCase().startsWith("image/")) return false;
+  return lastRequestType === null || !NAVIGATION_TYPES.has(lastRequestType);
+}
+
 function filenameExt(filename: string): string {
   if (!filename) return "";
   // Strip any path separators a server-suggested filename might smuggle in.
