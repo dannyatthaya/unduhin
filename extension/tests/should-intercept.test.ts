@@ -8,6 +8,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  isReplayableMethod,
   looksLikeBrowserSaveAs,
   shouldIntercept,
   type InterceptInputs,
@@ -275,5 +276,18 @@ describe("looksLikeBrowserSaveAs", () => {
     expect(
       looksLikeBrowserSaveAs({ mime: "application/zip", lastRequestType: "main_frame" }),
     ).toBe(false);
+  });
+});
+
+describe("isReplayableMethod", () => {
+  it("captures a GET, and a download nothing was observed for", () => {
+    expect(isReplayableMethod("GET")).toBe(true);
+    expect(isReplayableMethod("HEAD")).toBe(true);
+    expect(isReplayableMethod(null)).toBe(true);
+  });
+
+  it("leaves a form-POST download to the browser", () => {
+    expect(isReplayableMethod("POST")).toBe(false);
+    expect(isReplayableMethod("PUT")).toBe(false);
   });
 });

@@ -150,7 +150,7 @@ referrerOrigin: string | null,
 /**
  * Unix epoch milliseconds after which the extension drops the entry.
  */
-expiresAtMs: number, } | { "type": "refreshCredentials", token: string, downloadId: number, url: string, };
+expiresAtMs: number, } | { "type": "refreshCredentials", token: string, downloadId: number, url: string, } | { "type": "downloadInBrowser", downloadId: number, url: string, };
 
 export const HOST_NAME = "com.unduhin.host" as const;
 export const ALLOWED_DEV_EXTENSION_ID = "blbgjagjodpiiclpecohlfhebgddkejn" as const;

@@ -22,6 +22,25 @@ import type {
 
 export const SETTINGS_KEY = "settings";
 
+/**
+ * File extensions captured out of the box: what a download manager is for
+ * (archives, installers, disk images, video, audio, office files, torrents).
+ * Everything else — a page's images, a receipt PDF, a JSON export — stays
+ * with the browser until the user adds its extension.
+ *
+ * Only a FRESH install starts with this list: `mergeWithDefaults` keeps any
+ * stored array, including the empty one that means "every type".
+ * Mirrors `DEFAULT_FILE_TYPES` in `crates/core/src/wire.rs`.
+ */
+export const DEFAULT_FILE_TYPES: readonly string[] = [
+  "zip", "rar", "7z", "gz", "tgz", "bz2", "xz", "tar", "iso", "img",
+  "exe", "msi", "msix", "dmg", "pkg", "deb", "rpm", "apk", "appimage", "bin",
+  "mp4", "mkv", "webm", "mov", "avi", "wmv", "flv", "m4v", "mpg", "mpeg",
+  "mp3", "flac", "wav", "m4a", "aac", "ogg", "opus",
+  "epub", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "csv",
+  "torrent",
+];
+
 export const DEFAULT_SETTINGS: Settings = {
   enabled: true,
   nativeHostName: "com.unduhin.host",
@@ -37,7 +56,7 @@ export const DEFAULT_SETTINGS: Settings = {
   installContextMenu: true,
   hideShelf: true,
   forwardCookies: true,
-  fileTypes: [],
+  fileTypes: DEFAULT_FILE_TYPES,
 };
 
 export async function loadSettings(): Promise<Settings> {

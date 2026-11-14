@@ -34,7 +34,10 @@ import { buildCookieHeader } from "./cookie-forwarder.js";
 import { createRefreshArmTable } from "./refresh-arm.js";
 import { createNativeBridge } from "./native-bridge.js";
 import type { NativeBridge } from "./native-bridge.js";
-import { installDownloadInterceptor } from "./download-interceptor.js";
+import {
+  downloadInBrowserInstead,
+  installDownloadInterceptor,
+} from "./download-interceptor.js";
 import { installMediaSniffer } from "./media-sniffer.js";
 import {
   labelFor,
@@ -158,6 +161,14 @@ const rawBridge = createNativeBridge(
     // jar is always live, so this needs no page and no tab.
     if (msg.type === "refreshCredentials") {
       void handleRefreshCredentials(msg.token, msg.downloadId, msg.url);
+      return;
+    }
+    // The app could not fetch a download we captured (a host that only
+    // serves a real browser, a link that was single-use). Take it back.
+    if (msg.type === "downloadInBrowser") {
+      void downloadInBrowserInstead(msg.downloadId, msg.url).catch((err) =>
+        log.warn("downloadInBrowser failed", err),
+      );
       return;
     }
     // `handoffDecision` frames are vestigial — the app no longer drives the

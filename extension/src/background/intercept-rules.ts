@@ -167,6 +167,23 @@ export function looksLikeBrowserSaveAs(input: SaveAsInputs): boolean {
   return lastRequestType === null || !NAVIGATION_TYPES.has(lastRequestType);
 }
 
+/**
+ * Can the app replay the request that produced this download?
+ *
+ * It replays a plain GET of the URL. A download that is the response to a
+ * form submission (an export button, "generate report", some file hosts)
+ * needs the POST and its body, which are never captured — replayed as a GET
+ * it comes back as an error or as the page holding the form. Those stay
+ * with the browser.
+ *
+ * `method` is how a tab last requested the URL, or `null` when nothing is on
+ * record. Unknown is treated as replayable, so a download we simply did not
+ * observe keeps being captured as before.
+ */
+export function isReplayableMethod(method: string | null): boolean {
+  return method === null || method === "GET" || method === "HEAD";
+}
+
 function filenameExt(filename: string): string {
   if (!filename) return "";
   // Strip any path separators a server-suggested filename might smuggle in.

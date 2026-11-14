@@ -129,3 +129,17 @@ fn outbound_status_fixture() {
 fn outbound_error_fixture() {
     round_trip_outbound("outbound_error.json");
 }
+
+#[test]
+fn outbound_download_in_browser_fixture() {
+    round_trip_outbound("outbound_download_in_browser.json");
+    let parsed: Outbound =
+        serde_json::from_str(&read("outbound_download_in_browser.json")).expect("parse");
+    match parsed {
+        Outbound::DownloadInBrowser { download_id, url } => {
+            assert_eq!(download_id, 42);
+            assert_eq!(url, "https://files.example.com/get/abc123");
+        }
+        other => panic!("wrong variant: {other:?}"),
+    }
+}

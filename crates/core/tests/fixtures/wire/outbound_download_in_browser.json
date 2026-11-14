@@ -1,0 +1,5 @@
+{
+  "type": "downloadInBrowser",
+  "downloadId": 42,
+  "url": "https://files.example.com/get/abc123"
+}

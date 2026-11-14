@@ -40,6 +40,7 @@ import type { HeaderCache } from "./header-capture.js";
 import type { NativeBridge } from "./native-bridge.js";
 import type { ArmedRefresh, RefreshArmTable } from "./refresh-arm.js";
 import {
+  isReplayableMethod,
   looksLikeBrowserSaveAs,
   shouldIntercept,
   type ShouldInterceptDecision,
@@ -188,6 +189,15 @@ export function installDownloadInterceptor(deps: InterceptorDeps): void {
     const hostForced = decision.kind === "intercept" && decision.matchedPattern !== undefined;
     if (!hostForced && isBrowserSaveAs(item, url, deps.headerCache)) {
       log.debug("passthrough: browser save-as →", url);
+      return;
+    }
+
+    // A download that answers a form POST. The app could only replay it as
+    // a GET, which the server would refuse. Unlike the save-as check this is
+    // not a preference but a capability limit, so no host rule overrides it.
+    const method = deps.headerCache.getRequestMethodFor(url);
+    if (!isReplayableMethod(method)) {
+      log.debug(`passthrough: ${method} download cannot be replayed →`, url);
       return;
     }
 
@@ -521,6 +531,38 @@ function notifyRejected(title: string, message: string): void {
   } catch (err) {
     log.warn("notifications.create failed", err);
   }
+}
+
+/** Rows the app already handed back in this service-worker session. */
+const handedBack = new Set<number>();
+
+/**
+ * The app could not fetch a download we handed it and asked for it back
+ * (`Outbound::DownloadInBrowser`). Start it in the browser and let it
+ * through — the browser has the session and the page context the app's own
+ * client lacks.
+ *
+ * `url` comes off the pipe, so it is checked like any other untrusted input:
+ * only an http(s) URL is ever handed to `chrome.downloads.download`.
+ */
+export async function downloadInBrowserInstead(downloadId: number, url: string): Promise<void> {
+  // One hand-back per row, whatever the app or the transport repeats.
+  if (handedBack.has(downloadId)) {
+    log.debug("downloadInBrowser: already handled for", downloadId);
+    return;
+  }
+  handedBack.add(downloadId);
+  const target = stripFragment(url);
+  if (!/^https?:\/\//i.test(target)) {
+    log.warn("downloadInBrowser: ignoring a non-http URL");
+    return;
+  }
+  log.info("app handed the download back; starting it in the browser:", target);
+  notifyRejected(
+    "Download handed back to the browser",
+    "Unduhin couldn't fetch this file, so the browser is downloading it instead.",
+  );
+  await redownloadInBrowser(target);
 }
 
 export { shouldIntercept } from "./intercept-rules.js";

@@ -355,6 +355,21 @@ pub struct ExtensionSettings {
     pub file_types: Vec<String>,
 }
 
+/// File extensions captured out of the box: the things a download manager
+/// is for (archives, installers, disk images, video, audio, office files,
+/// torrents). Everything else — a page's images, a receipt PDF, a JSON
+/// export — stays with the browser until the user adds its extension.
+///
+/// Only a FRESH install starts with this list. An existing install keeps
+/// whatever it stored, including the empty list that means "every type".
+/// Mirrors `DEFAULT_FILE_TYPES` in `extension/src/shared/settings.ts`.
+pub const DEFAULT_FILE_TYPES: &[&str] = &[
+    "zip", "rar", "7z", "gz", "tgz", "bz2", "xz", "tar", "iso", "img", "exe", "msi", "msix", "dmg",
+    "pkg", "deb", "rpm", "apk", "appimage", "bin", "mp4", "mkv", "webm", "mov", "avi", "wmv",
+    "flv", "m4v", "mpg", "mpeg", "mp3", "flac", "wav", "m4a", "aac", "ogg", "opus", "epub", "doc",
+    "docx", "xls", "xlsx", "ppt", "pptx", "csv", "torrent",
+];
+
 impl ExtensionSettings {
     /// The canonical default shape. Matches `DEFAULT_SETTINGS` in
     /// `extension/src/shared/settings.ts` byte-for-byte so a fresh
@@ -376,7 +391,7 @@ impl ExtensionSettings {
             install_context_menu: true,
             hide_shelf: true,
             forward_cookies: true,
-            file_types: Vec::new(),
+            file_types: DEFAULT_FILE_TYPES.iter().map(|s| s.to_string()).collect(),
         }
     }
 
@@ -698,6 +713,20 @@ pub enum Outbound {
         download_id: i64,
         url: String,
     },
+    /// The app could not fetch a download the browser handed it (the host
+    /// answered 401 / 403 / 410, or served a page in place of the file), and
+    /// its own recoveries are spent. Ask the extension to start `url` in the
+    /// browser instead, which has the session, the TLS fingerprint and the
+    /// page context the app's client lacks.
+    ///
+    /// Fire-and-forget: there is no reply. The extension lets the resulting
+    /// download through without capturing it again.
+    #[serde(rename_all = "camelCase")]
+    DownloadInBrowser {
+        #[cfg_attr(feature = "ts-rs-export", ts(type = "number"))]
+        download_id: i64,
+        url: String,
+    },
 }
 
 impl Outbound {
@@ -718,6 +747,7 @@ impl Outbound {
                 | Outbound::ExtensionUpdated { .. }
                 | Outbound::ArmRefresh { .. }
                 | Outbound::RefreshCredentials { .. }
+                | Outbound::DownloadInBrowser { .. }
         )
     }
 }
@@ -1117,6 +1147,10 @@ mod tests {
                 download_id: 1,
                 url: "https://example.com/".into(),
             },
+            Outbound::DownloadInBrowser {
+                download_id: 1,
+                url: "https://example.com/".into(),
+            },
         ];
         for msg in &all {
             match msg {
@@ -1130,7 +1164,8 @@ mod tests {
                 | Outbound::ExtensionUpdated { .. }
                 | Outbound::MediaFormats { .. }
                 | Outbound::ArmRefresh { .. }
-                | Outbound::RefreshCredentials { .. } => {}
+                | Outbound::RefreshCredentials { .. }
+                | Outbound::DownloadInBrowser { .. } => {}
             }
         }
         all

@@ -14,6 +14,7 @@
 //! either way. That is why the dispatch, caching, and broadcast code below
 //! carries no `cfg` at all.
 
+pub mod rescue;
 mod transport;
 
 use std::path::PathBuf;
@@ -288,6 +289,29 @@ async fn broadcast(frame: unduhin_core::wire::Outbound, label: &str) {
             tracing::debug!(error = %e, label, "broadcast write failed (client likely gone)");
         }
     }
+}
+
+/// Write one unsolicited frame to a single client. Best-effort, like
+/// [`broadcast`].
+async fn send_to(client: &Arc<ClientWriter>, frame: unduhin_core::wire::Outbound, label: &str) {
+    use unduhin_core::wire::framing::write_frame;
+
+    let bytes = match serde_json::to_vec(&frame) {
+        Ok(buf) => buf,
+        Err(e) => {
+            tracing::warn!(error = %e, label, "serialize outbound frame failed");
+            return;
+        }
+    };
+    let mut writer = client.lock().await;
+    if let Err(e) = write_frame(&mut *writer, &bytes).await {
+        tracing::debug!(error = %e, label, "write failed (client likely gone)");
+    }
+}
+
+/// The most recently connected client, if any is connected.
+async fn latest_client() -> Option<Arc<ClientWriter>> {
+    connected_clients().lock().await.last().cloned()
 }
 
 /// Broadcast a `SettingsChanged { full }` frame. Public so Tauri commands can
@@ -646,8 +670,14 @@ async fn handle_connection(stream: ServerStream, core: Core) -> std::io::Result<
             // full snapshot out to every other connected client so
             // their UI stays consistent.
             let broadcast_after = matches!(inbound, Inbound::SetSettings { .. });
+            let is_capture = matches!(inbound, Inbound::Download { .. });
 
             let response = dispatch(&core, inbound).await;
+            // Remember which browser this capture came from: if the app has
+            // to hand it back, only that browser should start it.
+            if let (true, Outbound::Ack { id }) = (is_capture, &response) {
+                rescue::set_client(*id, &writer).await;
+            }
             let buf = serde_json::to_vec(&response).unwrap_or_else(|_| {
                 br#"{"type":"error","message":"serialize Outbound failed"}"#.to_vec()
             });
@@ -812,7 +842,7 @@ async fn handle_download(
 
     let input = unduhin_core::AddDownload {
         url,
-        filename: job.filename,
+        filename: job.filename.clone(),
         output_path: None,
         output_dir: None,
         category: None,
@@ -828,7 +858,11 @@ async fn handle_download(
         kind: unduhin_core::DownloadKind::Http,
         torrent: None,
     };
-    core.add_download(input).await.map_err(|e| format!("{e}"))
+    let id = core.add_download(input).await.map_err(|e| format!("{e}"))?;
+    // Remember the capture so a failure in the next while can be rescued
+    // (see `rescue`) instead of just sitting there failed.
+    rescue::note_capture(id, &job).await;
+    Ok(id)
 }
 
 /// Fold a re-captured job into an EXISTING row rather than adding one.
@@ -946,18 +980,25 @@ async fn handle_credentials_refreshed(
     };
     let headers = unduhin_core::wire::headers_from_job(&job);
 
-    core.refresh_source(
-        download_id,
-        &record.url,
-        if headers.is_empty() {
-            None
-        } else {
-            Some(headers)
-        },
-        false,
-    )
-    .await
-    .map_err(|e| format!("{e}"))?;
+    let refreshed = core
+        .refresh_source(
+            download_id,
+            &record.url,
+            if headers.is_empty() {
+                None
+            } else {
+                Some(headers)
+            },
+            false,
+        )
+        .await;
+    if let Err(e) = refreshed {
+        // Fresh cookies did not open the link either. The row stays failed
+        // and emits no further event, so this is the last chance to give a
+        // recent capture back to the browser.
+        rescue::hand_back(core, download_id).await;
+        return Err(format!("{e}"));
+    }
     Ok(())
 }
 

@@ -73,6 +73,9 @@ export const UNSOLICITED_TYPES: ReadonlySet<Outbound["type"]> = new Set<Outbound
   // keeps them out of the reply FIFO, where they would hijack a pending ack.
   "armRefresh",
   "refreshCredentials",
+  // The app giving a download it could not fetch back to the browser.
+  // Fire-and-forget, like `armRefresh`.
+  "downloadInBrowser",
 ]);
 
 /** How long a request may wait for its reply before the port is torn down.
@@ -223,9 +226,25 @@ export function createNativeBridge(
     return true;
   }
 
-  async function connect(): Promise<void> {
-    if (port) return;
+  // The connect in flight, if any. `connect()` awaits before it opens the
+  // port, so without this every caller that arrives in that gap opens a port
+  // of its own — and the service worker boots with three sends at once
+  // (top-level, `onInstalled`, `onStartup`). Each extra port is a live native
+  // host with its own pipe connection, and every frame the app pushes is
+  // then handled once per port.
+  let connecting: Promise<void> | null = null;
+
+  function connect(): Promise<void> {
+    if (port) return Promise.resolve();
+    connecting ??= openPort().finally(() => {
+      connecting = null;
+    });
+    return connecting;
+  }
+
+  async function openPort(): Promise<void> {
     const hostName = await hostNameProvider();
+    if (port) return;
     log.info("bridge connectNative →", hostName);
     let opened: chrome.runtime.Port;
     try {

@@ -403,6 +403,8 @@ pub async fn start_handoff_download(
     })?;
     let headers = unduhin_core::wire::headers_from_job(&job);
     let category = category_id.map(CategorySelector::Id);
+    // Kept for `rescue::note_capture`: the job is consumed piecemeal below.
+    let captured = job.clone();
 
     let id = core
         .add_download(AddDownload {
@@ -428,6 +430,7 @@ pub async fn start_handoff_download(
             torrent: None,
         })
         .await?;
+    crate::pipe::rescue::note_capture(id, &captured).await;
     Ok(id)
 }
 

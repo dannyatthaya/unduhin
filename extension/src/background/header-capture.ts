@@ -65,6 +65,8 @@ interface CacheEntry {
 
 interface TypeEntry {
   readonly type: chrome.webRequest.ResourceType;
+  /** HTTP method of that request, upper-cased (`GET`, `POST`, …). */
+  readonly method: string;
   readonly expiresAt: number;
 }
 
@@ -79,6 +81,12 @@ export interface HeaderCache {
    * click from the browser's own "Save image as…".
    */
   getResourceTypeFor(url: string): chrome.webRequest.ResourceType | null;
+  /**
+   * HTTP method a tab most recently used for `url` (`"GET"`, `"POST"`, …),
+   * or `null` when no tab request for it is on record. The app can only
+   * replay a GET, so the interceptor leaves anything else to the browser.
+   */
+  getRequestMethodFor(url: string): string | null;
   /** Number of live (non-expired) entries — exported for tests / debugging. */
   size(): number;
   /** Tear down listeners. Currently only used for tests. */
@@ -100,7 +108,11 @@ export function installHeaderCapture(): HeaderCache {
     if (details.tabId < 0) return; // service worker / extension internal — skip.
 
     types.delete(details.url);
-    types.set(details.url, { type: details.type, expiresAt: Date.now() + TYPE_TTL_MS });
+    types.set(details.url, {
+      type: details.type,
+      method: (details.method ?? "GET").toUpperCase(),
+      expiresAt: Date.now() + TYPE_TTL_MS,
+    });
     while (types.size > MAX_TYPE_ENTRIES) {
       const oldest = types.keys().next().value;
       if (oldest === undefined) break;
@@ -129,6 +141,19 @@ export function installHeaderCapture(): HeaderCache {
       cache.delete(oldest);
     }
   };
+
+  /** The unexpired request record for `url` (fragment ignored), if any. */
+  function liveTypeEntry(url: string): TypeEntry | null {
+    const hash = url.indexOf("#");
+    const key = hash >= 0 ? url.slice(0, hash) : url;
+    const entry = types.get(key);
+    if (!entry) return null;
+    if (entry.expiresAt < Date.now()) {
+      types.delete(key);
+      return null;
+    }
+    return entry;
+  }
 
   // `extraHeaders` is required to see Cookie / Referer / Authorization on
   // MV3 — without it Chrome hides them from the listener.
@@ -161,15 +186,10 @@ export function installHeaderCapture(): HeaderCache {
       return entry.headers.map((h) => ({ ...h }));
     },
     getResourceTypeFor(url) {
-      const hash = url.indexOf("#");
-      const key = hash >= 0 ? url.slice(0, hash) : url;
-      const entry = types.get(key);
-      if (!entry) return null;
-      if (entry.expiresAt < Date.now()) {
-        types.delete(key);
-        return null;
-      }
-      return entry.type;
+      return liveTypeEntry(url)?.type ?? null;
+    },
+    getRequestMethodFor(url) {
+      return liveTypeEntry(url)?.method ?? null;
     },
     size() {
       let n = 0;
