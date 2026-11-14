@@ -117,10 +117,26 @@ pub async fn store_extension_settings(full: ExtensionSettings) {
 /// have since paused. And its presence marks "already tried", which is what
 /// bounds the silent tier to one attempt: without that, a row whose cookies
 /// are genuinely dead would loop fail → refresh → fail forever.
-fn pending_credential_refresh() -> &'static AsyncMutex<std::collections::HashMap<i64, String>> {
-    static PENDING: OnceLock<AsyncMutex<std::collections::HashMap<i64, String>>> = OnceLock::new();
+///
+/// The entry therefore OUTLIVES its reply: answering it only flips
+/// `answered`, and the slot stays claimed until the row completes, is
+/// removed, or the user retries it by hand. Removing it on reply (as this
+/// once did) made every later failure look like a first attempt, which is
+/// exactly the endless fail → refresh → fail loop described above.
+fn pending_credential_refresh() -> &'static AsyncMutex<CredentialRefreshMap> {
+    static PENDING: OnceLock<AsyncMutex<CredentialRefreshMap>> = OnceLock::new();
     PENDING.get_or_init(|| AsyncMutex::new(std::collections::HashMap::new()))
 }
+
+/// One silent credential-refresh attempt for a download.
+struct CredentialRefresh {
+    /// Correlation tag echoed by the extension's reply.
+    token: String,
+    /// The reply was applied. A second reply with the same token is stale.
+    answered: bool,
+}
+
+type CredentialRefreshMap = std::collections::HashMap<i64, CredentialRefresh>;
 
 /// Claim the right to make one silent credential-refresh attempt for `id`.
 ///
@@ -147,7 +163,13 @@ pub async fn begin_credential_refresh(id: i64) -> Option<String> {
         "cred-{id}-{}",
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
-    guard.insert(id, token.clone());
+    guard.insert(
+        id,
+        CredentialRefresh {
+            token: token.clone(),
+            answered: false,
+        },
+    );
     Some(token)
 }
 
@@ -213,13 +235,17 @@ fn redacted_for_prompt(job: &unduhin_core::wire::DownloadJob) -> unduhin_core::w
     shown
 }
 
-/// Consume the pending entry for `id` when `token` matches. `false` means the
-/// reply is stale and must be ignored.
+/// Mark the pending entry for `id` answered when `token` matches. `false`
+/// means the reply is stale (superseded, or already applied) and must be
+/// ignored.
+///
+/// The entry is kept, not removed: it is what stops the next failure of the
+/// same row from starting another automatic attempt.
 async fn take_pending_credential_refresh(id: i64, token: &str) -> bool {
     let mut guard = pending_credential_refresh().lock().await;
-    match guard.get(&id) {
-        Some(t) if t == token => {
-            guard.remove(&id);
+    match guard.get_mut(&id) {
+        Some(entry) if entry.token == token && !entry.answered => {
+            entry.answered = true;
             true
         }
         _ => false,
@@ -227,8 +253,9 @@ async fn take_pending_credential_refresh(id: i64, token: &str) -> bool {
 }
 
 /// Drop any pending entry for `id`, re-allowing a future automatic attempt.
-/// Called when a download completes or is removed — the next failure is a new
-/// situation, not a repeat of the one already tried.
+/// Called when a download completes, is removed, or is retried / refreshed by
+/// the user — the next failure is a new situation, not a repeat of the one
+/// already tried.
 pub async fn forget_credential_refresh(id: i64) {
     pending_credential_refresh().lock().await.remove(&id);
 }
@@ -820,6 +847,9 @@ async fn handle_refresh_download(
     job: unduhin_core::wire::DownloadJob,
 ) -> Result<(), String> {
     let headers = unduhin_core::wire::headers_from_job(&job);
+    // The user repaired this row by hand, so its next expired-link failure is
+    // a new situation and may have its one silent credential refresh again.
+    forget_credential_refresh(download_id).await;
     let outcome = match core
         .refresh_source(
             download_id,

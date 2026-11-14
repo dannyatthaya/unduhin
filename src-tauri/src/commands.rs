@@ -469,6 +469,9 @@ pub async fn resume_download(core: State<'_, Core>, id: DownloadId) -> CommandRe
 
 #[tauri::command]
 pub async fn retry_download(core: State<'_, Core>, id: DownloadId) -> CommandResult<()> {
+    // A manual retry is a new situation: let the next expired-link failure
+    // have its one silent credential refresh again.
+    crate::pipe::forget_credential_refresh(id).await;
     Ok(core.retry(id).await?)
 }
 
@@ -495,6 +498,7 @@ pub async fn refresh_download_source(
     headers: Option<Vec<(String, String)>>,
     force_restart: Option<bool>,
 ) -> CommandResult<RefreshOutcome> {
+    crate::pipe::forget_credential_refresh(id).await;
     Ok(core
         .refresh_source(id, &url, headers, force_restart.unwrap_or(false))
         .await?)
