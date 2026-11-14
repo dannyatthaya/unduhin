@@ -29,7 +29,11 @@ import {
 import { formatBytes } from "@/lib/format";
 
 const { t } = useI18n();
-const props = defineProps<{ open: boolean }>();
+const props = defineProps<{
+  open: boolean;
+  /** Pre-fills the URL field when the dialog opens (a link pasted on the page). */
+  initialUrl?: string;
+}>();
 const emit = defineEmits<{ close: []; submitted: [id: number] }>();
 
 const downloads = useDownloadsStore();
@@ -101,7 +105,7 @@ watch(
   () => props.open,
   (v) => {
     if (v) {
-      url.value = "";
+      url.value = props.initialUrl ?? "";
       filename.value = "";
       categoryId.value = null;
       segments.value = null;

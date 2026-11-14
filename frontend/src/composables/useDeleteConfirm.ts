@@ -62,9 +62,22 @@ export function useDeleteConfirm() {
     req?.resolve(choice);
   }
 
-  async function requestDelete(ids: DownloadId[]): Promise<void> {
+  /** Forget rows without a prompt and without touching the files on disk. */
+  async function removeFromList(ids: DownloadId[]): Promise<void> {
     if (ids.length === 0) return;
-    const setting = readSetting();
+    await performDelete(ids, false);
+  }
+
+  /**
+   * `alwaysAsk` shows the dialog even when the user's default action would
+   * skip it — for call sites whose label promises a choice ("Delete files…").
+   */
+  async function requestDelete(
+    ids: DownloadId[],
+    options: { alwaysAsk?: boolean } = {},
+  ): Promise<void> {
+    if (ids.length === 0) return;
+    const setting = options.alwaysAsk ? "ask" : readSetting();
     if (setting === "row_only") {
       await performDelete(ids, false);
       return;
@@ -80,5 +93,5 @@ export function useDeleteConfirm() {
     await performDelete(ids, choice === "row_and_data");
   }
 
-  return { pending, requestDelete, answer };
+  return { pending, requestDelete, removeFromList, answer };
 }

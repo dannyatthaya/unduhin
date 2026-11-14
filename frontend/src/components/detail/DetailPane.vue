@@ -1,23 +1,28 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+// Details panel for one download. Docks to the right of the list (420px)
+// rather than floating over it: the list stays usable and simply drops
+// its Size and Added columns while the panel is open. Esc or ✕ closes it
+// (Esc is routed by DownloadsView, after "clear selection").
+
+import { computed, ref, type Component } from "vue";
 import { useI18n } from "vue-i18n";
-import { Clock, MoreHorizontal, Pause, Play, RotateCw, Trash2, X } from "lucide-vue-next";
+import { ExternalLink, Folder, MoreHorizontal, Pause, Play, RotateCw, X } from "lucide-vue-next";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 
 import DetailOverview from "./DetailOverview.vue";
 import DetailSegments from "./DetailSegments.vue";
 import DetailTorrent from "./DetailTorrent.vue";
 import DetailHistory from "./DetailHistory.vue";
+import KindBadge from "@/components/downloads/KindBadge.vue";
 import RowMenu from "@/components/RowMenu.vue";
 import ScheduleDialog from "@/components/ScheduleDialog.vue";
-import Drawer from "@/components/ui/Drawer.vue";
 
-import { useCategoriesStore } from "@/stores/categories";
 import { useDetailStore, type DetailTab } from "@/stores/detail";
 import { useDownloadsStore } from "@/stores/downloads";
+import { useElapsedSeconds } from "@/composables/useElapsed";
 import { useToast } from "@/composables/useToast";
 import { useDeleteConfirm } from "@/composables/useDeleteConfirm";
-import { relativeTime } from "@/lib/format";
+import { formatBytes, formatEta, formatSpeed, hostOf, percent } from "@/lib/format";
 import type { DownloadRecord } from "@/types/tauri-bindings";
 
 const { t } = useI18n();
@@ -25,7 +30,6 @@ const toast = useToast();
 
 const detail = useDetailStore();
 const downloads = useDownloadsStore();
-const categories = useCategoriesStore();
 const deleteConfirm = useDeleteConfirm();
 
 const record = computed<DownloadRecord | null>(() => {
@@ -34,12 +38,6 @@ const record = computed<DownloadRecord | null>(() => {
 });
 
 const scheduleOpen = ref(false);
-
-// The drawer is shown whenever a download is pinned. Selection and
-// detail are now independent surfaces — the floating batch bar pins
-// to the bottom and the drawer pins to the right, so they don't fight
-// for screen real estate.
-const drawerOpen = computed(() => record.value != null);
 
 const segmentsCount = computed(() => record.value?.segments ?? 0);
 const historyCount = computed(() =>
@@ -53,66 +51,30 @@ const torrentFileCount = computed(
   () => record.value?.torrent?.files?.length ?? 0
 );
 
-const tabs = computed<{ id: DetailTab; label: string; count?: () => number }[]>(() => [
+const tabs = computed<{ id: DetailTab; label: string; count?: number }[]>(() => [
   { id: "overview", label: t("detail.tabOverview") },
-  ...(isTorrent.value
-    ? [
-        {
-          id: "torrent" as const,
-          label: t("detail.tabTorrent"),
-          count: () => torrentFileCount.value,
-        },
-      ]
-    : [
-        {
-          id: "segments" as const,
-          label: t("detail.tabSegments"),
-          count: () => segmentsCount.value,
-        },
-      ]),
-  { id: "history", label: t("detail.tabHistory"), count: () => historyCount.value },
+  isTorrent.value
+    ? { id: "torrent", label: t("detail.tabTorrent"), count: torrentFileCount.value }
+    : { id: "segments", label: t("detail.tabSegments"), count: segmentsCount.value },
+  { id: "history", label: t("detail.tabHistory"), count: historyCount.value },
 ]);
 
-const breadcrumbs = computed(() => {
-  if (!record.value) return [];
-  const ext = (() => {
-    const i = record.value.filename.lastIndexOf(".");
-    if (i < 0) return "File";
-    return record.value.filename.slice(i + 1).toUpperCase();
-  })();
-  const cat = categories.nameOf(record.value.category_id).toUpperCase();
-  return [ext, cat];
-});
+// ── Progress block ──────────────────────────────────────────────────────────
 
-const startedAgo = computed(() =>
-  record.value ? relativeTime(record.value.created_at) : "—"
+const stats = computed(() =>
+  record.value ? downloads.statsFor(record.value.id) : undefined,
+);
+const pct = computed(() =>
+  record.value ? percent(record.value.downloaded_bytes, record.value.total_bytes) : 0,
+);
+const hasKnownSize = computed(
+  () => record.value?.total_bytes != null && record.value.total_bytes > 0,
 );
 
-const statusTone = computed(() => {
-  if (!record.value) return "bg-muted-foreground";
-  switch (record.value.status) {
-    case "active":
-      return "bg-primary";
-    case "muxing":
-      return "bg-info";
-    case "queued":
-      return "bg-muted-foreground";
-    case "paused":
-      return "bg-warning";
-    case "failed":
-      return "bg-danger";
-    case "completed":
-      return "bg-success";
-    default:
-      return "bg-muted-foreground";
-  }
-});
-
 const statusLabel = computed(() => {
-  if (!record.value) return "";
-  switch (record.value.status) {
+  switch (record.value?.status) {
     case "active":
-      return t("downloads.statusActive");
+      return t("downloads.groupDownloading");
     case "muxing":
       return t("downloads.statusMuxing");
     case "paused":
@@ -130,71 +92,143 @@ const statusLabel = computed(() => {
   }
 });
 
-const primaryActionLabel = computed(() => {
-  if (!record.value) return "";
-  switch (record.value.status) {
+/** "Downloading · 34%" — the percentage only while it says something. */
+const statusLine = computed(() => {
+  const status = record.value?.status;
+  const partial = status === "active" || status === "paused" || status === "failed";
+  return partial && hasKnownSize.value
+    ? `${statusLabel.value} · ${pct.value}%`
+    : statusLabel.value;
+});
+
+const statusTone = computed(() => {
+  switch (record.value?.status) {
     case "active":
+      return { text: "text-primary", bar: "bg-primary" };
+    case "muxing":
     case "queued":
-      return t("detail.actionPause");
-    case "paused":
-      return t("detail.actionResume");
+      return { text: "text-info", bar: "bg-info" };
     case "failed":
-    case "cancelled":
-      return t("detail.actionRestart");
+      return { text: "text-danger", bar: "bg-danger" };
     case "completed":
-      return t("downloads.rowOpenFile");
+      return { text: "text-success", bar: "bg-success" };
     default:
-      return "";
+      return { text: "text-dl-soft", bar: "bg-muted-foreground" };
   }
 });
 
-const primaryActionIcon = computed(() => {
-  if (!record.value) return Pause;
-  switch (record.value.status) {
+const barWidth = computed(() =>
+  record.value?.status === "completed" ? 100 : pct.value,
+);
+
+const timeLeft = computed(() => {
+  const eta = stats.value?.eta;
+  if (record.value?.status !== "active" || eta == null || eta <= 0) return "";
+  return t("detail.timeLeft", { time: formatEta(eta) });
+});
+
+const bytesLine = computed(() => {
+  const r = record.value;
+  if (!r) return "";
+  if (r.status === "completed") return formatBytes(r.total_bytes ?? r.downloaded_bytes);
+  if (!hasKnownSize.value) return formatBytes(r.downloaded_bytes);
+  return t("downloads.rowBytesOf", {
+    done: formatBytes(r.downloaded_bytes),
+    total: formatBytes(r.total_bytes),
+  });
+});
+
+// ── Stat tiles ──────────────────────────────────────────────────────────────
+
+const averageSpeed = computed(() => {
+  if (!record.value) return 0;
+  const samples = downloads.speedHistoryFor(record.value.id).filter((v) => v > 0);
+  if (samples.length === 0) return 0;
+  return samples.reduce((sum, v) => sum + v, 0) / samples.length;
+});
+
+const elapsedSeconds = useElapsedSeconds(() => record.value);
+
+const statTiles = computed<{ label: string; value: string }[]>(() => {
+  const r = record.value;
+  if (!r) return [];
+  const connections = isTorrent.value
+    ? { label: t("detail.torrentPeers"), value: String(r.torrent?.swarm?.peers ?? "—") }
+    : { label: t("detail.tabSegments"), value: String(r.segments) };
+  return [
+    { label: t("detail.metricSpeed"), value: formatSpeed(stats.value?.speed_bps) },
+    { label: t("detail.metricAverage"), value: formatSpeed(averageSpeed.value) },
+    connections,
+    {
+      label: t("detail.metricElapsedTitle"),
+      value: elapsedSeconds.value == null ? "—" : formatEta(elapsedSeconds.value),
+    },
+  ];
+});
+
+// ── Footer actions ──────────────────────────────────────────────────────────
+
+const primaryAction = computed<{ label: string; icon: Component } | null>(() => {
+  switch (record.value?.status) {
     case "active":
     case "queued":
-      return Pause;
+    case "muxing":
+      return { label: t("detail.actionPause"), icon: Pause };
     case "paused":
-      return Play;
+      return { label: t("detail.actionResume"), icon: Play };
     case "failed":
     case "cancelled":
-      return RotateCw;
+      return { label: t("detail.actionRestart"), icon: RotateCw };
+    case "completed":
+      return { label: t("downloads.rowOpenFile"), icon: ExternalLink };
     default:
-      return Play;
+      return null;
   }
 });
 
 async function runPrimary() {
-  if (!record.value) return;
-  const id = record.value.id;
-  switch (record.value.status) {
-    case "active":
-    case "queued":
-      await downloads.pause(id);
-      break;
-    case "paused":
-      await downloads.resume(id);
-      break;
-    case "failed":
-    case "cancelled":
-      try {
-        await downloads.retry(id);
-      } catch (e) {
-        const message = e instanceof Error ? e.message : String(e);
-        toast.push(t("errors.restartDownload", { error: message }), "error");
-      }
-      break;
-    case "completed":
-      try {
-        await openPath(record.value.output_path);
-      } catch (e) {
-        console.error("openPath failed", e);
-        toast.push(
-          t("errors.openFile", { filename: record.value.filename }),
-          "error",
-        );
-      }
-      break;
+  const r = record.value;
+  if (!r) return;
+  try {
+    switch (r.status) {
+      case "active":
+      case "queued":
+      case "muxing":
+        await downloads.pause(r.id);
+        break;
+      case "paused":
+        await downloads.resume(r.id);
+        break;
+      case "failed":
+      case "cancelled":
+        await downloads.retry(r.id);
+        break;
+      case "completed":
+        await openPath(r.output_path);
+        break;
+    }
+  } catch (e) {
+    if (r.status === "completed") {
+      console.error("openPath failed", e);
+      toast.push(t("errors.openFile", { filename: r.filename }), "error");
+      return;
+    }
+    const message = e instanceof Error ? e.message : String(e);
+    toast.push(
+      r.status === "failed" || r.status === "cancelled"
+        ? t("errors.restartDownload", { error: message })
+        : message || t("downloads.actionFailed"),
+      "error",
+    );
+  }
+}
+
+async function restart(id: DownloadRecord["id"]) {
+  try {
+    await downloads.retry(id);
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    toast.push(t("errors.restartDownload", { error: message }), "error");
   }
 }
 
@@ -209,173 +243,185 @@ async function openFolder() {
 }
 
 const moreMenu = computed(() => {
-  if (!record.value) return [];
-  const id = record.value.id;
+  const r = record.value;
+  if (!r) return [];
   const items: { label: string; danger?: boolean; onSelect: () => void }[] = [
-    { label: t("downloads.rowOpenFolder"), onSelect: openFolder },
     {
-      label: t("downloads.menuCopyUrl"),
+      label: t("downloads.menuSchedule"),
       onSelect: () => {
-        if (!record.value) return;
-        void navigator.clipboard.writeText(record.value.url);
+        scheduleOpen.value = true;
       },
     },
+    {
+      label: t("downloads.menuCopyUrl"),
+      onSelect: () => void navigator.clipboard.writeText(r.url),
+    },
   ];
-  if (record.value.status === "completed") {
+  if (r.status === "completed") {
     // Re-download a finished file from scratch.
     items.push({
       label: t("downloads.menuRestart"),
-      onSelect: () => void downloads.retry(id),
+      onSelect: () => void restart(r.id),
     });
   }
+  items.push({
+    label: t("common.remove"),
+    danger: true,
+    onSelect: () => void deleteConfirm.requestDelete([r.id]),
+  });
   return items;
 });
+
+const FOCUS_RING =
+  "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring";
 </script>
 
 <template>
-  <Drawer
-    :open="drawerOpen"
-    @close="detail.close()"
+  <aside
+    v-if="record"
+    :aria-label="t('detail.panelAria', { filename: record.filename })"
+    class="flex min-h-0 w-[420px] shrink-0 flex-col border-l border-dl-line bg-dl-chrome"
   >
-    <template v-if="record">
-      <!-- Header -->
-      <header class="px-5 pt-4">
-        <div class="flex items-center justify-between text-[11px] font-semibold tracking-wider text-muted-foreground">
-          <p class="flex items-center gap-1">
-            <span
-              v-for="(b, i) in breadcrumbs"
-              :key="i"
-              class="flex items-center gap-1"
-            >
-              <span>{{ b }}</span>
-              <span
-                v-if="i < breadcrumbs.length - 1"
-                aria-hidden
-              >·</span>
-            </span>
-          </p>
-          <button
-            type="button"
-            class="inline-flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-            :title="t('common.close')"
-            @click="detail.close()"
-          >
-            <X class="h-4 w-4" />
-          </button>
-        </div>
-        <h2 class="mt-2 wrap-break-word text-lg font-semibold leading-snug text-foreground">
+    <header class="flex items-start gap-3 pb-3.5 pl-5 pr-4 pt-[18px]">
+      <KindBadge :filename="record.filename" :download-kind="record.kind" size="lg" />
+      <div class="flex min-w-0 flex-1 flex-col gap-[3px]">
+        <h2 class="truncate text-[15px] font-semibold" :title="record.filename">
           {{ record.filename }}
         </h2>
-        <div class="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-          <span
-            class="inline-flex items-center gap-1.5 rounded-full border border-border bg-card px-2 py-0.5 text-xs font-medium text-foreground"
-          >
-            <span
-              class="h-1.5 w-1.5 rounded-full"
-              :class="statusTone"
-            />
-            {{ statusLabel }}
-          </span>
-          <span>{{ t("detail.startedAgo", { time: startedAgo }) }}</span>
-        </div>
-      </header>
-
-      <!-- Tabs -->
-      <nav class="mt-4 border-b border-border px-5">
-        <ul class="flex items-center gap-4 text-sm">
-          <li
-            v-for="t in tabs"
-            :key="t.id"
-          >
-            <button
-              type="button"
-              class="flex items-center gap-1.5 border-b-2 py-2 font-medium transition-colors"
-              :class="detail.tab === t.id
-                  ? 'border-primary text-primary'
-                  : 'border-transparent text-muted-foreground hover:text-foreground'
-                "
-              @click="detail.setTab(t.id)"
-            >
-              <span>{{ t.label }}</span>
-              <span
-                v-if="t.count"
-                class="rounded-full bg-muted px-1.5 text-[10px] font-semibold text-muted-foreground"
-              >
-                {{ t.count() }}
-              </span>
-            </button>
-          </li>
-        </ul>
-      </nav>
-
-      <!-- Body — vertical scroll only, never horizontal. -->
-      <div class="flex-1 overflow-y-auto overflow-x-hidden px-5 py-5">
-        <DetailOverview
-          v-if="detail.tab === 'overview'"
-          :download="record"
-          @view-segments="detail.setTab(isTorrent ? 'torrent' : 'segments')"
-        />
-        <DetailTorrent
-          v-else-if="isTorrent && detail.tab === 'torrent'"
-          :download="record"
-        />
-        <DetailSegments
-          v-else-if="!isTorrent && detail.tab === 'segments'"
-          :download="record"
-        />
-        <DetailHistory
-          v-else-if="detail.tab === 'history'"
-          :download="record"
-        />
-        <!-- Fallback when the active tab doesn't apply to this kind (e.g. a
-             stale 'segments' tab on a torrent row): show the kind's primary
-             secondary view rather than a blank pane. -->
-        <DetailTorrent
-          v-else-if="isTorrent"
-          :download="record"
-        />
-        <DetailSegments
-          v-else
-          :download="record"
-        />
+        <span class="truncate text-xs text-muted-foreground">
+          {{ hostOf(record.url) || t("downloads.kindTorrent") }}
+        </span>
       </div>
+      <button
+        type="button"
+        class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+        :class="FOCUS_RING"
+        :aria-label="t('common.close')"
+        :title="t('detail.closeHint')"
+        @click="detail.close()"
+      >
+        <X class="h-[15px] w-[15px]" aria-hidden="true" />
+      </button>
+    </header>
 
-      <!-- Footer actions -->
-      <footer class="flex items-center gap-2 border-t border-border bg-background px-5 py-3">
-        <button
-          v-if="primaryActionLabel"
-          type="button"
-          class="inline-flex h-9 flex-1 items-center justify-center gap-1.5 rounded-md border border-border bg-card text-sm font-medium text-foreground transition-colors hover:bg-accent"
-          @click="runPrimary"
+    <div class="flex flex-col gap-2 px-5 pb-4">
+      <div class="flex items-baseline justify-between text-xs">
+        <span class="font-semibold" :class="statusTone.text">{{ statusLine }}</span>
+        <span class="font-mono text-muted-foreground">{{ timeLeft }}</span>
+      </div>
+      <span class="block h-1.5 rounded-[3px] bg-dl-track">
+        <span
+          class="block h-1.5 rounded-[3px] transition-[width] duration-300 ease-out"
+          :class="statusTone.bar"
+          :style="{ width: `${barWidth}%` }"
+        />
+      </span>
+      <span class="font-mono text-xs text-muted-foreground">{{ bytesLine }}</span>
+    </div>
+
+    <dl
+      class="mx-5 mb-4 grid grid-cols-2 gap-px overflow-hidden rounded-xl border border-dl-line bg-dl-line"
+    >
+      <div
+        v-for="tile in statTiles"
+        :key="tile.label"
+        class="flex flex-col gap-[3px] bg-card px-3 py-2.5"
+      >
+        <dt class="text-[11px] uppercase tracking-[0.06em] text-muted-foreground">
+          {{ tile.label }}
+        </dt>
+        <dd class="font-mono text-sm">{{ tile.value }}</dd>
+      </div>
+    </dl>
+
+    <div
+      role="tablist"
+      :aria-label="t('detail.tabsAria')"
+      class="flex gap-0.5 border-b border-dl-line px-5"
+    >
+      <button
+        v-for="tab in tabs"
+        :key="tab.id"
+        type="button"
+        role="tab"
+        :aria-selected="detail.tab === tab.id"
+        class="-mb-px flex h-[38px] items-center gap-1.5 px-2.5 font-medium transition-colors focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring"
+        :class="
+          detail.tab === tab.id
+            ? 'text-foreground shadow-[inset_0_-2px_0_hsl(var(--primary))]'
+            : 'text-muted-foreground hover:text-foreground'
+        "
+        @click="detail.setTab(tab.id)"
+      >
+        {{ tab.label }}
+        <span
+          v-if="tab.count"
+          class="rounded-md bg-muted px-1.5 py-px font-mono text-[11px] text-dl-soft"
         >
-          <component
-            :is="primaryActionIcon"
-            class="h-4 w-4"
-          />
-          <span>{{ primaryActionLabel }}</span>
-        </button>
-        <button
-          type="button"
-          class="inline-flex h-9 w-9 items-center justify-center rounded-md border border-border bg-card text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-          :title="t('detail.actionSchedule')"
-          @click="scheduleOpen = true"
-        >
-          <Clock class="h-4 w-4" />
-        </button>
+          {{ tab.count }}
+        </span>
+      </button>
+    </div>
+
+    <!-- Body — vertical scroll only, never horizontal. -->
+    <div class="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-5 py-4">
+      <DetailOverview
+        v-if="detail.tab === 'overview'"
+        :download="record"
+        @view-segments="detail.setTab(isTorrent ? 'torrent' : 'segments')"
+      />
+      <DetailTorrent
+        v-else-if="isTorrent && detail.tab === 'torrent'"
+        :download="record"
+      />
+      <DetailSegments
+        v-else-if="!isTorrent && detail.tab === 'segments'"
+        :download="record"
+      />
+      <DetailHistory
+        v-else-if="detail.tab === 'history'"
+        :download="record"
+      />
+      <!-- Fallback when the active tab doesn't apply to this kind (e.g. a
+           stale 'segments' tab on a torrent row): show the kind's primary
+           secondary view rather than a blank pane. -->
+      <DetailTorrent
+        v-else-if="isTorrent"
+        :download="record"
+      />
+      <DetailSegments
+        v-else
+        :download="record"
+      />
+    </div>
+
+    <footer class="flex shrink-0 items-center gap-2 border-t border-dl-line py-3 pl-5 pr-4">
+      <button
+        v-if="primaryAction"
+        type="button"
+        class="flex h-9 items-center gap-1.5 rounded-[9px] border border-border bg-dl-raised px-3.5 font-medium text-foreground transition-colors hover:bg-accent"
+        :class="FOCUS_RING"
+        @click="runPrimary"
+      >
+        <component :is="primaryAction.icon" class="h-3.5 w-3.5" aria-hidden="true" />
+        {{ primaryAction.label }}
+      </button>
+      <button
+        type="button"
+        class="flex h-9 items-center gap-1.5 rounded-[9px] px-3 font-medium text-foreground transition-colors hover:bg-accent"
+        :class="FOCUS_RING"
+        @click="openFolder"
+      >
+        <Folder class="h-[15px] w-[15px]" aria-hidden="true" />
+        {{ t("downloads.rowShowInFolder") }}
+      </button>
+      <span class="ml-auto flex">
         <RowMenu :items="moreMenu">
-          <MoreHorizontal class="h-4 w-4" />
+          <MoreHorizontal class="h-[18px] w-[18px]" aria-hidden="true" />
         </RowMenu>
-        <button
-          type="button"
-          class="inline-flex h-9 w-9 items-center justify-center rounded-md bg-danger text-white transition-colors hover:bg-danger/90"
-          :title="t('common.remove')"
-          @click="deleteConfirm.requestDelete([record.id])"
-        >
-          <Trash2 class="h-4 w-4" />
-        </button>
-      </footer>
-    </template>
-  </Drawer>
+      </span>
+    </footer>
+  </aside>
   <ScheduleDialog
     v-if="record"
     :open="scheduleOpen"

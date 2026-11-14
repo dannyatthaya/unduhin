@@ -6,10 +6,13 @@
 
 import { nextTick, onBeforeUnmount, ref, watch } from "vue";
 import { onClickOutside, useEventListener } from "@vueuse/core";
+import { useI18n } from "vue-i18n";
 
 import { useOverlaysStore } from "@/stores/overlays";
 
 const props = defineProps<{ items: { label: string; danger?: boolean; onSelect: () => void }[] }>();
+
+const { t } = useI18n();
 
 const open = ref(false);
 const triggerRef = ref<HTMLButtonElement | null>(null);
@@ -105,8 +108,11 @@ onBeforeUnmount(close);
   <button
     ref="triggerRef"
     type="button"
-    class="inline-flex h-9 w-9 items-center justify-center rounded-md text-foreground transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-    title="More actions"
+    class="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+    aria-haspopup="menu"
+    :aria-expanded="open"
+    :aria-label="t('downloads.rowMoreActions')"
+    :title="t('downloads.rowMoreActions')"
     @click="toggle"
   >
     <slot />
@@ -122,14 +128,16 @@ onBeforeUnmount(close);
       <div
         v-if="open"
         ref="menuRef"
-        class="fixed z-50 overflow-hidden rounded-md border border-border bg-card text-card-foreground shadow-lg"
+        role="menu"
+        data-state="open"
+        class="dl-surface fixed z-50 overflow-hidden rounded-lg border border-border bg-card text-card-foreground shadow-lg"
         :style="menuStyle"
       >
         <ul class="py-1">
           <li v-for="(item, i) in props.items" :key="i">
             <button
               type="button"
-              class="flex w-full items-center px-3 py-1.5 text-left text-sm transition-colors hover:bg-accent"
+              class="flex w-full items-center px-3 py-1.5 text-left transition-colors hover:bg-accent"
               :class="item.danger ? 'text-danger hover:text-danger' : ''"
               @click="pick(item.onSelect)"
             >

@@ -98,3 +98,101 @@ export function shortenPath(p: string, max = 36): string {
   const tail = p.slice(Math.max(i, p.length - (max - head.length - 4)));
   return `${head}\\…${tail}`;
 }
+
+/** Hostname of a URL, or "" when it has none (magnet links, bare paths). */
+export function hostOf(url: string): string {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * The folder a file sits in, cut to its last `segments` path parts —
+ * `C:\Users\me\Downloads\Video\clip.mp4` reads as `Downloads\Video`.
+ * Keeps whichever separator the path already uses.
+ */
+export function parentFolderLabel(path: string, segments = 2): string {
+  if (!path) return "";
+  const separator = path.includes("\\") ? "\\" : "/";
+  const parts = path.split(/[\\/]+/).filter((part) => part !== "");
+  const folders = parts.slice(0, -1);
+  return folders.slice(-segments).join(separator);
+}
+
+export interface SpeedParts {
+  value: string;
+  /** Includes the leading space, e.g. " MB/s". Empty when idle. */
+  unit: string;
+}
+
+/** `formatSpeed` split in two so the number and the unit can be styled apart. */
+export function splitSpeed(bps: number | null | undefined): SpeedParts {
+  const text = formatSpeed(bps);
+  const space = text.indexOf(" ");
+  if (space < 0) return { value: text, unit: "" };
+  return { value: text.slice(0, space), unit: text.slice(space) };
+}
+
+/** A speed limit as a short label: whole numbers lose the ".0" (`10 MB/s`). */
+export function formatSpeedLimit(bps: number): string {
+  return formatSpeed(bps).replace(/\.0(?= )/, "");
+}
+
+export type DurationUnit = "s" | "min" | "h";
+
+export interface ApproxDuration {
+  n: number;
+  unit: DurationUnit;
+}
+
+const SECONDS_PER_MINUTE = 60;
+const SECONDS_PER_HOUR = 3600;
+
+/** A duration rounded to the one unit a person would say it in. */
+export function approxDuration(seconds: number): ApproxDuration {
+  const s = Math.max(0, seconds);
+  if (s < SECONDS_PER_MINUTE) return { n: Math.max(1, Math.round(s)), unit: "s" };
+  if (s < SECONDS_PER_HOUR) return { n: Math.round(s / SECONDS_PER_MINUTE), unit: "min" };
+  return { n: Math.round(s / SECONDS_PER_HOUR), unit: "h" };
+}
+
+function startOfLocalDay(ms: number): number {
+  const d = new Date(ms);
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+}
+
+/** Whole local calendar days between `ms` and `nowMs` (0 = today, 1 = yesterday). */
+export function calendarDaysAgo(ms: number, nowMs = Date.now()): number {
+  const DAY_MS = 24 * 3600 * 1000;
+  return Math.round((startOfLocalDay(nowMs) - startOfLocalDay(ms)) / DAY_MS);
+}
+
+/**
+ * The "Added" column: a clock time for today, `yesterdayLabel` for
+ * yesterday, otherwise a short date (with the year once it differs).
+ */
+export function formatAdded(
+  iso: string | null | undefined,
+  yesterdayLabel: string,
+  locale?: string,
+  nowMs = Date.now(),
+): string {
+  if (!iso) return "—";
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return "—";
+  const daysAgo = calendarDaysAgo(t, nowMs);
+  const d = new Date(t);
+  if (daysAgo <= 0) {
+    const pad = (n: number) => n.toString().padStart(2, "0");
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+  if (daysAgo === 1) return yesterdayLabel;
+  const sameYear = d.getFullYear() === new Date(nowMs).getFullYear();
+  return d.toLocaleDateString(locale, {
+    day: "numeric",
+    month: "short",
+    ...(sameYear ? {} : { year: "numeric" }),
+  });
+}

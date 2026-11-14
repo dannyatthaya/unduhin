@@ -1,8 +1,7 @@
-// Builds the four UI groups in the screenshots: Active, Paused &
-// Queued, Needs Attention (failed), Completed Today. Also builds the
-// flat (un-grouped) row list when the user picks the "Flat" view in
-// the sort toolbar — both shapes share the same filter + sort logic so
-// switching views doesn't surprise the user with reordering.
+// Builds the sections of the downloads list — Needs attention, Downloading,
+// Queued, Cancelled, Done today, Done earlier — and the flat (un-grouped)
+// row list for the "Flat" layout. Both shapes share the same filter + sort
+// logic so switching layouts doesn't surprise the user with reordering.
 
 import { computed } from "vue";
 
@@ -12,35 +11,41 @@ import {
   type SortColumn,
   type SortDir,
 } from "@/composables/useDownloadsSort";
+import { calendarDaysAgo } from "@/lib/format";
 import type { DownloadRecord } from "@/types/tauri-bindings";
 
+export type DownloadGroupKey =
+  | "needs-attention"
+  | "active"
+  | "queued"
+  | "cancelled"
+  | "completed"
+  | "completed-earlier";
+
 export interface DownloadGroup {
-  key:
-    | "active"
-    | "paused-queued"
-    | "needs-attention"
-    | "cancelled"
-    | "completed"
-    | "completed-yesterday"
-    | "completed-older";
-  label: string;
+  key: DownloadGroupKey;
   rows: DownloadRecord[];
 }
 
-const DAY_MS = 24 * 3600 * 1000;
-
 /**
- * Age (ms) of a completed row, preferring `completed_at` and falling back
- * to `created_at`. The fallback is what keeps rows whose `completed_at` is
- * NULL (loaded from the DB / legacy rows) visible instead of silently
- * dropped. If neither parses we return +Infinity so the row still lands in
- * the "Older" bucket rather than vanishing.
+ * Whether a completed row finished on today's local calendar day. Prefers
+ * `completed_at` and falls back to `created_at`, which keeps rows whose
+ * `completed_at` is NULL (legacy rows) visible instead of silently dropped.
+ * If neither parses the row counts as earlier rather than vanishing.
  */
-function completedAgeMs(r: DownloadRecord): number {
+function completedToday(r: DownloadRecord, nowMs: number): boolean {
   const iso = r.completed_at ?? r.created_at;
   const t = iso ? Date.parse(iso) : Number.NaN;
-  if (Number.isNaN(t)) return Number.POSITIVE_INFINITY;
-  return Date.now() - t;
+  if (Number.isNaN(t)) return false;
+  return calendarDaysAgo(t, nowMs) <= 0;
+}
+
+function matchesQuery(r: DownloadRecord, q: string): boolean {
+  return (
+    r.filename.toLowerCase().includes(q) ||
+    r.url.toLowerCase().includes(q) ||
+    r.output_path.toLowerCase().includes(q)
+  );
 }
 
 export function useGroupedDownloads(
@@ -56,11 +61,7 @@ export function useGroupedDownloads(
     const cid = categoryId();
     return store.all.filter((r: DownloadRecord) => {
       if (cid != null && r.category_id !== cid) return false;
-      if (!q) return true;
-      return (
-        r.filename.toLowerCase().includes(q) ||
-        r.url.toLowerCase().includes(q)
-      );
+      return !q || matchesQuery(r, q);
     });
   });
 
@@ -77,39 +78,30 @@ export function useGroupedDownloads(
 
   const groups = computed<DownloadGroup[]>(() => {
     const rows = sortedMatching.value;
-    const active = rows.filter(
-      (r) => r.status === "active" || r.status === "muxing",
-    );
-    const pq = rows.filter((r) => r.status === "paused" || r.status === "queued");
-    const attention = rows.filter((r) => r.status === "failed");
-    // Cancelled rows are terminal but not failures. They previously matched no
-    // bucket and silently vanished from the Grouped view, even though the Flat
-    // view and the sidebar category / "All downloads" counts both include them
-    // — so a cancelled download read as a phantom +1. Give them their own group.
-    const cancelled = rows.filter((r) => r.status === "cancelled");
-
-    // Bucket *every* completed row by age so none disappear: rows older
-    // than 24h (previously dropped entirely) fall into Yesterday/Older, and
-    // rows with a missing completed_at use created_at as a fallback.
+    const now = Date.now();
     const completed = rows.filter((r) => r.status === "completed");
-    const today = completed.filter((r) => completedAgeMs(r) < DAY_MS);
-    const yesterday = completed.filter((r) => {
-      const age = completedAgeMs(r);
-      return age >= DAY_MS && age < 2 * DAY_MS;
-    });
-    const older = completed.filter((r) => completedAgeMs(r) >= 2 * DAY_MS);
 
-    const out: DownloadGroup[] = [];
-    if (active.length) out.push({ key: "active", label: "Active", rows: active });
-    if (pq.length) out.push({ key: "paused-queued", label: "Paused & Queued", rows: pq });
-    if (attention.length) out.push({ key: "needs-attention", label: "Needs attention", rows: attention });
-    if (cancelled.length) out.push({ key: "cancelled", label: "Cancelled", rows: cancelled });
-    // Label reflects the rolling-24h window (not a calendar day); the real
-    // label is resolved by `DownloadGroup.vue` from the key via i18n.
-    if (today.length) out.push({ key: "completed", label: "Completed in the last 24h", rows: today });
-    if (yesterday.length) out.push({ key: "completed-yesterday", label: "Completed yesterday", rows: yesterday });
-    if (older.length) out.push({ key: "completed-older", label: "Completed earlier", rows: older });
-    return out;
+    // Every row lands in exactly one bucket, so the grouped layout shows
+    // the same rows as the flat one. Cancelled rows are terminal but not
+    // failures; they get their own section rather than vanishing.
+    const buckets: DownloadGroup[] = [
+      {
+        key: "needs-attention",
+        rows: rows.filter((r) => r.status === "failed" || r.status === "paused"),
+      },
+      {
+        key: "active",
+        rows: rows.filter((r) => r.status === "active" || r.status === "muxing"),
+      },
+      { key: "queued", rows: rows.filter((r) => r.status === "queued") },
+      { key: "cancelled", rows: rows.filter((r) => r.status === "cancelled") },
+      { key: "completed", rows: completed.filter((r) => completedToday(r, now)) },
+      {
+        key: "completed-earlier",
+        rows: completed.filter((r) => !completedToday(r, now)),
+      },
+    ];
+    return buckets.filter((g) => g.rows.length > 0);
   });
 
   return { groups, matching, sortedMatching };

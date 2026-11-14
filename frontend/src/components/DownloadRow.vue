@@ -1,12 +1,15 @@
 <script setup lang="ts">
-import { computed, inject } from "vue";
+import { computed, inject, nextTick, type Component } from "vue";
 import { useI18n } from "vue-i18n";
 import {
+  CircleAlert,
+  CircleCheck,
   Clock,
   Copy,
   ExternalLink,
   Folder,
   FolderTree,
+  Link,
   MoreHorizontal,
   Pause,
   Pencil,
@@ -17,10 +20,8 @@ import {
 } from "lucide-vue-next";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 
-import Button from "./ui/Button.vue";
-import ExtBadge from "./ExtBadge.vue";
-import ProgressBar from "./ProgressBar.vue";
-import StatusBadge from "./StatusBadge.vue";
+import KindBadge from "./downloads/KindBadge.vue";
+import { DOWNLOADS_LIST_KEY } from "./downloads/listContext";
 import RowMenu from "./RowMenu.vue";
 import {
   ContextMenu,
@@ -43,12 +44,13 @@ import { useDeleteConfirm } from "@/composables/useDeleteConfirm";
 import { useRefreshLink } from "@/composables/useRefreshLink";
 import { useToast } from "@/composables/useToast";
 import {
+  formatAdded,
   formatBytes,
   formatEta,
   formatSpeed,
+  hostOf,
+  parentFolderLabel,
   percent,
-  shortenPath,
-  shortenUrl,
 } from "@/lib/format";
 import type {
   Category,
@@ -61,7 +63,7 @@ const props = defineProps<{
   queuePosition?: number | null;
 }>();
 
-const { t } = useI18n();
+const { t, locale } = useI18n();
 const store = useDownloadsStore();
 const selection = useSelectionStore();
 const detail = useDetailStore();
@@ -83,7 +85,6 @@ async function restart(id: DownloadId) {
 // ── Selection-aware context-menu actions ────────────────────────────────────
 // The right-click menu acts on the WHOLE multi-selection when this row is part
 // of one (count > 1); otherwise just this row — same rule as drag-and-drop.
-// This replaces the floating batch bar: every batch action lives in the menu.
 const targetIds = computed<DownloadId[]>(() =>
   selection.has(props.download.id) && selection.count > 1
     ? Array.from(selection.ids)
@@ -156,16 +157,25 @@ async function ctxMoveTo(target: Category) {
   );
 }
 
-// Parent (DownloadsView) provides the currently visible ordered ids
-// so shift-click range-select knows what to walk between. Falls back to
-// the single row when the component is rendered in isolation.
-const orderedIds = inject<() => DownloadId[]>("orderedIds", () => [
-  props.download.id,
-]);
+// DownloadsView provides the rendered ids (for shift-click ranges), the
+// compact flag and the roving tab stop. The fallbacks keep the row usable
+// when it is rendered on its own.
+const list = inject(DOWNLOADS_LIST_KEY, null);
+const orderedIds = (): DownloadId[] =>
+  list?.orderedIds() ?? [props.download.id];
+const compact = computed(() => list?.compact.value ?? false);
+const tabIndex = computed(() => {
+  if (!list) return 0;
+  const active = list.activeRowId.value;
+  if (active != null) return active === props.download.id ? 0 : -1;
+  return orderedIds()[0] === props.download.id ? 0 : -1;
+});
 
 const stats = computed(() => store.statsFor(props.download.id));
 const isSelected = computed(() => selection.has(props.download.id));
 const isOpenInDetail = computed(() => detail.openId === props.download.id);
+/** Selected, or the row the details panel is showing. */
+const isLit = computed(() => isSelected.value || isOpenInDetail.value);
 
 /** Peers/seeds badge — only for torrent rows that already carry a swarm
  *  snapshot (persisted on the `torrent` blob, re-emitted live by
@@ -180,54 +190,8 @@ const swarm = computed(() =>
 const pct = computed(() =>
   percent(props.download.downloaded_bytes, props.download.total_bytes)
 );
-
-const tone = computed(() => {
-  switch (props.download.status) {
-    case "muxing":
-      return "muxing" as const;
-    case "paused":
-      return "paused" as const;
-    case "failed":
-      return "failed" as const;
-    case "completed":
-      return "done" as const;
-    default:
-      return "active" as const;
-  }
-});
-
-const outerClass = computed(() => {
-  const base =
-    "group relative overflow-hidden rounded-lg border bg-card transition-shadow before:absolute before:inset-y-0 before:left-0 before:w-1 before:rounded-l-lg";
-  const accent = (() => {
-    switch (props.download.status) {
-      case "active":
-        return "before:bg-primary";
-      case "muxing":
-        return "before:bg-info";
-      case "paused":
-        return "before:bg-warning";
-      case "queued":
-        return "before:bg-muted-foreground/60";
-      case "failed":
-        return "before:bg-danger";
-      case "completed":
-        return "before:bg-success";
-      default:
-        return "before:bg-muted-foreground/60";
-    }
-  })();
-  let frame = "border-border hover:shadow-sm";
-  if (isSelected.value) {
-    frame = "border-primary ring-1 ring-primary bg-primary/5";
-  } else if (isOpenInDetail.value) {
-    frame = "border-primary/70 ring-1 ring-primary/30";
-  }
-  return `${base} ${accent} ${frame} cursor-pointer`;
-});
-
-const showProgress = computed(() =>
-  ["active", "muxing", "paused", "failed"].includes(props.download.status)
+const hasKnownSize = computed(
+  () => props.download.total_bytes != null && props.download.total_bytes > 0,
 );
 
 function openRefreshLink() {
@@ -248,6 +212,118 @@ const errorLine = computed(() => {
   if (isExpiredAuth.value) return t("downloads.errorExpiredLink");
   return `${props.download.error}`;
 });
+
+/** Second line under the name: what went wrong, else where it comes from. */
+const subLine = computed(() => errorLine.value ?? hostOf(props.download.url));
+
+// ── Status cell ─────────────────────────────────────────────────────────────
+
+interface StatusView {
+  label: string;
+  /** Text colour of the label (and of the icon, when there is one). */
+  tone: string;
+  icon: Component | null;
+  /** Fill colour of the progress bar; null hides the bar. */
+  bar: string | null;
+}
+
+const statusView = computed<StatusView>(() => {
+  const d = props.download;
+  switch (d.status) {
+    case "active":
+      return {
+        label: hasKnownSize.value ? `${pct.value}%` : formatBytes(d.downloaded_bytes),
+        tone: "text-primary",
+        icon: null,
+        bar: "bg-primary",
+      };
+    case "muxing":
+      return {
+        label: t("downloads.statusMuxing"),
+        tone: "text-info",
+        icon: null,
+        bar: "bg-info",
+      };
+    case "queued":
+      return {
+        label:
+          props.queuePosition != null
+            ? t("downloads.rowQueuedAt", { position: props.queuePosition })
+            : t("downloads.statusQueued"),
+        tone: "text-info",
+        icon: null,
+        bar: null,
+      };
+    case "paused":
+      return {
+        label: hasKnownSize.value
+          ? t("downloads.rowPausedAt", { pct: pct.value })
+          : t("downloads.statusPaused"),
+        tone: "text-dl-soft",
+        icon: Pause,
+        bar: "bg-muted-foreground",
+      };
+    case "failed":
+      return {
+        label:
+          pct.value > 0
+            ? t("downloads.rowFailedAt", { pct: pct.value })
+            : t("downloads.statusFailed"),
+        tone: "text-danger",
+        icon: CircleAlert,
+        bar: "bg-danger",
+      };
+    case "completed":
+      return {
+        label: t("downloads.statusDone"),
+        tone: "text-dl-soft",
+        icon: CircleCheck,
+        bar: null,
+      };
+    default:
+      return {
+        label: t("downloads.statusCancelled"),
+        tone: "text-muted-foreground",
+        icon: null,
+        bar: null,
+      };
+  }
+});
+
+/** Right-aligned figures in the status cell: speed and time left while
+ *  running, bytes so far while paused (when there is room). */
+const metaLine = computed(() => {
+  const d = props.download;
+  if (d.status === "active" && stats.value) {
+    return `${formatSpeed(stats.value.speed_bps)} · ${formatEta(stats.value.eta)}`;
+  }
+  if (d.status === "paused" && hasKnownSize.value && !compact.value) {
+    return t("downloads.rowBytesOf", {
+      done: formatBytes(d.downloaded_bytes),
+      total: formatBytes(d.total_bytes),
+    });
+  }
+  return "";
+});
+
+const folderLabel = computed(() =>
+  props.download.status === "completed"
+    ? parentFolderLabel(props.download.output_path)
+    : "",
+);
+
+const sizeLabel = computed(() => {
+  const d = props.download;
+  const bytes =
+    d.status === "completed" ? d.total_bytes ?? d.downloaded_bytes : d.total_bytes;
+  return bytes == null ? null : formatBytes(bytes);
+});
+
+const addedLabel = computed(() =>
+  formatAdded(props.download.created_at, t("downloads.addedYesterday"), locale.value),
+);
+
+// ── Actions ─────────────────────────────────────────────────────────────────
 
 /** Statuses that a pause can stop. `muxing` is included deliberately —
  *  see `Core::pause`: without it a row that reaches the merge phase has
@@ -277,11 +353,37 @@ async function togglePauseResume() {
   }
 }
 
+interface PrimaryAction {
+  label: string;
+  icon: Component;
+  run: () => void;
+}
+
+/** The single icon button on an unfinished row. Finished rows get the
+ *  Open + folder pair instead; cancelled rows only have the menu. */
+const primaryAction = computed<PrimaryAction | null>(() => {
+  switch (props.download.status) {
+    case "active":
+    case "queued":
+    case "muxing":
+      return { label: t("downloads.rowPause"), icon: Pause, run: () => void togglePauseResume() };
+    case "paused":
+      return { label: t("downloads.rowResume"), icon: Play, run: () => void togglePauseResume() };
+    case "failed":
+      return isExpiredAuth.value
+        ? { label: t("downloads.refreshLinkHint"), icon: Link, run: openRefreshLink }
+        : { label: t("downloads.rowRetry"), icon: RotateCw, run: () => void restart(props.download.id) };
+    default:
+      return null;
+  }
+});
+
 async function openFile() {
   try {
     await openPath(props.download.output_path);
   } catch (e) {
     console.error("openPath failed", e);
+    toast.push(t("errors.openFile", { filename: props.download.filename }), "error");
   }
 }
 
@@ -290,6 +392,7 @@ async function openFolder() {
     await revealItemInDir(props.download.output_path);
   } catch (e) {
     console.error("revealItemInDir failed", e);
+    toast.push(t("errors.revealFile"), "error");
   }
 }
 
@@ -314,23 +417,40 @@ function onRowClick(e: MouseEvent) {
     selection.toggle(props.download.id);
     return;
   }
-  // Plain click only opens the detail drawer. Multi-select is driven
+  // Plain click only opens the details panel. Multi-select is driven
   // by the row's checkbox (or the Ctrl/Shift shortcuts above), so we
   // intentionally leave `selection` alone here — otherwise a plain
   // click while inspecting another row would tear down whatever the
-  // user was building in the batch bar.
+  // user was building in the bulk bar.
   detail.open(props.download.id);
 }
 
 function onCheckboxClick(e: MouseEvent) {
   // The checkbox is its own selection affordance — don't let the click
-  // bubble to the row body and reopen the detail drawer.
+  // bubble to the row body and reopen the details panel.
   e.stopPropagation();
-  if (e.shiftKey) {
-    selection.extendTo(props.download.id, orderedIds());
-    return;
+  if (e.shiftKey) selection.extendTo(props.download.id, orderedIds());
+  else selection.toggle(props.download.id);
+  // The browser has already flipped the box. When the selection ends up
+  // unchanged for this row (a shift-click inside the range), Vue has nothing
+  // to patch, so put the box back in step with the store ourselves.
+  const box = e.target as HTMLInputElement;
+  void nextTick(() => {
+    box.checked = isSelected.value;
+  });
+}
+
+// Keyboard on the focused row itself (not on a control inside it):
+// Space selects, Enter opens details. Arrow keys are handled by the list.
+function onRowKeydown(e: KeyboardEvent) {
+  if (e.target !== e.currentTarget) return;
+  if (e.key === " ") {
+    e.preventDefault();
+    selection.toggle(props.download.id);
+  } else if (e.key === "Enter") {
+    e.preventDefault();
+    detail.open(props.download.id);
   }
-  selection.toggle(props.download.id);
 }
 
 // HTML5 drag-source. If the row is part of an active multi-select we
@@ -380,7 +500,7 @@ const menuItems = computed(() => {
       items.push({ label: t("downloads.menuPause"), onSelect: () => void togglePauseResume() });
       break;
     case "paused":
-      items.push({ label: t("downloads.menuResume"), onSelect: () => store.resume(props.download.id) });
+      items.push({ label: t("downloads.menuResume"), onSelect: () => void togglePauseResume() });
       break;
     case "failed":
       // Retry is still offered on an expired link — it is harmless, just
@@ -394,162 +514,197 @@ const menuItems = computed(() => {
       items.push({ label: t("downloads.batchRetry"), onSelect: () => restart(props.download.id) });
       break;
   }
+  // Same pair, same meaning as the bulk bar: "Remove from list" never
+  // touches the file, "Delete files…" always asks first. Neither follows
+  // the default delete action — the right-click "Delete…" item does.
   items.push({
     label: t("downloads.menuRemoveFromList"),
+    onSelect: () => void deleteConfirm.removeFromList([props.download.id]),
+  });
+  items.push({
+    label: t("downloads.bulkDeleteFiles"),
     danger: true,
-    onSelect: () => deleteConfirm.requestDelete([props.download.id]),
+    onSelect: () =>
+      void deleteConfirm.requestDelete([props.download.id], { alwaysAsk: true }),
   });
   return items;
 });
+
+const FOCUS_RING =
+  "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring";
+// Row controls sit quiet until the row is hovered, focused or lit, then
+// pick up the raised-button treatment.
+const QUIET_BUTTON = `flex h-8 items-center justify-center rounded-lg border transition-colors ${FOCUS_RING}`;
 </script>
 
 <template>
   <ContextMenu>
     <ContextMenuTrigger as-child>
-      <article
-        :class="outerClass"
+      <div
+        role="row"
+        :tabindex="tabIndex"
+        :aria-selected="isSelected"
+        :data-row-id="download.id"
+        class="group dl-grid-row h-[52px] cursor-default border-b border-dl-line-soft pl-7 pr-5 outline-none focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring"
+        :class="
+          isLit
+            ? 'bg-dl-selrow shadow-[inset_3px_0_0_hsl(var(--primary))]'
+            : 'hover:bg-dl-hover'
+        "
         draggable="true"
         @click="onRowClick"
+        @keydown="onRowKeydown"
+        @focus="list?.setActiveRow(download.id)"
         @dragstart="onDragStart"
       >
-    <div class="flex items-start gap-3 px-4 py-3">
-      <label
-        class="mt-0.5 inline-flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center"
-        :title="isSelected ? t('downloads.deselect') : t('downloads.select')"
-        @click.stop
-      >
-        <input
-          type="checkbox"
-          class="h-4 w-4 cursor-pointer rounded border-border accent-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          :checked="isSelected"
-          :aria-label="t('downloads.selectAria', { filename: download.filename })"
-          @click="onCheckboxClick"
-        />
-      </label>
-      <ExtBadge :filename="download.filename" />
+        <span role="gridcell" class="flex items-center" @click.stop>
+          <input
+            type="checkbox"
+            class="cursor-pointer accent-primary"
+            :checked="isSelected"
+            :aria-label="t('downloads.selectAria', { filename: download.filename })"
+            @click="onCheckboxClick"
+          />
+        </span>
 
-      <div class="min-w-0 flex-1">
-        <div class="flex flex-wrap items-center gap-x-2 gap-y-1">
-          <h3 class="truncate text-sm font-semibold text-foreground">
-            {{ download.filename }}
-          </h3>
-          <StatusBadge :status="download.status" :queue-position="queuePosition" />
+        <span role="gridcell" class="flex min-w-0 items-center gap-2.5 pr-4">
+          <KindBadge :filename="download.filename" :download-kind="download.kind" />
+          <span class="flex min-w-0 flex-col gap-0.5">
+            <span class="flex min-w-0 items-center gap-2">
+              <span
+                class="truncate font-medium"
+                :class="download.status === 'completed' ? 'text-dl-soft' : 'text-foreground'"
+              >
+                {{ download.filename }}
+              </span>
+              <span
+                v-if="swarm"
+                class="flex h-5 shrink-0 items-center gap-1 rounded-[10px] bg-muted px-2 text-[11px] font-medium text-dl-soft"
+                :title="t('downloads.torrentSwarmBadgeTitle', { peers: swarm.peers, seeds: swarm.seeds })"
+              >
+                <Users class="h-3 w-3" aria-hidden="true" />
+                {{ t("downloads.torrentSwarmBadge", { peers: swarm.peers, seeds: swarm.seeds }) }}
+              </span>
+            </span>
+            <span v-if="subLine" class="truncate text-xs text-muted-foreground">
+              {{ subLine }}
+            </span>
+          </span>
+        </span>
+
+        <span role="gridcell" class="flex min-w-0 flex-col justify-center gap-1.5 pr-5">
+          <span class="flex min-w-0 items-center gap-1.5 whitespace-nowrap text-xs">
+            <component
+              :is="statusView.icon"
+              v-if="statusView.icon"
+              class="h-3.5 w-3.5 shrink-0"
+              :class="statusView.tone"
+              aria-hidden="true"
+            />
+            <span class="font-medium" :class="statusView.tone">{{ statusView.label }}</span>
+            <template v-if="folderLabel">
+              <span class="text-dl-dim" aria-hidden="true">·</span>
+              <button
+                type="button"
+                class="min-w-0 truncate text-muted-foreground underline decoration-border underline-offset-[3px] hover:text-foreground"
+                :class="FOCUS_RING"
+                :title="t('downloads.rowShowInFolder')"
+                @click.stop="openFolder"
+              >
+                {{ folderLabel }}
+              </button>
+            </template>
+            <span v-if="metaLine" class="ml-auto pl-2 font-mono text-muted-foreground">
+              {{ metaLine }}
+            </span>
+          </span>
           <span
-            v-if="swarm"
-            class="inline-flex items-center gap-1 rounded-md bg-info/10 px-1.5 py-0.5 text-[11px] font-medium text-info"
-            :title="t('downloads.torrentSwarmBadgeTitle', { peers: swarm.peers, seeds: swarm.seeds })"
+            v-if="statusView.bar"
+            class="block h-1 rounded-sm bg-dl-track"
+            role="progressbar"
+            :aria-valuenow="pct"
+            aria-valuemin="0"
+            aria-valuemax="100"
           >
-            <Users class="h-3 w-3" aria-hidden />
-            {{ t("downloads.torrentSwarmBadge", { peers: swarm.peers, seeds: swarm.seeds }) }}
+            <span
+              class="block h-1 rounded-sm transition-[width] duration-300 ease-out"
+              :class="statusView.bar"
+              :style="{ width: `${pct}%` }"
+            />
           </span>
-        </div>
+        </span>
 
-        <div
-          v-if="download.status === 'active' || download.status === 'muxing' || download.status === 'paused'"
-          class="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-muted-foreground"
-        >
-          <span class="font-medium text-foreground/80">
-            {{ formatBytes(download.total_bytes) }}
+        <template v-if="!compact">
+          <span
+            role="gridcell"
+            class="text-right font-mono text-xs"
+            :class="sizeLabel ? 'text-foreground' : 'text-muted-foreground'"
+          >
+            {{ sizeLabel ?? t("downloads.sizeUnknown") }}
           </span>
-          <span v-if="download.status === 'active' && stats" class="font-medium text-foreground/80">
-            {{ formatSpeed(stats.speed_bps) }}
+          <span role="gridcell" class="text-right font-mono text-xs text-muted-foreground">
+            {{ addedLabel }}
           </span>
-          <span v-if="download.status === 'active' && stats">
-            {{ t("detail.metricEta") }} <span class="font-medium text-foreground/80">{{ formatEta(stats.eta) }}</span>
-          </span>
-          <span v-else-if="download.status === 'muxing'" class="font-medium text-info">
-            {{ t("downloads.mergingMedia") }}
-          </span>
-          <span v-else-if="download.status === 'paused'">
-            {{ t("downloads.bytesDownloaded", { bytes: formatBytes(download.downloaded_bytes) }) }}
-          </span>
-          <span class="truncate">{{ shortenUrl(download.url) }}</span>
-        </div>
+        </template>
 
-        <p
-          v-else-if="download.status === 'failed'"
-          class="mt-1 text-xs text-danger"
-        >
-          {{ errorLine }}
-        </p>
-
-        <p
-          v-else-if="download.status === 'queued'"
-          class="mt-1 text-xs text-muted-foreground"
-        >
-          {{
-            download.downloaded_bytes > 0
-              ? t("downloads.queuedSoFar", { bytes: formatBytes(download.downloaded_bytes), url: shortenUrl(download.url) })
-              : t("downloads.queuedTotal", { bytes: formatBytes(download.total_bytes), url: shortenUrl(download.url) })
-          }}
-          <span class="block">{{ t("downloads.willStartWhenSlotFrees") }}</span>
-        </p>
-
-        <div
-          v-else-if="download.status === 'completed'"
-          class="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-muted-foreground"
-        >
-          <span class="font-medium text-foreground/80">
-            {{ formatBytes(download.total_bytes ?? download.downloaded_bytes) }}
-          </span>
-          <span class="truncate font-mono">{{ shortenPath(download.output_path) }}</span>
-        </div>
-
-        <ProgressBar v-if="showProgress" :value="pct" :tone="tone" class="mt-2" />
+        <span role="gridcell" class="flex items-center justify-end gap-1" @click.stop>
+          <template v-if="download.status === 'completed'">
+            <button
+              type="button"
+              :class="[
+                QUIET_BUTTON,
+                'border-border px-3 text-xs font-semibold text-foreground hover:bg-accent group-hover:bg-dl-raised',
+                isLit ? 'bg-dl-raised' : 'bg-transparent',
+              ]"
+              :aria-label="t('downloads.rowOpenAria', { filename: download.filename })"
+              @click="openFile"
+            >
+              {{ t("downloads.rowOpen") }}
+            </button>
+            <button
+              type="button"
+              :class="[
+                QUIET_BUTTON,
+                'w-8 border-transparent text-muted-foreground hover:bg-accent hover:text-foreground',
+              ]"
+              :aria-label="t('downloads.rowShowInFolder')"
+              :title="t('downloads.rowShowInFolder')"
+              @click="openFolder"
+            >
+              <Folder class="h-4 w-4" aria-hidden="true" />
+            </button>
+          </template>
+          <button
+            v-else-if="primaryAction"
+            type="button"
+            :class="[
+              QUIET_BUTTON,
+              'w-8 hover:bg-accent group-hover:border-border group-hover:bg-dl-raised group-hover:text-foreground',
+              isLit
+                ? 'border-border bg-dl-raised text-foreground'
+                : 'border-transparent text-muted-foreground',
+            ]"
+            :aria-label="primaryAction.label"
+            :title="primaryAction.label"
+            @click="primaryAction.run()"
+          >
+            <component :is="primaryAction.icon" class="h-[15px] w-[15px]" aria-hidden="true" />
+          </button>
+          <RowMenu :items="menuItems">
+            <MoreHorizontal class="h-[18px] w-[18px]" aria-hidden="true" />
+          </RowMenu>
+        </span>
       </div>
-
-      <div class="flex shrink-0 items-center gap-1" @click.stop>
-        <template v-if="download.status === 'failed'">
-          <Button
-            v-if="isExpiredAuth"
-            size="sm"
-            variant="secondary"
-            :title="t('downloads.refreshLinkHint')"
-            @click="openRefreshLink"
-          >
-            {{ t("downloads.refreshLink") }}
-          </Button>
-          <Button v-else size="sm" variant="secondary" @click="restart(download.id)">
-            {{ t("downloads.retryNow") }}
-          </Button>
-        </template>
-        <template v-else-if="download.status === 'completed'">
-          <Button size="icon" variant="ghost" :title="t('downloads.rowOpenFile')" @click="openFile">
-            <ExternalLink class="h-4 w-4" />
-          </Button>
-          <Button size="icon" variant="ghost" :title="t('downloads.rowOpenFolder')" @click="openFolder">
-            <Folder class="h-4 w-4" />
-          </Button>
-        </template>
-        <template v-else-if="download.status !== 'cancelled'">
-          <Button
-            size="icon"
-            variant="ghost"
-            :title="isPausable ? t('downloads.rowPause') : t('downloads.rowResume')"
-            @click="togglePauseResume"
-          >
-            <Pause v-if="isPausable" class="h-4 w-4" />
-            <Play v-else class="h-4 w-4" />
-          </Button>
-        </template>
-        <RowMenu :items="menuItems">
-          <MoreHorizontal class="h-4 w-4" />
-        </RowMenu>
-      </div>
-    </div>
-      </article>
     </ContextMenuTrigger>
 
-    <ContextMenuContent class="min-w-[14rem]">
+    <ContextMenuContent class="dl-surface min-w-[14rem]">
       <ContextMenuItem v-if="anyPlayable" @select="ctxPause">
         <Pause class="h-3.5 w-3.5" />
         <span>{{ t("downloads.menuPause") }}</span>
-        <ContextMenuShortcut>Space</ContextMenuShortcut>
       </ContextMenuItem>
       <ContextMenuItem v-else-if="anyResumable" @select="ctxResume">
         <Play class="h-3.5 w-3.5" />
         <span>{{ t("downloads.menuResume") }}</span>
-        <ContextMenuShortcut>Space</ContextMenuShortcut>
       </ContextMenuItem>
 
       <ContextMenuItem :disabled="!anyRestartable" @select="ctxRetry">
@@ -588,7 +743,7 @@ const menuItems = computed(() => {
           <FolderTree class="h-3.5 w-3.5" />
           <span>{{ t("downloads.menuMoveToCategory") }}</span>
         </ContextMenuSubTrigger>
-        <ContextMenuSubContent>
+        <ContextMenuSubContent class="dl-surface">
           <ContextMenuItem
             v-for="c in categories.list"
             :key="c.id"

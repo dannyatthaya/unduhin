@@ -1,219 +1,145 @@
 <script setup lang="ts">
-import { computed } from "vue";
+// Centred empty states for the downloads list.
+//
+// - "welcome": no downloads at all (first run) — the two ways to start.
+// - "search": a search with no matches — offers to clear it.
+// - "filtered" / a status: the category or status tab is simply empty.
+
+import { computed, type Component } from "vue";
 import { useI18n } from "vue-i18n";
 import {
-  Plus,
-  ClipboardPaste,
-  FolderOpen,
-  ArrowDownUp,
-  Puzzle,
-  ArrowUpRight,
-  CheckCircle2,
-  PauseCircle,
-  Clock,
   AlertTriangle,
-  XCircle,
-  Inbox,
+  ArrowDownUp,
+  CheckCircle2,
+  Clock,
+  Download,
   Filter,
+  PauseCircle,
+  Plug,
+  Plus,
+  Search,
+  X,
+  XCircle,
 } from "lucide-vue-next";
-import Button from "./ui/Button.vue";
+
+import { useSettingsStore } from "@/stores/settings";
+import { isMacOS } from "@/lib/platform";
 import type { Status } from "@/types/tauri-bindings";
 
-// "welcome" is the first-launch full pitch with the three cards and the
-// extension teaser. The status variants are short, honest messages that
-// replace the bare "No downloads match the current filter." paragraph
-// the per-status filter used to render. "filtered" is the catch-all when
-// the search/category combination has no matches.
-export type EmptyVariant = Status | "welcome" | "filtered";
-
-const { t } = useI18n();
+export type EmptyVariant = Status | "welcome" | "search" | "filtered";
 
 const props = withDefaults(
-  defineProps<{ variant?: EmptyVariant }>(),
-  { variant: "welcome" },
+  defineProps<{
+    variant?: EmptyVariant;
+    /** The search text, shown in the "search" variant's title. */
+    query?: string;
+  }>(),
+  { variant: "welcome", query: "" },
 );
 
-defineEmits<{ "add-url": [] }>();
+const emit = defineEmits<{ "add-url": []; "clear-search": [] }>();
 
-const statusIcons: Record<Exclude<EmptyVariant, "welcome">, typeof CheckCircle2> = {
-  active: ArrowDownUp,
-  queued: Clock,
-  paused: PauseCircle,
-  completed: CheckCircle2,
-  failed: AlertTriangle,
-  cancelled: XCircle,
-  muxing: ArrowDownUp,
-  filtered: Filter,
+const { t } = useI18n();
+const settings = useSettingsStore();
+
+type FilterVariant = Exclude<EmptyVariant, "welcome" | "search">;
+
+const FILTER_STATES: Record<FilterVariant, { icon: Component; key: string }> = {
+  active: { icon: ArrowDownUp, key: "Active" },
+  queued: { icon: Clock, key: "Queued" },
+  paused: { icon: PauseCircle, key: "Paused" },
+  completed: { icon: CheckCircle2, key: "Completed" },
+  failed: { icon: AlertTriangle, key: "Failed" },
+  cancelled: { icon: XCircle, key: "Cancelled" },
+  muxing: { icon: ArrowDownUp, key: "Muxing" },
+  filtered: { icon: Filter, key: "Filtered" },
 };
 
-const statusTitleKey: Record<Exclude<EmptyVariant, "welcome">, string> = {
-  active: "downloads.emptyActiveTitle",
-  queued: "downloads.emptyQueuedTitle",
-  paused: "downloads.emptyPausedTitle",
-  completed: "downloads.emptyCompletedTitle",
-  failed: "downloads.emptyFailedTitle",
-  cancelled: "downloads.emptyCancelledTitle",
-  muxing: "downloads.emptyMuxingTitle",
-  filtered: "downloads.emptyFilteredTitle",
-};
-
-const statusHintKey: Record<Exclude<EmptyVariant, "welcome">, string> = {
-  active: "downloads.emptyActiveHint",
-  queued: "downloads.emptyQueuedHint",
-  paused: "downloads.emptyPausedHint",
-  completed: "downloads.emptyCompletedHint",
-  failed: "downloads.emptyFailedHint",
-  cancelled: "downloads.emptyCancelledHint",
-  muxing: "downloads.emptyMuxingHint",
-  filtered: "downloads.emptyFilteredHint",
-};
-
-const status = computed(() => {
-  if (props.variant === "welcome") return null;
-  const key = props.variant as Exclude<EmptyVariant, "welcome">;
+const content = computed<{ icon: Component; title: string; body: string }>(() => {
+  if (props.variant === "welcome") {
+    return {
+      icon: Download,
+      title: t("downloads.emptyFirstTitle"),
+      body: t("downloads.emptyFirstBody"),
+    };
+  }
+  if (props.variant === "search") {
+    return {
+      icon: Search,
+      title: t("downloads.emptySearchTitle", { query: props.query }),
+      body: t("downloads.emptySearchBody"),
+    };
+  }
+  const state = FILTER_STATES[props.variant];
   return {
-    icon: statusIcons[key] ?? Inbox,
-    title: t(statusTitleKey[key] ?? "downloads.emptyFilteredTitle"),
-    hint: t(statusHintKey[key] ?? "downloads.emptyFilteredHint"),
+    icon: state.icon,
+    title: t(`downloads.empty${state.key}Title`),
+    body: t(`downloads.empty${state.key}Hint`),
   };
 });
+
+// The tip describes the clipboard watcher, which is opt-in — only promise
+// it when it is actually on.
+const showClipboardTip = computed(
+  () => props.variant === "welcome" && settings.values["watch_clipboard"] === true,
+);
+
+const newShortcut = isMacOS ? "⌘N" : "Ctrl N";
+
+const BUTTON =
+  "flex h-10 items-center gap-2 rounded-[10px] px-4 transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring";
+const SECONDARY = "border border-border bg-dl-raised font-medium text-foreground hover:bg-accent";
 </script>
 
 <template>
-  <section
-    v-if="status"
-    class="mx-auto flex max-w-md flex-col items-center px-6 py-16 text-center"
-  >
-    <div
-      class="flex h-12 w-12 items-center justify-center rounded-full bg-muted text-muted-foreground"
-    >
-      <component :is="status.icon" class="h-6 w-6" />
-    </div>
-    <h2 class="mt-4 font-serif text-xl font-bold tracking-tight">
-      {{ status.title }}
-    </h2>
-    <p class="mt-1.5 max-w-xs text-sm text-muted-foreground">
-      {{ status.hint }}
-    </p>
-  </section>
+  <div class="flex min-h-0 flex-1 items-center justify-center px-6 py-12">
+    <section class="flex max-w-[440px] flex-col items-center gap-3.5 text-center">
+      <span
+        class="flex h-14 w-14 items-center justify-center rounded-2xl bg-dl-accent-soft text-primary shadow-[inset_0_0_0_1px_var(--dl-accent-ring)]"
+      >
+        <component :is="content.icon" class="h-[26px] w-[26px]" aria-hidden="true" />
+      </span>
+      <h2 class="mt-1 text-xl font-semibold tracking-[-0.01em]">
+        {{ content.title }}
+      </h2>
+      <p class="text-sm leading-normal text-muted-foreground">
+        {{ content.body }}
+      </p>
 
-  <section v-else class="mx-auto max-w-6xl px-2">
-    <header class="flex items-end justify-between gap-6">
-      <div class="max-w-2xl">
-        <p class="text-xs font-semibold uppercase tracking-[0.18em] text-primary">
-          {{ t("downloads.emptyWelcomeTitle") }}
-        </p>
-        <h2 class="mt-2 font-serif text-4xl font-black tracking-tight">
-          {{ t("downloads.emptyWelcomeSubtitle") }}
-        </h2>
-        <p class="mt-2 text-sm text-muted-foreground">
-          {{ t("downloads.emptyWelcomeIntro") }}
-        </p>
-      </div>
-      <Button variant="primary" size="md" class="shrink-0" @click="$emit('add-url')">
-        <Plus class="h-4 w-4" />
-        {{ t("downloads.emptyWelcomeAddFirst") }}
-      </Button>
-    </header>
-
-    <div class="mt-8 grid grid-cols-1 gap-4 md:grid-cols-3">
-      <!-- 01 -->
-      <article class="relative overflow-hidden rounded-xl border border-border bg-card p-5">
-        <span
-          class="pointer-events-none absolute right-4 top-3 select-none font-serif text-5xl font-black text-primary/10"
-        >
-          01
-        </span>
-        <div
-          class="flex h-10 w-10 items-center justify-center rounded-lg bg-primary/10 text-primary"
-        >
-          <ClipboardPaste class="h-5 w-5" />
-        </div>
-        <h3 class="mt-4 font-serif text-lg font-bold">{{ t("downloads.emptyWelcomeCard1Title") }}</h3>
-        <p class="mt-1.5 text-sm leading-relaxed text-muted-foreground">
-          {{ t("downloads.emptyWelcomeCard1Body") }}
-        </p>
-        <div class="mt-4 flex items-center gap-1.5 font-mono text-[11px] text-muted-foreground">
-          <span>{{ t("downloads.emptyWelcomeCard1Shortcut") }}</span>
-        </div>
-      </article>
-
-      <!-- 02 -->
-      <article class="relative overflow-hidden rounded-xl border border-border bg-card p-5">
-        <span
-          class="pointer-events-none absolute right-4 top-3 select-none font-serif text-5xl font-black text-primary/10"
-        >
-          02
-        </span>
-        <div
-          class="flex h-10 w-10 items-center justify-center rounded-lg bg-primary/10 text-primary"
-        >
-          <FolderOpen class="h-5 w-5" />
-        </div>
-        <h3 class="mt-4 font-serif text-lg font-bold">{{ t("downloads.emptyWelcomeCard2Title") }}</h3>
-        <p class="mt-1.5 text-sm leading-relaxed text-muted-foreground">
-          {{ t("downloads.emptyWelcomeCard2Body") }}
-        </p>
-        <div class="mt-4">
-          <span
-            class="inline-flex items-center rounded-md bg-primary/10 px-2 py-0.5 font-mono text-[11px] text-primary"
-          >
-            {{ t("downloads.emptyWelcomeCard2Hint") }}
-          </span>
-        </div>
-      </article>
-
-      <!-- 03 -->
-      <article class="relative overflow-hidden rounded-xl border border-border bg-card p-5">
-        <span
-          class="pointer-events-none absolute right-4 top-3 select-none font-serif text-5xl font-black text-primary/10"
-        >
-          03
-        </span>
-        <div
-          class="flex h-10 w-10 items-center justify-center rounded-lg bg-primary/10 text-primary"
-        >
-          <ArrowDownUp class="h-5 w-5" />
-        </div>
-        <h3 class="mt-4 font-serif text-lg font-bold">{{ t("downloads.emptyWelcomeCard3Title") }}</h3>
-        <p class="mt-1.5 text-sm leading-relaxed text-muted-foreground">
-          {{ t("downloads.emptyWelcomeCard3Body") }}
-        </p>
-        <div class="mt-4 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-success">
-          <span class="font-medium">✓ {{ t("downloads.emptyWelcomeBadgeResumable") }}</span>
-          <span class="text-muted-foreground">·</span>
-          <span class="font-medium">{{ t("downloads.emptyWelcomeBadgeParallel") }}</span>
-          <span class="text-muted-foreground">·</span>
-          <span class="font-medium">{{ t("downloads.emptyWelcomeBadgeVerified") }}</span>
-        </div>
-      </article>
-    </div>
-
-    <aside
-      class="mt-6 flex flex-col gap-3 rounded-xl bg-primary px-5 py-4 text-primary-foreground sm:flex-row sm:items-center"
-    >
       <div
-        class="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-white/15"
+        v-if="variant === 'welcome' || variant === 'search'"
+        class="mt-2 flex flex-wrap justify-center gap-2"
       >
-        <Puzzle class="h-5 w-5" />
+        <template v-if="variant === 'welcome'">
+          <button
+            type="button"
+            :class="[BUTTON, 'bg-dl-accent font-semibold text-dl-on-accent hover:brightness-95']"
+            @click="emit('add-url')"
+          >
+            <Plus class="h-4 w-4" aria-hidden="true" />
+            {{ t("downloads.newDownload") }}
+            <kbd class="text-[11px] opacity-75">{{ newShortcut }}</kbd>
+          </button>
+          <RouterLink :to="{ name: 'settings-browser' }" :class="[BUTTON, SECONDARY]">
+            <Plug class="h-4 w-4" aria-hidden="true" />
+            {{ t("downloads.emptyConnectExtension") }}
+          </RouterLink>
+        </template>
+        <button
+          v-else
+          type="button"
+          :class="[BUTTON, SECONDARY]"
+          @click="emit('clear-search')"
+        >
+          <X class="h-3.5 w-3.5" aria-hidden="true" />
+          {{ t("downloads.searchClear") }}
+          <kbd class="text-[11px] text-muted-foreground">Esc</kbd>
+        </button>
       </div>
-      <div class="flex-1">
-        <p class="text-[11px] font-semibold uppercase tracking-[0.18em] text-white/70">
-          {{ t("downloads.emptyWelcomeAsideTitle") }}
-        </p>
-        <h3 class="font-serif text-base font-bold">
-          {{ t("downloads.emptyWelcomeAsideBody") }}
-        </h3>
-        <p class="mt-0.5 text-xs text-white/85">
-          {{ t("downloads.emptyWelcomeAsideHint") }}
-        </p>
-      </div>
-      <button
-        class="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-background px-3 py-1.5 text-xs font-semibold text-foreground transition-colors hover:bg-background/90"
-      >
-        {{ t("downloads.emptyWelcomeNotifyMe") }}
-        <ArrowUpRight class="h-3.5 w-3.5" />
-      </button>
-    </aside>
-  </section>
+
+      <p v-if="showClipboardTip" class="mt-2.5 text-xs text-muted-foreground">
+        {{ t("downloads.emptyClipboardTip") }}
+      </p>
+    </section>
+  </div>
 </template>

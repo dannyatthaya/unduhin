@@ -1,0 +1,242 @@
+/*
+ * Scoped theme for the downloads page (design "Option A3": yellow + black,
+ * paper + yellow in light mode).
+ *
+ * Everything hangs off `.dl-surface`, so the Settings routes and the shared
+ * dialogs keep the app-wide palette from `style.css`. Inside the scope the
+ * shadcn-style HSL channels are remapped, which re-skins every existing
+ * utility (`bg-background`, `text-muted-foreground`, `bg-primary`, …) and
+ * every reused component without touching them. Tokens the shared set has no
+ * slot for are declared as `--dl-*` and exposed as `*-dl-*` utilities below.
+ *
+ * Menus and popovers opened from the page are teleported to <body>; they
+ * carry the `dl-surface` class themselves so the scope follows them.
+ *
+ * `--primary` is the accent as a *line or text* colour (dark yellow on
+ * paper, yellow on black). The solid yellow fill is `--dl-accent`.
+ */
+
+.dl-surface {
+  --background: 48 38.5% 97.5%;
+  --foreground: 51.4 18.9% 7.3%;
+
+  --muted: 46.2 24.5% 89.6%;
+  --muted-foreground: 45 6.3% 37.6%;
+
+  --card: 0 0% 100%;
+  --card-foreground: 51.4 18.9% 7.3%;
+
+  --primary: 45.2 100% 23.9%;
+  --primary-foreground: 0 0% 100%;
+
+  --accent: 46.2 24.5% 89.6%;
+  --accent-foreground: 51.4 18.9% 7.3%;
+
+  --border: 45.9 18.3% 81.8%;
+  --input: 45.9 6.8% 50.8%;
+  --ring: 51.4 18.9% 7.3%;
+
+  --sidebar: 46.7 27.3% 93.5%;
+  --sidebar-foreground: 51.4 18.9% 7.3%;
+
+  --success: 129.9 49.2% 36.3%;
+  --danger: 4.2 76.5% 40%;
+  --info: 224.3 76.3% 48%;
+
+  --dl-chrome: #f3f1ea;
+  --dl-raised: #f3f1ea;
+  --dl-field: #ffffff;
+  --dl-hover: #f1ecdc;
+  --dl-selrow: #fff3c4;
+  --dl-group: #f7f5ef;
+  --dl-line: #e3e0d5;
+  --dl-line-soft: #eeebe2;
+  --dl-track: #e6e2d6;
+  --dl-soft: #3a382f;
+  --dl-dim: #69665d;
+  --dl-accent: #ffd60a;
+  --dl-on-accent: #16150f;
+  --dl-accent-soft: #ffd60a33;
+  --dl-accent-ring: #7a5c0066;
+  --dl-bulk: #fff6cc;
+  --dl-fail-soft: #b4231814;
+  --dl-switch-knob: #ffffff;
+  --dl-scrollbar: #7a5c00;
+
+  --dl-kind-video-bg: #efe9ff;
+  --dl-kind-video-fg: #5a3cc2;
+  --dl-kind-archive-bg: #fdeae2;
+  --dl-kind-archive-fg: #a8380e;
+  --dl-kind-app-bg: #e3f4e6;
+  --dl-kind-app-fg: #1f6b2c;
+  --dl-kind-audio-bg: #fbe6f3;
+  --dl-kind-audio-fg: #9c1f6e;
+  --dl-kind-doc-bg: #e4eefb;
+  --dl-kind-doc-fg: #1d4f9c;
+  --dl-kind-file-bg: #eeece4;
+  --dl-kind-file-fg: #47453c;
+
+  font-family: "Geist Sans", "Segoe UI", system-ui, sans-serif;
+  font-size: 13px;
+}
+
+.dark .dl-surface {
+  --background: 0 0% 3.9%;
+  --foreground: 60 23.1% 94.9%;
+
+  --muted: 0 0% 14.9%;
+  --muted-foreground: 60 6.1% 61.6%;
+
+  --card: 0 0% 7.8%;
+  --card-foreground: 60 23.1% 94.9%;
+
+  --primary: 50 100% 52%;
+  --primary-foreground: 0 0% 3.9%;
+
+  --accent: 0 0% 12.2%;
+  --accent-foreground: 60 23.1% 94.9%;
+
+  --border: 0 0% 18%;
+  --input: 60 3.4% 40.6%;
+  --ring: 50 100% 52%;
+
+  --sidebar: 0 0% 6.3%;
+  --sidebar-foreground: 60 23.1% 94.9%;
+
+  --success: 135.4 58.5% 59.4%;
+  --danger: 7.2 100% 73.9%;
+  --info: 207 100% 74.3%;
+
+  --dl-chrome: #101010;
+  --dl-raised: #1c1c1c;
+  --dl-field: #161616;
+  --dl-hover: #1f1e17;
+  --dl-selrow: #262110;
+  --dl-group: #0d0d0d;
+  --dl-line: #222222;
+  --dl-line-soft: #191919;
+  --dl-track: #2b2b2b;
+  --dl-soft: #d6d6cc;
+  --dl-dim: #83837a;
+  --dl-accent: #ffd60a;
+  --dl-on-accent: #0a0a0a;
+  --dl-accent-soft: #ffd60a1c;
+  --dl-accent-ring: #ffd60a4d;
+  --dl-bulk: #1b180a;
+  --dl-fail-soft: #ff8a7a22;
+  --dl-switch-knob: #0a0a0a;
+  --dl-scrollbar: #ffd60a;
+
+  --dl-kind-video-bg: #211c33;
+  --dl-kind-video-fg: #c9bcff;
+  --dl-kind-archive-bg: #2b1913;
+  --dl-kind-archive-fg: #ffa27f;
+  --dl-kind-app-bg: #122419;
+  --dl-kind-app-fg: #8fe0a6;
+  --dl-kind-audio-bg: #2a1626;
+  --dl-kind-audio-fg: #ff9fd6;
+  --dl-kind-doc-bg: #13202e;
+  --dl-kind-doc-fg: #8cc4ff;
+  --dl-kind-file-bg: #1f1f1f;
+  --dl-kind-file-fg: #cfcfc6;
+}
+
+@theme inline {
+  --color-dl-chrome: var(--dl-chrome);
+  --color-dl-raised: var(--dl-raised);
+  --color-dl-field: var(--dl-field);
+  --color-dl-hover: var(--dl-hover);
+  --color-dl-selrow: var(--dl-selrow);
+  --color-dl-group: var(--dl-group);
+  --color-dl-line: var(--dl-line);
+  --color-dl-line-soft: var(--dl-line-soft);
+  --color-dl-track: var(--dl-track);
+  --color-dl-soft: var(--dl-soft);
+  --color-dl-dim: var(--dl-dim);
+  --color-dl-accent: var(--dl-accent);
+  --color-dl-on-accent: var(--dl-on-accent);
+  --color-dl-accent-soft: var(--dl-accent-soft);
+  --color-dl-accent-ring: var(--dl-accent-ring);
+  --color-dl-bulk: var(--dl-bulk);
+  --color-dl-fail-soft: var(--dl-fail-soft);
+}
+
+/* Geist replaces the app-wide Open Sans / JetBrains Mono / Merriweather
+   inside the scope. Unlayered, so it wins over Tailwind's font utilities. */
+.dl-surface .font-sans,
+.dl-surface .font-serif {
+  font-family: "Geist Sans", "Segoe UI", system-ui, sans-serif;
+}
+
+.dl-surface .font-mono,
+.dl-surface kbd {
+  font-family: "Geist Mono", ui-monospace, "Consolas", monospace;
+}
+
+/* Thin accent scrollbars on a transparent track. */
+.dl-surface,
+.dl-surface * {
+  scrollbar-width: thin;
+  scrollbar-color: var(--dl-scrollbar) transparent;
+}
+
+.dl-surface ::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.dl-surface ::-webkit-scrollbar-track,
+.dl-surface ::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+.dl-surface ::-webkit-scrollbar-thumb {
+  background: var(--dl-scrollbar);
+  border: 0;
+  border-radius: 3px;
+}
+
+/* The shared Switch has a white thumb; on the yellow track it needs the
+   dark knob from the design. */
+.dl-surface [role="switch"][data-state="checked"] > span {
+  background: var(--dl-switch-knob);
+}
+
+/* One column template for the header row and every list row; the list
+   container sets `--dl-cols` (wide vs compact). */
+.dl-grid-row {
+  display: grid;
+  grid-template-columns: var(--dl-cols);
+  align-items: center;
+}
+
+/* File-kind tiles. */
+.dl-kind-video {
+  background: var(--dl-kind-video-bg);
+  color: var(--dl-kind-video-fg);
+}
+
+.dl-kind-archive {
+  background: var(--dl-kind-archive-bg);
+  color: var(--dl-kind-archive-fg);
+}
+
+.dl-kind-app {
+  background: var(--dl-kind-app-bg);
+  color: var(--dl-kind-app-fg);
+}
+
+.dl-kind-audio {
+  background: var(--dl-kind-audio-bg);
+  color: var(--dl-kind-audio-fg);
+}
+
+.dl-kind-doc {
+  background: var(--dl-kind-doc-bg);
+  color: var(--dl-kind-doc-fg);
+}
+
+.dl-kind-file {
+  background: var(--dl-kind-file-bg);
+  color: var(--dl-kind-file-fg);
+}

@@ -1,5 +1,7 @@
 @import "tailwindcss";
 @import "tw-animate-css";
+/* Scoped palette + tokens for the downloads page only (`.dl-surface`). */
+@import "./downloads-theme.css";
 
 /* Tailwind v4: opt into the v3-style class-based `dark:` variant.
    `useDark()` from VueUse toggles the `dark` class on <html>. */
