@@ -94,8 +94,21 @@ pub fn headers_from_job(job: &DownloadJob) -> Vec<(String, String)> {
     if let Some(ua) = job.user_agent.as_ref().filter(|s| !s.is_empty()) {
         out.push(("User-Agent".to_string(), ua.clone()));
     }
+    // `Referer` and `User-Agent` observed on the real request stand in when
+    // the dedicated field is empty — `DownloadItem.referrer` is often blank
+    // for a download the page started itself, and dropping the Referer the
+    // browser actually sent is what makes a hotlink-protected host answer
+    // 403. `Cookie` never falls back: it comes only from the dedicated field,
+    // so turning cookie forwarding off stays a hard off.
+    let has_referer = out.iter().any(|(n, _)| n.eq_ignore_ascii_case("referer"));
+    let has_ua = out
+        .iter()
+        .any(|(n, _)| n.eq_ignore_ascii_case("user-agent"));
     for h in &job.request_headers {
-        if is_prepended_header(&h.name) {
+        let dedicated_wins = h.name.eq_ignore_ascii_case("cookie")
+            || (has_referer && h.name.eq_ignore_ascii_case("referer"))
+            || (has_ua && h.name.eq_ignore_ascii_case("user-agent"));
+        if dedicated_wins {
             continue;
         }
         out.push((h.name.clone(), h.value.clone()));

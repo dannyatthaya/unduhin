@@ -59,6 +59,14 @@ pub const HEADER_DROP_LIST: &[&str] = &[
     "upgrade",
     "proxy-authorization",
     "proxy-authenticate",
+    // Conditional headers describe the *browser's* cache, not ours. Replayed
+    // on every request they turn a download into `304 Not Modified` (no
+    // body). `If-Range` is set per ranged request by the transfer itself.
+    "if-none-match",
+    "if-modified-since",
+    "if-match",
+    "if-unmodified-since",
+    "if-range",
 ];
 
 /// Most redirects followed for one request, matching reqwest's default.
@@ -351,26 +359,50 @@ fn sanitize_headers(pairs: &[(String, String)]) -> HeaderMap {
 }
 
 /// Issue a HEAD request and parse the headers we care about. Falls back to a
-/// ranged GET (Range: bytes=0-0) if the server rejects HEAD with 405.
+/// ranged GET (Range: bytes=0-0) whenever the server refuses the HEAD.
+///
+/// Any refusal, not only 405: a URL signed for `GET` (S3-style presigned
+/// links) answers a HEAD with 403, and plenty of origins answer 404 / 501 to
+/// a method they never implemented. The browser never sends that HEAD, so
+/// trusting its status made a perfectly good link look expired on resume and
+/// on "Refresh link". The GET's status is the one that counts.
 pub async fn probe(client: &Client, url: &Url) -> Result<RemoteInfo> {
-    let resp = client.head(url.clone()).send().await?;
-    let resp = if resp.status() == StatusCode::METHOD_NOT_ALLOWED {
-        tracing::debug!("HEAD not allowed; falling back to ranged GET for probe");
+    let head = client.head(url.clone()).send().await;
+    let head_ok = matches!(&head, Ok(r) if r.status().is_success());
+    let resp = if head_ok {
+        head?
+    } else {
+        tracing::debug!("HEAD refused or failed; falling back to ranged GET for probe");
         client
             .get(url.clone())
             .header(RANGE, "bytes=0-0")
             .send()
             .await?
-    } else {
-        resp
     };
 
     let status = resp.status();
-    if !status.is_success() && status != StatusCode::PARTIAL_CONTENT {
+    if !status.is_success() {
         return Err(map_status_error(status.as_u16()));
     }
 
-    Ok(parse_remote_info(url, &resp))
+    let mut info = parse_remote_info(url, &resp);
+    if status == StatusCode::PARTIAL_CONTENT {
+        // A `206` reports the length of the one byte we asked for; the size
+        // of the resource is the total in `Content-Range: bytes 0-0/<total>`.
+        info.content_length = resp
+            .headers()
+            .get(CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(content_range_total);
+        info.accept_ranges = true;
+    }
+    Ok(info)
+}
+
+/// Total size out of a `Content-Range` value such as `bytes 0-0/1234`.
+/// `None` for the unknown-length form (`bytes 0-0/*`) or anything malformed.
+fn content_range_total(value: &str) -> Option<u64> {
+    value.rsplit_once('/')?.1.trim().parse().ok()
 }
 
 pub(crate) fn parse_remote_info(original_url: &Url, resp: &Response) -> RemoteInfo {
@@ -487,6 +519,31 @@ mod tests {
         assert!(!map.contains_key("bad name"));
         assert!(!map.contains_key("x-ok"));
         assert_eq!(map.get("x-foo").unwrap(), "bar");
+    }
+
+    #[test]
+    fn sanitize_drops_browser_conditional_headers() {
+        let pairs = vec![
+            ("If-None-Match".into(), "\"abc\"".into()),
+            (
+                "If-Modified-Since".into(),
+                "Wed, 21 Oct 2015 07:28:00 GMT".into(),
+            ),
+            ("If-Range".into(), "\"abc\"".into()),
+            ("Referer".into(), "https://example.com/".into()),
+        ];
+        let map = sanitize_headers(&pairs);
+        assert!(!map.contains_key("if-none-match"));
+        assert!(!map.contains_key("if-modified-since"));
+        assert!(!map.contains_key("if-range"));
+        assert_eq!(map.get("referer").unwrap(), "https://example.com/");
+    }
+
+    #[test]
+    fn content_range_total_reads_the_resource_size() {
+        assert_eq!(content_range_total("bytes 0-0/1234"), Some(1234));
+        assert_eq!(content_range_total("bytes 0-0/*"), None);
+        assert_eq!(content_range_total("garbage"), None);
     }
 
     #[test]

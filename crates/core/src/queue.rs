@@ -948,7 +948,7 @@ async fn run_worker(
         }
     });
 
-    let backoff = Backoff::default();
+    let backoff = backoff_setting(&pool).await;
     // Branch on the explicit backend discriminator. `Media` delegates to
     // yt-dlp, `Torrent` to the librqbit facade, and `Http` to the engine
     // (resume when a sidecar exists, fresh otherwise). The URL parse above
@@ -1596,6 +1596,36 @@ pub(crate) async fn timeouts(pool: &SqlitePool) -> (Duration, Duration) {
         .and_then(|v| v.as_u64())
         .unwrap_or(60);
     (Duration::from_secs(connect), Duration::from_secs(read))
+}
+
+/// Build the transfer's retry schedule from the `max_retries` and
+/// `retry_backoff_base_ms` settings (Settings → Network). Missing or
+/// unreadable values fall back to the engine defaults.
+pub(crate) async fn backoff_setting(pool: &SqlitePool) -> Backoff {
+    let defaults = Backoff::default();
+    let max_attempts = settings::get(pool, settings::settings_keys::MAX_RETRIES)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.as_u64())
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(defaults.max_attempts);
+    let base = settings::get(pool, settings::settings_keys::RETRY_BACKOFF_BASE_MS)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.as_u64())
+        .filter(|ms| *ms > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(defaults.base);
+    Backoff {
+        base,
+        // Never let a large base exceed the cap, or every delay would be
+        // clamped below the first one the user asked for.
+        cap: defaults.cap.max(base),
+        max_attempts,
+    }
 }
 
 /// Read the `user_agent` setting. Empty strings normalize to `None`,
