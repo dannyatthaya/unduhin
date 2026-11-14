@@ -110,6 +110,13 @@ export function createNativeBridge(
   // IDs. Ping/pong is handled separately because it can be in flight at
   // the same time as a user send.
   const replyQueue: PendingReply[] = [];
+  // FIFO of everything waiting on a `pong`, in send order. `null` is the
+  // health check's own ping; anything else is a caller that went through
+  // `send({ type: "ping" })`. Pongs never touch `replyQueue`, so a ping sent
+  // through `send()` must wait here — parked in `replyQueue` it would never
+  // be resolved, every later reply would land on the request before it, and
+  // its reply timeout would tear a healthy port down.
+  const pongQueue: (PendingReply | null)[] = [];
   let pongWaiter: ((msg: Outbound) => void) | null = null;
   let pongTimer: ReturnType<typeof setTimeout> | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -136,6 +143,13 @@ export function createNativeBridge(
   function rejectAllPending(err: Error): void {
     while (replyQueue.length > 0) {
       const next = replyQueue.shift();
+      if (next) {
+        clearTimeout(next.timer);
+        next.reject(err);
+      }
+    }
+    while (pongQueue.length > 0) {
+      const next = pongQueue.shift();
       if (next) {
         clearTimeout(next.timer);
         next.reject(err);
@@ -249,6 +263,14 @@ export function createNativeBridge(
     }
     const msg = raw as Outbound;
     if (msg.type === "pong") {
+      // Pongs come back in the order the pings went out.
+      const waiter = pongQueue.shift();
+      if (waiter) {
+        clearTimeout(waiter.timer);
+        waiter.resolve(msg);
+        return;
+      }
+      // `null` (or an empty queue): the health check's ping.
       if (pongTimer) {
         clearTimeout(pongTimer);
         pongTimer = null;
@@ -333,6 +355,7 @@ export function createNativeBridge(
       scheduleReconnect();
       return;
     }
+    pongQueue.push(null);
     pongWaiter = () => {
       // No-op — the message handler already nulls the waiter.
     };
@@ -367,15 +390,18 @@ export function createNativeBridge(
           scheduleReconnect();
         }, REPLY_TIMEOUT_MS),
       };
-      replyQueue.push(pending);
+      // A ping is answered by a `pong`, which never passes through the
+      // reply FIFO — so its waiter queues with the other pong waiters.
+      const queue = msg.type === "ping" ? pongQueue : replyQueue;
+      queue.push(pending);
       try {
         live.postMessage(msg);
       } catch (err) {
         // postMessage threw — withdraw the waiter we just enqueued (it's
         // the last one) and reject. The disconnect handler will not also
         // fire on a sync throw.
-        const idx = replyQueue.lastIndexOf(pending);
-        if (idx >= 0) replyQueue.splice(idx, 1);
+        const idx = queue.lastIndexOf(pending);
+        if (idx >= 0) queue.splice(idx, 1);
         clearTimeout(pending.timer);
         reject(err instanceof Error ? err : new Error(String(err)));
       }
