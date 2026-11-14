@@ -175,6 +175,33 @@ native-messaging keys (production's are never touched).
 > name back to your real browser. The script passes `--disable-sync` as a
 > guard; leave it in place.
 
+## Browser end-to-end test
+
+```powershell
+cargo build -p unduhin-native-host --release
+bun run --cwd extension build
+bun scripts/e2e-browser.mjs
+```
+
+Drives the built extension in a real Chromium browser (Brave by default;
+set `E2E_BROWSER` to another executable) against a headless stand-in for
+the app (`src-tauri/tests/browser_e2e_harness.rs`) and a local file host.
+It checks the capture decisions — a clicked download is captured, a
+form-POST download and a non-listed file type stay in the browser, a saved
+image stays in the browser — and the rescue chain that hands a download
+the app cannot fetch back to the browser.
+
+It is isolated the same way the dev channel is: its own pipe, its own
+native-host registration (`com.unduhin.host.e2e`, removed on exit), a
+throwaway browser profile, and an in-memory database. Every download the
+stand-in app "takes" fails at the file host on purpose, so nothing is
+written outside the temp directory. Set `E2E_VERBOSE=1` to print the
+extension's log.
+
+The one thing it cannot do is click the browser's own "Save image as…"
+menu item; that scenario is stood in for by a browser-initiated download
+of an image the page is displaying.
+
 ## CLI
 
 The `unduhin` binary is the engine + queue exercised from the shell.
