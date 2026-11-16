@@ -54,11 +54,7 @@ fn validated_color(color: Option<&str>) -> Result<Option<&str>> {
 
 /// A category name must be unique ignoring case and surrounding space:
 /// "video" and "Video" would be two rows the user cannot tell apart.
-async fn ensure_name_free(
-    pool: &SqlitePool,
-    name: &str,
-    except: Option<CategoryId>,
-) -> Result<()> {
+async fn ensure_name_free(pool: &SqlitePool, name: &str, except: Option<CategoryId>) -> Result<()> {
     let wanted = name.trim().to_lowercase();
     if wanted.is_empty() {
         return Err(CoreError::InvalidArgument(
@@ -70,12 +66,16 @@ async fn ensure_name_free(
         .into_iter()
         .any(|c| Some(c.id) != except && c.name.trim().to_lowercase() == wanted);
     if taken {
-        return Err(CoreError::InvalidArgument(format!(
-            "there is already a category called {}",
-            name.trim()
-        )));
+        return Err(name_taken(name));
     }
     Ok(())
+}
+
+fn name_taken(name: &str) -> CoreError {
+    CoreError::InvalidArgument(format!(
+        "there is already a category called {}",
+        name.trim()
+    ))
 }
 
 pub(crate) async fn list(pool: &SqlitePool) -> Result<Vec<Category>> {
@@ -110,10 +110,15 @@ pub(crate) async fn insert(pool: &SqlitePool, input: NewCategory) -> Result<Cate
         .default_output_path
         .as_ref()
         .map(|p| p.to_string_lossy().into_owned());
+    // `ensure_name_free` reads, then this writes. The `WHERE NOT EXISTS`
+    // repeats the check inside the one statement, so two adds racing on the
+    // same name cannot both land.
     let row = sqlx::query(
         "INSERT INTO categories \
          (name, icon, default_output_path, extension_rules, color, display_order) \
-         VALUES (?, ?, ?, ?, ?, (SELECT COALESCE(MAX(display_order), 0) + 1 FROM categories)) \
+         SELECT ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(display_order), 0) + 1 FROM categories) \
+         WHERE NOT EXISTS \
+         (SELECT 1 FROM categories WHERE lower(trim(name)) = lower(?)) \
          RETURNING id",
     )
     .bind(input.name.trim())
@@ -121,8 +126,10 @@ pub(crate) async fn insert(pool: &SqlitePool, input: NewCategory) -> Result<Cate
     .bind(folder)
     .bind(exts)
     .bind(color)
-    .fetch_one(pool)
+    .bind(input.name.trim())
+    .fetch_optional(pool)
     .await?;
+    let row = row.ok_or_else(|| name_taken(&input.name))?;
     Ok(row.get("id"))
 }
 
@@ -159,15 +166,25 @@ pub(crate) async fn set_order(pool: &SqlitePool, ids: &[CategoryId]) -> Result<(
 
 pub(crate) async fn update(pool: &SqlitePool, id: CategoryId, input: NewCategory) -> Result<()> {
     let color = validated_color(input.color.as_deref())?;
+    let current = get(pool, id).await?;
+    // The catch-all is found by its name (`remove`, auto-categorize), so a
+    // rename would leave the app without one.
+    if current.name == FALLBACK_NAME && input.name.trim() != FALLBACK_NAME {
+        return Err(CoreError::InvalidArgument(format!(
+            "the {FALLBACK_NAME} category cannot be renamed"
+        )));
+    }
     ensure_name_free(pool, &input.name, Some(id)).await?;
     let exts = serde_json::to_string(&normalize_extensions(&input.extension_rules))?;
     let folder = input
         .default_output_path
         .as_ref()
         .map(|p| p.to_string_lossy().into_owned());
+    // Same single-statement name guard as `insert`.
     let res = sqlx::query(
         "UPDATE categories SET name = ?, icon = ?, default_output_path = ?, \
-         extension_rules = ?, color = ? WHERE id = ?",
+         extension_rules = ?, color = ? WHERE id = ? AND NOT EXISTS \
+         (SELECT 1 FROM categories WHERE id != ? AND lower(trim(name)) = lower(?))",
     )
     .bind(input.name.trim())
     .bind(&input.icon)
@@ -175,10 +192,14 @@ pub(crate) async fn update(pool: &SqlitePool, id: CategoryId, input: NewCategory
     .bind(exts)
     .bind(color)
     .bind(id)
+    .bind(id)
+    .bind(input.name.trim())
     .execute(pool)
     .await?;
     if res.rows_affected() == 0 {
-        return Err(CoreError::CategoryNotFound(id));
+        // The row was there a moment ago (`get` above), so the name guard
+        // is what stopped the write.
+        return Err(name_taken(&input.name));
     }
     Ok(())
 }
@@ -193,16 +214,14 @@ pub(crate) async fn remove(pool: &SqlitePool, id: CategoryId) -> Result<()> {
             "the fallback category cannot be deleted".to_string(),
         ));
     }
-    let fallback = other_category_id(pool).await.ok();
 
     let mut tx = pool.begin().await?;
-    if let Some(fallback_id) = fallback {
-        sqlx::query("UPDATE downloads SET category_id = ? WHERE category_id = ?")
-            .bind(fallback_id)
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-    }
+    let fallback_id = fallback_category_id(&mut tx).await?;
+    sqlx::query("UPDATE downloads SET category_id = ? WHERE category_id = ?")
+        .bind(fallback_id)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
     let res = sqlx::query("DELETE FROM categories WHERE id = ?")
         .bind(id)
         .execute(&mut *tx)
@@ -212,6 +231,29 @@ pub(crate) async fn remove(pool: &SqlitePool, id: CategoryId) -> Result<()> {
     }
     tx.commit().await?;
     Ok(())
+}
+
+/// Id of the catch-all, putting it back when it is missing. An earlier
+/// version let "Other" be renamed, so a database can be without one, and
+/// the downloads of a deleted category still need somewhere to go.
+async fn fallback_category_id(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> Result<CategoryId> {
+    let existing: Option<CategoryId> =
+        sqlx::query_scalar("SELECT id FROM categories WHERE name = ?")
+            .bind(FALLBACK_NAME)
+            .fetch_optional(&mut **tx)
+            .await?;
+    if let Some(id) = existing {
+        return Ok(id);
+    }
+    let created: CategoryId = sqlx::query_scalar(
+        "INSERT INTO categories (name, icon, extension_rules, display_order) \
+         VALUES (?, 'other', '[]', (SELECT COALESCE(MAX(display_order), 0) + 1 FROM categories)) \
+         RETURNING id",
+    )
+    .bind(FALLBACK_NAME)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(created)
 }
 
 /// Name of the seeded catch-all category.
@@ -466,6 +508,71 @@ mod tests {
 
         remove(&pool, video.id).await.unwrap();
 
+        let filed: Option<i64> = sqlx::query_scalar("SELECT category_id FROM downloads")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(filed, Some(other.id));
+    }
+
+    #[tokio::test]
+    async fn update_refuses_to_rename_the_fallback_category() {
+        let pool = fresh_pool().await;
+        let other = find_by_name(&pool, "Other").await.unwrap().unwrap();
+
+        let res = update(&pool, other.id, new_category("Misc", None)).await;
+
+        assert!(matches!(res, Err(CoreError::InvalidArgument(_))));
+        assert!(find_by_name(&pool, "Other").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn update_may_change_the_fallback_category_but_not_its_name() {
+        let pool = fresh_pool().await;
+        let other = find_by_name(&pool, "Other").await.unwrap().unwrap();
+
+        update(&pool, other.id, new_category("Other", Some("blue")))
+            .await
+            .unwrap();
+
+        let after = get(&pool, other.id).await.unwrap();
+        assert_eq!(after.color.as_deref(), Some("blue"));
+    }
+
+    #[tokio::test]
+    async fn update_rejects_a_name_another_category_has() {
+        let pool = fresh_pool().await;
+        let video = find_by_name(&pool, "Video").await.unwrap().unwrap();
+        let id = insert(&pool, new_category("Books", None)).await.unwrap();
+
+        let res = update(&pool, id, new_category(" video ", None)).await;
+
+        assert!(matches!(res, Err(CoreError::InvalidArgument(_))));
+        assert_eq!(get(&pool, video.id).await.unwrap().name, "Video");
+    }
+
+    #[tokio::test]
+    async fn remove_puts_the_fallback_back_when_an_old_version_renamed_it() {
+        let pool = fresh_pool().await;
+        let video = find_by_name(&pool, "Video").await.unwrap().unwrap();
+        // What a database looks like after an older version renamed "Other".
+        sqlx::query("UPDATE categories SET name = 'Misc' WHERE name = 'Other'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO downloads (url, filename, output_path, status, category_id, created_at) \
+             VALUES ('https://example.com/a.mp4', 'a.mp4', '/tmp/a.mp4', 'completed', ?, \
+             '2026-11-15T00:00:00Z')",
+        )
+        .bind(video.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        remove(&pool, video.id).await.unwrap();
+
+        let other = find_by_name(&pool, "Other").await.unwrap().unwrap();
         let filed: Option<i64> = sqlx::query_scalar("SELECT category_id FROM downloads")
             .fetch_one(&pool)
             .await

@@ -125,8 +125,10 @@ const sizeLabel = computed(() =>
         <span class="flex min-w-0 items-center gap-3 overflow-hidden whitespace-nowrap text-xs">
           <span v-if="sizeLabel" class="font-mono text-dl-soft">{{ sizeLabel }}</span>
           <span v-else class="text-muted-foreground">{{ t("addUrl.sizeUnknown") }}</span>
-          <span class="flex items-center gap-1 text-muted-foreground">
-            <template v-if="result?.resumable">
+          <!-- No answer from the server (a local link is not checked): say
+               nothing about connections rather than guess. -->
+          <span v-if="result" class="flex items-center gap-1 text-muted-foreground">
+            <template v-if="result.resumable">
               <RotateCw class="h-3 w-3" aria-hidden="true" />
               {{ t("addUrl.canResume") }}
             </template>

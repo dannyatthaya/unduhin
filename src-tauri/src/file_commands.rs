@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use tauri::State;
 
-use unduhin_core::{Core, DownloadId, DownloadRecord, LinkProbe};
+use unduhin_core::{folder_is_usable, Core, DownloadId, DownloadRecord, LinkProbe};
 
 use crate::error::CommandResult;
 
@@ -63,8 +63,10 @@ pub async fn probe_link(core: State<'_, Core>, url: String) -> CommandResult<Lin
     Ok(core.probe_link(&url).await?)
 }
 
-/// Write the download list to `path` (`.csv` or JSON); returns the row count.
-/// `path` comes from the system save dialog.
+/// Write the download list to `path` (`.csv` or `.json`); returns the row
+/// count. `path` is meant to come from the system save dialog; the core
+/// checks it all the same and refuses anything but a full path to an
+/// ordinary `.csv` or `.json` file.
 #[tauri::command]
 pub async fn export_history(core: State<'_, Core>, path: String) -> CommandResult<usize> {
     Ok(core.export_history(&PathBuf::from(path)).await?)
@@ -106,19 +108,10 @@ fn show_open_with(_path: &std::path::Path) -> CommandResult<()> {
 /// Whether `path` can be used as a download folder: it exists, or the
 /// nearest folder above it does (so it can be created on first use). A path
 /// on a drive that is not connected has no existing ancestor and fails.
+/// The same rule [`Core::move_download`] applies before it moves a file.
 #[tauri::command]
 pub async fn check_folder(path: String) -> CommandResult<bool> {
     Ok(folder_is_usable(std::path::Path::new(path.trim())))
-}
-
-fn folder_is_usable(path: &std::path::Path) -> bool {
-    if !path.is_absolute() {
-        return false;
-    }
-    match path.ancestors().find(|ancestor| ancestor.exists()) {
-        Some(existing) => existing.is_dir(),
-        None => false,
-    }
 }
 
 #[cfg(test)]
@@ -129,7 +122,9 @@ mod tests {
     fn accepts_an_existing_folder_and_a_new_one_inside_it() {
         let dir = std::env::temp_dir();
         assert!(folder_is_usable(&dir));
-        assert!(folder_is_usable(&dir.join("unduhin-not-created-yet").join("deeper")));
+        assert!(folder_is_usable(
+            &dir.join("unduhin-not-created-yet").join("deeper")
+        ));
     }
 
     #[test]
@@ -140,7 +135,8 @@ mod tests {
 
     #[test]
     fn rejects_a_path_under_a_file() {
-        let file = std::env::temp_dir().join(format!("unduhin-check-folder-{}", std::process::id()));
+        let file =
+            std::env::temp_dir().join(format!("unduhin-check-folder-{}", std::process::id()));
         std::fs::write(&file, b"x").unwrap();
         let usable = folder_is_usable(&file.join("inside"));
         std::fs::remove_file(&file).unwrap();
@@ -155,7 +151,9 @@ mod tests {
             .map(|letter| format!("{letter}:\\"))
             .find(|root| !std::path::Path::new(root).exists());
         if let Some(root) = free {
-            assert!(!folder_is_usable(&std::path::Path::new(&root).join("Media")));
+            assert!(!folder_is_usable(
+                &std::path::Path::new(&root).join("Media")
+            ));
         }
     }
 }

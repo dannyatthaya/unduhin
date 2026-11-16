@@ -2060,6 +2060,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_speed_limit_reaches_a_download_that_is_running() {
+        let core = crate::Core::open_in_memory().await.expect("core");
+        let id = insert_queued_row(core.pool()).await;
+        // Stand in for the queue with one running worker whose limiter the
+        // test can read back.
+        let limiter = engine::TokenBucket::new(0);
+        let cancel = CancellationToken::new();
+        let stop = cancel.clone();
+        let active = Arc::new(Mutex::new(HashMap::from([(
+            id,
+            ActiveHandle {
+                cancel,
+                join: tokio::spawn(async move { stop.cancelled().await }),
+                control: None,
+                tuning: engine::Tuning {
+                    speed_limiter: Some(limiter.clone()),
+                    help_slow_parts: None,
+                },
+                cancel_ticks: 0,
+            },
+        )])));
+        let (wake_tx, _wake_rx) = mpsc::channel(1);
+        *core.inner.queue.lock().await = Some(Arc::new(QueueHandle {
+            wake_tx,
+            shutdown: CancellationToken::new(),
+            join: Mutex::new(None),
+            active,
+        }));
+
+        core.set_speed_limit(id, Some(2_000_000))
+            .await
+            .expect("set");
+        assert_eq!(limiter.rate().await, 2_000_000);
+
+        core.set_speed_limit(id, None).await.expect("clear");
+        assert_eq!(limiter.rate().await, 0, "clearing the cap lifts it at once");
+    }
+
+    #[tokio::test]
     async fn fill_capacity_never_spawns_a_second_worker_for_one_download() {
         // The bug this locks down: `fill_capacity` used to claim any
         // `queued` row without checking the active map, and

@@ -2191,7 +2191,11 @@ async fn move_into_folder(from: &Path, dest_dir: &Path) -> PathBuf {
 /// Never overwrites anything: each candidate name is claimed with
 /// [`move_no_clobber`], and a name that turns out to be taken — even one
 /// that appeared a moment ago — just moves on to the next ` (n)`.
-pub(crate) async fn move_renamed(from: &Path, dest_dir: &Path, new_name: &std::ffi::OsStr) -> PathBuf {
+pub(crate) async fn move_renamed(
+    from: &Path,
+    dest_dir: &Path,
+    new_name: &std::ffi::OsStr,
+) -> PathBuf {
     if tokio::fs::create_dir_all(dest_dir).await.is_err() {
         return from.to_path_buf();
     }

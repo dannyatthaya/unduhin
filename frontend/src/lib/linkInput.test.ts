@@ -4,8 +4,40 @@ import {
   classifyLink,
   extensionOf,
   fileNameFromLink,
+  isLocalNetworkLink,
   splitFileName,
 } from "./linkInput";
+
+describe("isLocalNetworkLink", () => {
+  test.each([
+    "http://localhost:8080/a.zip",
+    "http://api.localhost/a.zip",
+    "http://127.0.0.1/a.zip",
+    "http://10.0.0.5/a.zip",
+    "http://172.16.4.1/a.zip",
+    "http://172.31.255.255/a.zip",
+    "http://192.168.1.20:5000/a.zip",
+    "http://169.254.169.254/latest/meta-data",
+    "http://0.0.0.0/a.zip",
+    "http://[::1]/a.zip",
+    "http://[fd12:3456::1]/a.zip",
+    "http://[fe80::1]/a.zip",
+  ])("treats %s as local", (link) => {
+    expect(isLocalNetworkLink(link)).toBe(true);
+  });
+
+  test.each([
+    "https://cdn1.example.com/media/video.mp4",
+    "http://8.8.8.8/a.zip",
+    "http://172.32.0.1/a.zip",
+    "http://192.169.1.1/a.zip",
+    "http://[2001:db8::1]/a.zip",
+    "https://localhost.example.com/a.zip",
+    "not a link",
+  ])("treats %s as not local", (link) => {
+    expect(isLocalNetworkLink(link)).toBe(false);
+  });
+});
 
 describe("classifyLink", () => {
   test("treats blank text as empty", () => {

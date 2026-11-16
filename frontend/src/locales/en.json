@@ -1005,7 +1005,7 @@
     "themeLight": "Light",
     "themeDark": "Dark",
     "historyLabel": "Download history",
-    "historyDesc": "The list itself: {n} download. Files on disk aren’t touched. | The list itself: {n} downloads. Files on disk aren’t touched.",
+    "historyDesc": "The list itself: {n} download. Files on disk aren’t touched. An export holds every link in full, including any sign-in token inside it. | The list itself: {n} downloads. Files on disk aren’t touched. An export holds every link in full, including any sign-in token inside it.",
     "historyExport": "Export…",
     "historyExported": "Exported {n} download. | Exported {n} downloads.",
     "historyExportFailed": "Couldn't export the list: {error}",

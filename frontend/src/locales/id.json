@@ -1005,7 +1005,7 @@
     "themeLight": "Terang",
     "themeDark": "Gelap",
     "historyLabel": "Riwayat unduhan",
-    "historyDesc": "Daftarnya saja: {n} unduhan. Berkas di disk tidak disentuh.",
+    "historyDesc": "Daftarnya saja: {n} unduhan. Berkas di disk tidak disentuh. Ekspor memuat setiap tautan secara utuh, termasuk token masuk di dalamnya.",
     "historyExport": "Ekspor…",
     "historyExported": "{n} unduhan diekspor.",
     "historyExportFailed": "Tidak bisa mengekspor daftar: {error}",

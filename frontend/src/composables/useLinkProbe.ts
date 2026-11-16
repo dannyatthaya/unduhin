@@ -6,7 +6,12 @@
 import { computed, ref, watch, type Ref } from "vue";
 import { useDebounceFn } from "@vueuse/core";
 
-import { classifyLink, fileNameFromLink, type LinkKind } from "@/lib/linkInput";
+import {
+  classifyLink,
+  fileNameFromLink,
+  isLocalNetworkLink,
+  type LinkKind,
+} from "@/lib/linkInput";
 import { hostOf } from "@/lib/format";
 import { api, type LinkProbe } from "@/types/tauri-bindings";
 
@@ -30,6 +35,12 @@ export function useLinkProbe(url: Ref<string>, enabled: Ref<boolean>) {
 
   const kind = computed<LinkKind>(() => classifyLink(url.value));
   const host = computed(() => result.value?.host ?? hostOf(url.value.trim()));
+  /**
+   * A link to this computer or the local network is not checked while it is
+   * typed or pasted: that would send a request to a device on the user's
+   * network before they asked for anything. The download itself still works.
+   */
+  const isLocal = computed(() => kind.value === "http" && isLocalNetworkLink(url.value));
 
   const state = computed<LinkProbeState>(() => {
     if (kind.value === "empty") return "empty";
@@ -37,6 +48,8 @@ export function useLinkProbe(url: Ref<string>, enabled: Ref<boolean>) {
     if (kind.value === "torrent") return "torrent";
     if (failed.value) return "unreachable";
     if (result.value) return "ready";
+    // Not checked on its own: the card shows what the link itself says.
+    if (isLocal.value) return "ready";
     return "checking";
   });
 
@@ -77,7 +90,7 @@ export function useLinkProbe(url: Ref<string>, enabled: Ref<boolean>) {
 
   watch([url, enabled], () => {
     clear();
-    if (enabled.value && kind.value === "http") void runDebounced();
+    if (enabled.value && kind.value === "http" && !isLocal.value) void runDebounced();
   });
 
   return { state, kind, result, host, detectedName, checking, retry: run, clear };

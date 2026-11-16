@@ -44,11 +44,54 @@ enum ExportFormat {
 }
 
 impl ExportFormat {
-    fn for_path(path: &Path) -> Self {
-        match path.extension().and_then(|e| e.to_str()) {
-            Some(ext) if ext.eq_ignore_ascii_case("csv") => ExportFormat::Csv,
-            _ => ExportFormat::Json,
+    /// `None` for any extension other than `.csv` or `.json`.
+    fn for_path(path: &Path) -> Option<Self> {
+        let ext = path.extension().and_then(|e| e.to_str())?;
+        if ext.eq_ignore_ascii_case("csv") {
+            Some(ExportFormat::Csv)
+        } else if ext.eq_ignore_ascii_case("json") {
+            Some(ExportFormat::Json)
+        } else {
+            None
         }
+    }
+}
+
+/// Whether `path` can be used as a download folder: it exists, or the
+/// nearest folder above it does (so it can be created on first use). A path
+/// on a drive that is not connected has no existing ancestor and fails.
+pub fn folder_is_usable(path: &Path) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+    match path.ancestors().find(|ancestor| ancestor.exists()) {
+        Some(existing) => existing.is_dir(),
+        None => false,
+    }
+}
+
+/// Check where an export is about to be written and pick its format.
+///
+/// The path is meant to come from the system save dialog, but the command
+/// takes it as plain text, so it is checked here: a full path, a `.csv` or
+/// `.json` name, and nothing but an ordinary file (or nothing at all) there
+/// already — never a folder, a link or a device.
+async fn export_target(path: &Path) -> Result<ExportFormat> {
+    if !path.is_absolute() {
+        return Err(CoreError::InvalidArgument(
+            "pick a full file path to export the list to".to_string(),
+        ));
+    }
+    let format = ExportFormat::for_path(path).ok_or_else(|| {
+        CoreError::InvalidArgument("the list can only be exported as .csv or .json".to_string())
+    })?;
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(existing) if !existing.file_type().is_file() => Err(CoreError::InvalidArgument(
+            format!("{} is not a file that can be replaced", path.display()),
+        )),
+        // An ordinary file (the save dialog already asked about replacing
+        // it) or nothing there yet. Any other error surfaces on the write.
+        _ => Ok(format),
     }
 }
 
@@ -63,6 +106,12 @@ impl Core {
         bps: Option<u64>,
     ) -> Result<DownloadRecord> {
         let bps = bps.filter(|n| *n > 0);
+        // The column is a signed 64-bit integer; a larger value would wrap
+        // to a negative one and read back as "no cap".
+        let stored = bps
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| CoreError::InvalidArgument("that speed limit is too large".to_string()))?;
         let record = download::get(&self.inner.pool, id).await?;
         if record.kind == DownloadKind::Torrent {
             return Err(CoreError::InvalidArgument(
@@ -70,7 +119,7 @@ impl Core {
             ));
         }
         sqlx::query("UPDATE downloads SET speed_limit_bps = ? WHERE id = ?")
-            .bind(bps.map(|n| n as i64))
+            .bind(stored)
             .bind(id)
             .execute(&self.inner.pool)
             .await?;
@@ -150,6 +199,12 @@ impl Core {
             return Err(CoreError::InvalidArgument(
                 "pick a full folder path to move the download to".to_string(),
             ));
+        }
+        if !folder_is_usable(folder) {
+            return Err(CoreError::InvalidArgument(format!(
+                "{} cannot be used as a folder",
+                folder.display()
+            )));
         }
         let record = download::get(&self.inner.pool, id).await?;
         let name = record.filename.clone();
@@ -259,12 +314,17 @@ impl Core {
     }
 
     /// Write the whole download list to `path` and return how many rows went
-    /// out. A `.csv` target gets a spreadsheet-friendly table; anything else
-    /// gets JSON with every field. Captured request headers are never
-    /// included (they are not serialized at all).
+    /// out. A `.csv` target gets a spreadsheet-friendly table; a `.json`
+    /// target gets every field. Any other target is refused, and so is one
+    /// that is not an ordinary file.
+    ///
+    /// Captured request headers are never included (they are not serialized
+    /// at all), but each link is written in full, so a token inside a link
+    /// ends up in the file.
     pub async fn export_history(&self, path: &Path) -> Result<usize> {
+        let format = export_target(path).await?;
         let records = download::list(&self.inner.pool, DownloadFilter::default()).await?;
-        let body = match ExportFormat::for_path(path) {
+        let body = match format {
             ExportFormat::Csv => history_csv(&records),
             ExportFormat::Json => serde_json::to_string_pretty(&records)?,
         };
@@ -358,6 +418,14 @@ async fn carry_sidecar(old_output: &Path, new_output: &Path) {
 
 fn sha256_of_file(path: &Path) -> std::io::Result<String> {
     use std::io::Read;
+    // Hash the download itself, never whatever a link left in its place
+    // points at.
+    if !std::fs::symlink_metadata(path)?.file_type().is_file() {
+        return Err(std::io::Error::other(format!(
+            "{} is not an ordinary file",
+            path.display()
+        )));
+    }
     let mut file = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; HASH_BUFFER_BYTES];
@@ -396,11 +464,11 @@ fn history_csv(records: &[DownloadRecord]) -> String {
 }
 
 /// Quote a CSV field when it holds a comma, a quote or a line break, and
-/// neutralise a leading `=`, `+`, `-` or `@` so a spreadsheet does not run a
-/// file name or link as a formula.
+/// neutralise a leading `=`, `+`, `-`, `@`, tab or carriage return so a
+/// spreadsheet does not run a file name or link as a formula.
 fn csv_field(value: &str) -> String {
     let guarded = match value.chars().next() {
-        Some('=' | '+' | '-' | '@') => format!("'{value}"),
+        Some('=' | '+' | '-' | '@' | '\t' | '\r') => format!("'{value}"),
         _ => value.to_string(),
     };
     if guarded.contains([',', '"', '\n', '\r']) {
@@ -495,13 +563,14 @@ mod tests {
     fn export_format_follows_the_extension() {
         assert_eq!(
             ExportFormat::for_path(Path::new("list.CSV")),
-            ExportFormat::Csv
+            Some(ExportFormat::Csv)
         );
         assert_eq!(
             ExportFormat::for_path(Path::new("list.json")),
-            ExportFormat::Json
+            Some(ExportFormat::Json)
         );
-        assert_eq!(ExportFormat::for_path(Path::new("list")), ExportFormat::Json);
+        assert_eq!(ExportFormat::for_path(Path::new("list")), None);
+        assert_eq!(ExportFormat::for_path(Path::new("list.txt")), None);
     }
 
     #[tokio::test]
@@ -659,6 +728,106 @@ mod tests {
         let text = tokio::fs::read_to_string(&target).await.unwrap();
         assert!(text.starts_with("name,link,status,"));
         assert!(text.contains("a.bin"));
+    }
+
+    #[tokio::test]
+    async fn export_history_writes_json_for_a_json_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (core, _id) = core_with_completed_file(tmp.path(), "a.bin", b"data").await;
+        let target = tmp.path().join("history.JSON");
+
+        let count = core.export_history(&target).await.unwrap();
+
+        assert_eq!(count, 1);
+        let text = tokio::fs::read_to_string(&target).await.unwrap();
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn export_history_refuses_another_extension() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (core, _id) = core_with_completed_file(tmp.path(), "a.bin", b"data").await;
+        let target = tmp.path().join("history.bat");
+
+        let result = core.export_history(&target).await;
+
+        assert!(matches!(result, Err(CoreError::InvalidArgument(_))));
+        assert!(!target.exists());
+    }
+
+    #[tokio::test]
+    async fn export_history_refuses_a_relative_path() {
+        let core = Core::open_in_memory().await.unwrap();
+
+        let result = core.export_history(Path::new("history.csv")).await;
+
+        assert!(matches!(result, Err(CoreError::InvalidArgument(_))));
+    }
+
+    #[tokio::test]
+    async fn export_history_refuses_a_folder_as_the_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (core, _id) = core_with_completed_file(tmp.path(), "a.bin", b"data").await;
+        let target = tmp.path().join("folder.csv");
+        tokio::fs::create_dir(&target).await.unwrap();
+
+        let result = core.export_history(&target).await;
+
+        assert!(matches!(result, Err(CoreError::InvalidArgument(_))));
+    }
+
+    #[tokio::test]
+    async fn move_refuses_a_folder_under_a_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (core, id) = core_with_completed_file(tmp.path(), "a.bin", b"data").await;
+
+        let result = core
+            .move_download(id, &tmp.path().join("a.bin").join("inside"))
+            .await;
+
+        assert!(matches!(result, Err(CoreError::InvalidArgument(_))));
+        assert!(tmp.path().join("a.bin").exists(), "the file must stay put");
+    }
+
+    #[tokio::test]
+    async fn speed_limit_refuses_a_value_the_database_cannot_hold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (core, id) = core_with_completed_file(tmp.path(), "a.bin", b"data").await;
+
+        let result = core.set_speed_limit(id, Some(u64::MAX)).await;
+
+        assert!(matches!(result, Err(CoreError::InvalidArgument(_))));
+        assert_eq!(core.get_download(id).await.unwrap().speed_limit_bps, None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn checksum_refuses_a_link_left_in_place_of_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (core, id) = core_with_completed_file(tmp.path(), "a.bin", b"data").await;
+        let elsewhere = tmp.path().join("elsewhere.bin");
+        tokio::fs::write(&elsewhere, b"other").await.unwrap();
+        tokio::fs::remove_file(tmp.path().join("a.bin"))
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(&elsewhere, tmp.path().join("a.bin")).unwrap();
+
+        let result = core.compute_checksum(id).await;
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn csv_field_guards_formula_starters() {
+        for starter in ["=1+1", "+1", "-1", "@SUM(A1)", "\tcmd", "\rcmd"] {
+            let field = csv_field(starter);
+            assert!(
+                field.trim_start_matches('"').starts_with('\''),
+                "{starter:?} → {field:?}"
+            );
+        }
+        assert_eq!(csv_field("plain.bin"), "plain.bin");
     }
 
     #[tokio::test]

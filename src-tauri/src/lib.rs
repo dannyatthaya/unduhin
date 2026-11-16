@@ -8,9 +8,9 @@
 
 pub mod browser_integration;
 pub mod commands;
-pub mod file_commands;
 pub mod error;
 pub mod extension_sync;
+pub mod file_commands;
 pub mod i18n;
 pub mod manifest;
 pub mod pipe;

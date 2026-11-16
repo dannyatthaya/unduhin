@@ -28,6 +28,43 @@ export function classifyLink(raw: string): LinkKind {
   }
 }
 
+/**
+ * Whether a link points at this computer or the local network by address:
+ * `localhost`, a loopback, private or link-local IPv4 address, or the IPv6
+ * equivalents. New download does not check such a link on its own, so text
+ * that merely lands in the Link field never sends a request to a device on
+ * the user's network. A host *name* that resolves to a local address is not
+ * caught here.
+ */
+export function isLocalNetworkLink(raw: string): boolean {
+  let host: string;
+  try {
+    host = new URL(raw.trim()).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  if (host === "localhost" || host.endsWith(".localhost")) return true;
+  if (host.startsWith("[")) return isLocalIpv6(host.slice(1, -1));
+  const octets = host.split(".").map(Number);
+  const isIpv4 =
+    octets.length === 4 && octets.every((n) => Number.isInteger(n) && n >= 0 && n <= 255);
+  if (!isIpv4) return false;
+  const [a, b] = octets;
+  return (
+    a === 0 ||
+    a === 10 ||
+    a === 127 ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    (a === 169 && b === 254)
+  );
+}
+
+/** Loopback (`::1`), unique local (`fc00::/7`) or link-local (`fe80::/10`). */
+function isLocalIpv6(address: string): boolean {
+  return address === "::1" || /^f[cd]/.test(address) || /^fe[89ab]/.test(address);
+}
+
 /** The last path segment of a link, decoded, as a stand-in file name. */
 export function fileNameFromLink(raw: string): string {
   try {

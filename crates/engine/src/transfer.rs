@@ -433,10 +433,11 @@ async fn apply_set_segments(
 /// A connection finished its part while others still have work: hand it
 /// half of the part with the most left.
 ///
-/// The finished worker is retired and a new one opened on the tail half of
-/// the donor, so the connection count stays the same. The split is
-/// confirm-before-commit ([`try_probe_and_split`]): a host that refuses the
-/// request costs nothing, and the donor carries on untouched.
+/// A new worker is opened on the tail half of the donor and, once it is
+/// running, the finished worker is retired, so the connection count stays
+/// the same. The split is confirm-before-commit ([`try_probe_and_split`]):
+/// a host that refuses the request costs nothing — the donor carries on
+/// untouched and the finished worker keeps its slot.
 ///
 /// Does nothing when the download has this turned off, when the host has no
 /// range support, or when no part has [`HELP_MIN_REMAINING`] left.
@@ -453,7 +454,7 @@ async fn help_slow_part(
     }
     {
         let m = shared.meta.lock().await;
-        let mut senders = shared.senders.lock().await;
+        let senders = shared.senders.lock().await;
         // Already retired (a join, or the transfer finishing) — it has no
         // connection to give.
         if !matches!(senders.get(idle), Some(Some(_))) {
@@ -462,9 +463,16 @@ async fn help_slow_part(
         if pick_donor(&m, &senders, HELP_MIN_REMAINING).is_none() {
             return;
         }
-        senders[idle] = None;
     }
-    try_probe_and_split(shared, client, url, cancel, workers, HELP_MIN_REMAINING).await;
+    // Retire the finished worker only after its replacement is confirmed:
+    // dropping it first would lose a connection for good when the host
+    // refuses the probe.
+    if !try_probe_and_split(shared, client, url, cancel, workers, HELP_MIN_REMAINING).await {
+        return;
+    }
+    if let Some(slot) = shared.senders.lock().await.get_mut(idle) {
+        *slot = None;
+    }
 }
 
 async fn active_worker_count(shared: &Arc<SharedState>) -> usize {
@@ -1440,6 +1448,126 @@ mod tests {
             help_slow_parts: Some(Arc::new(AtomicBool::new(false))),
         };
         assert!(!off.helps_slow_parts());
+    }
+
+    const MIB: u64 = 1024 * 1024;
+
+    /// Shared state for a two-part transfer: part 0 is finished, part 1 has
+    /// 16 MiB left. Returns the receiver ends so the senders stay open.
+    async fn two_part_state(
+        output: std::path::PathBuf,
+    ) -> (Arc<SharedState>, Vec<mpsc::Receiver<Segment>>) {
+        let mut meta = make_meta(vec![(0, MIB, MIB), (MIB, 17 * MIB, 0)]);
+        meta.output_path = output.clone();
+        let (idle_tx, _idle_rx) = mpsc::unbounded_channel::<usize>();
+        let mut senders = Vec::new();
+        let mut receivers = Vec::new();
+        for _ in 0..2 {
+            let (tx, rx) = mpsc::channel::<Segment>(1);
+            senders.push(Some(tx));
+            receivers.push(rx);
+        }
+        let shared = Arc::new(SharedState {
+            idle_tx,
+            tuning: crate::download::Tuning::default(),
+            meta: Mutex::new(meta),
+            meta_path: Meta::sidecar_path(&output),
+            tx: None,
+            backoff: Backoff::default(),
+            ranges_supported: true,
+            senders: Mutex::new(senders),
+            prefetched: Mutex::new(std::collections::HashMap::new()),
+            rate_limiter: None,
+        });
+        (shared, receivers)
+    }
+
+    fn test_client() -> Client {
+        crate::http::build_client(Duration::from_secs(5), Duration::from_secs(5), None, &[])
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn help_slow_part_keeps_the_idle_worker_when_the_host_refuses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (shared, _receivers) = two_part_state(tmp.path().join("x.bin")).await;
+        // A port nothing listens on: the probe request fails to connect.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let url: Url = format!("http://127.0.0.1:{port}/x.bin").parse().unwrap();
+        let cancel = CancellationToken::new();
+        let mut workers: JoinSet<Result<()>> = JoinSet::new();
+
+        help_slow_part(&shared, &test_client(), &url, &cancel, &mut workers, 0).await;
+
+        let senders = shared.senders.lock().await;
+        assert_eq!(senders.len(), 2, "no part may be added");
+        assert!(senders[0].is_some(), "the idle worker must keep its slot");
+        assert_eq!(shared.meta.lock().await.segments[1].segment.end, 17 * MIB);
+    }
+
+    #[tokio::test]
+    async fn help_slow_part_hands_the_idle_connection_half_of_the_slowest_part() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (shared, _receivers) = two_part_state(tmp.path().join("x.bin")).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Answers the probe with a 206 for the tail half (9 MiB – 17 MiB)
+        // and then holds the body open; the test ends before it is read.
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 4096];
+            let _ = socket.read(&mut request).await.unwrap();
+            let head = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {}-{}/{}\r\n\
+                 Content-Length: {}\r\n\r\n",
+                9 * MIB,
+                17 * MIB - 1,
+                17 * MIB,
+                8 * MIB
+            );
+            socket.write_all(head.as_bytes()).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let url: Url = format!("http://127.0.0.1:{port}/x.bin").parse().unwrap();
+        let cancel = CancellationToken::new();
+        let mut workers: JoinSet<Result<()>> = JoinSet::new();
+
+        help_slow_part(&shared, &test_client(), &url, &cancel, &mut workers, 0).await;
+
+        {
+            let senders = shared.senders.lock().await;
+            assert_eq!(senders.len(), 3, "a new part takes the tail half");
+            assert!(senders[0].is_none(), "the idle worker is retired");
+            assert!(senders[1].is_some() && senders[2].is_some());
+            let meta = shared.meta.lock().await;
+            assert_eq!(meta.segments[1].segment.end, 9 * MIB);
+            assert_eq!(meta.segments[2].segment.start, 9 * MIB);
+            assert_eq!(meta.segments[2].segment.end, 17 * MIB);
+        }
+        cancel.cancel();
+        workers.shutdown().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn help_slow_part_does_nothing_when_no_part_has_enough_left() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (shared, _receivers) = two_part_state(tmp.path().join("x.bin")).await;
+        // Leave part 1 with less than HELP_MIN_REMAINING to fetch.
+        shared.meta.lock().await.segments[1].bytes_downloaded = 16 * MIB - HELP_MIN_REMAINING + 1;
+        let url: Url = "http://127.0.0.1:9/x.bin".parse().unwrap();
+        let cancel = CancellationToken::new();
+        let mut workers: JoinSet<Result<()>> = JoinSet::new();
+
+        help_slow_part(&shared, &test_client(), &url, &cancel, &mut workers, 0).await;
+
+        let senders = shared.senders.lock().await;
+        assert_eq!(senders.len(), 2);
+        assert!(senders[0].is_some());
     }
 
     #[test]

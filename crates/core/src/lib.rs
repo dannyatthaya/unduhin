@@ -48,7 +48,7 @@ pub use download::{
 };
 pub use error::{CoreError, Result};
 pub use event::CoreEvent;
-pub use file_ops::LinkProbe;
+pub use file_ops::{folder_is_usable, LinkProbe};
 pub use schedule::{NewSchedule, QuietHoursState, Schedule, ScheduleId, ScheduleKind};
 pub use settings::{parse_user_value, settings_keys, SettingValue};
 pub use speed::TokenBucket;
