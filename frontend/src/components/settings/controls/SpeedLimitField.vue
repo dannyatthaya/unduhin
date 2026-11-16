@@ -1,103 +1,109 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+// The total speed limit: a switch, then the number and its unit. The
+// number stays visible (dimmed) while the limit is off, so switching it
+// back on restores the same value.
 
+import { ref, watch } from "vue";
+import { useI18n } from "vue-i18n";
+
+import Field from "@/components/ui/Field.vue";
+import SegmentedControl from "@/components/ui/SegmentedControl.vue";
 import Switch from "@/components/ui/Switch.vue";
 
 const props = defineProps<{
-  /** Bytes per second; 0 = unlimited. */
+  /** Bytes per second; 0 = no limit. */
   modelValue: number;
-  disabled?: boolean;
+  /** Id of the text that names the switch. */
+  labelledby?: string;
 }>();
 const emit = defineEmits<{ "update:modelValue": [value: number] }>();
 
-type Unit = "kb" | "mb";
+const { t } = useI18n();
 
-const unit = ref<Unit>(props.modelValue >= 1024 * 1024 ? "mb" : "kb");
+type Unit = "mb" | "kb";
+const BYTES: Record<Unit, number> = { mb: 1024 * 1024, kb: 1024 };
+const DEFAULT_LIMIT = 10;
 
-function bpsToDisplay(bps: number, u: Unit): number {
-  if (bps <= 0) return 0;
-  const divisor = u === "mb" ? 1024 * 1024 : 1024;
-  // 1 decimal place is enough for the limit picker.
-  return Math.round((bps / divisor) * 10) / 10;
+const UNIT_OPTIONS: { value: Unit; label: string }[] = [
+  { value: "mb", label: "MB/s" },
+  { value: "kb", label: "KB/s" },
+];
+
+function unitFor(bps: number): Unit {
+  return bps > 0 && bps < BYTES.mb ? "kb" : "mb";
 }
 
-function displayToBps(n: number, u: Unit): number {
-  const factor = u === "mb" ? 1024 * 1024 : 1024;
-  return Math.round(n * factor);
+/** One decimal place is enough for a limit. */
+function toDisplay(bps: number, unit: Unit): string {
+  return String(Math.round((bps / BYTES[unit]) * 10) / 10);
 }
 
-const value = ref<number>(bpsToDisplay(props.modelValue || 0, unit.value));
+const unit = ref<Unit>(unitFor(props.modelValue));
+const amount = ref(props.modelValue > 0 ? toDisplay(props.modelValue, unit.value) : String(DEFAULT_LIMIT));
 
 watch(
   () => props.modelValue,
   (bps) => {
-    value.value = bpsToDisplay(bps || 0, unit.value);
+    if (bps <= 0) return;
+    // Keep the unit the user chose unless the value no longer fits it.
+    if (bps < BYTES.mb && unit.value === "mb") unit.value = "kb";
+    amount.value = toDisplay(bps, unit.value);
   },
 );
 
-const unlimited = computed({
-  get: () => props.modelValue <= 0,
-  set: (v) => {
-    if (v) emit("update:modelValue", 0);
-    else emit("update:modelValue", displayToBps(value.value || 1, unit.value));
-  },
-});
-
-function setUnit(u: Unit) {
-  if (u === unit.value) return;
-  unit.value = u;
-  if (props.modelValue > 0) emit("update:modelValue", displayToBps(value.value, u));
+function currentBps(): number {
+  const n = Number(amount.value);
+  const valid = Number.isFinite(n) && n > 0 ? n : DEFAULT_LIMIT;
+  return Math.round(valid * BYTES[unit.value]);
 }
 
-function onInputChange(event: Event) {
-  const target = event.target as HTMLInputElement;
-  const n = Number(target.value);
-  if (!Number.isFinite(n) || n < 0) return;
-  value.value = n;
-  if (!unlimited.value) emit("update:modelValue", displayToBps(n, unit.value));
+function setEnabled(on: boolean): void {
+  emit("update:modelValue", on ? currentBps() : 0);
+}
+
+function commitAmount(): void {
+  const n = Number(amount.value);
+  if (!Number.isFinite(n) || n <= 0) {
+    amount.value = toDisplay(props.modelValue, unit.value);
+    return;
+  }
+  if (props.modelValue > 0) emit("update:modelValue", currentBps());
+}
+
+function setUnit(next: Unit): void {
+  unit.value = next;
+  if (props.modelValue > 0) emit("update:modelValue", currentBps());
 }
 </script>
 
 <template>
-  <div class="flex items-center gap-3">
-    <span class="text-xs text-muted-foreground">Unlimited</span>
-    <Switch v-model="unlimited" :disabled="disabled" aria-label="Unlimited speed" />
-    <input
-      type="number"
-      min="0"
-      step="0.1"
-      :value="value"
-      :disabled="disabled || unlimited"
-      class="h-9 w-24 rounded-md border border-input bg-background px-3 text-right text-sm tabular-nums focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
-      @input="onInputChange"
+  <div class="flex items-center gap-2.5">
+    <Switch
+      :model-value="modelValue > 0"
+      :labelledby="labelledby"
+      @update:model-value="setEnabled"
     />
-    <div class="flex h-9 overflow-hidden rounded-md border border-border">
-      <button
-        type="button"
-        :disabled="disabled"
-        class="px-3 text-xs font-medium transition-colors"
-        :class="
-          unit === 'kb'
-            ? 'bg-primary text-primary-foreground'
-            : 'bg-background text-foreground hover:bg-accent'
-        "
-        @click="setUnit('kb')"
-      >
-        KB/s
-      </button>
-      <button
-        type="button"
-        :disabled="disabled"
-        class="px-3 text-xs font-medium transition-colors"
-        :class="
-          unit === 'mb'
-            ? 'bg-primary text-primary-foreground'
-            : 'bg-background text-foreground hover:bg-accent'
-        "
-        @click="setUnit('mb')"
-      >
-        MB/s
-      </button>
+    <div class="flex items-center gap-1.5" :class="modelValue > 0 ? '' : 'opacity-45'">
+      <Field
+        v-model="amount"
+        mono
+        type="text"
+        inputmode="decimal"
+        class="w-16"
+        :aria-label="t('settings.bandwidthMax')"
+        :disabled="modelValue <= 0"
+        @blur="commitAmount"
+        @keydown.enter.prevent="commitAmount"
+      />
+      <SegmentedControl
+        :model-value="unit"
+        :options="UNIT_OPTIONS"
+        :aria-label="t('settings.bandwidthUnit')"
+        :disabled="modelValue <= 0"
+        muted
+        class="opacity-100"
+        @update:model-value="setUnit"
+      />
     </div>
   </div>
 </template>

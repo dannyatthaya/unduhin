@@ -1,221 +1,149 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+// Settings → Behaviour: what the app does at sign-in, when the window is
+// closed, and when it may interrupt you.
+
+import { computed } from "vue";
 import { useI18n } from "vue-i18n";
-import { LayoutGrid, LogOut, HelpCircle, Moon } from "lucide-vue-next";
+import { Bell } from "lucide-vue-next";
 import { enable as enableAutostart, disable as disableAutostart } from "@tauri-apps/plugin-autostart";
 
-import SettingsSection from "@/components/settings/SettingsSection.vue";
+import QuietHoursCard from "@/components/settings/QuietHoursCard.vue";
 import SettingCard from "@/components/settings/SettingCard.vue";
 import SettingRow from "@/components/settings/SettingRow.vue";
+import SettingsSection from "@/components/settings/SettingsSection.vue";
 import ToggleSwitch from "@/components/settings/controls/ToggleSwitch.vue";
-import TileChoice, {
-  type TileOption,
-} from "@/components/settings/controls/TileChoice.vue";
 import Button from "@/components/ui/Button.vue";
-import ScheduleDialog from "@/components/ScheduleDialog.vue";
+import SegmentedControl, { type SegmentOption } from "@/components/ui/SegmentedControl.vue";
 
 import {
   useBehaviourSettings,
   type CloseBehavior,
 } from "@/composables/useBehaviourSettings";
-import {
-  previewNotification,
-  type NotificationKind,
-} from "@/composables/useNotificationPreview";
-import { useSettingsFilter } from "@/composables/useSettingsFilter";
-import { useSchedulesStore } from "@/stores/schedules";
+import { previewNotification } from "@/composables/useNotificationPreview";
+import { useToast } from "@/composables/useToast";
 
 const { t } = useI18n();
 const s = useBehaviourSettings();
-const filter = useSettingsFilter();
-const isHidden = (id: string) => filter.isHidden(id);
+const toast = useToast();
 
-const schedules = useSchedulesStore();
-const scheduleDialogOpen = ref(false);
-
-onMounted(() => {
-  // The settings page may be deep-linked; make sure the schedules cache
-  // is populated when the user opens this card directly.
-  if (schedules.list.length === 0) void schedules.refresh();
-});
-
-const dayNames = computed(() => [
-  t("common.dayMon"),
-  t("common.dayTue"),
-  t("common.dayWed"),
-  t("common.dayThu"),
-  t("common.dayFri"),
-  t("common.daySat"),
-  t("common.daySun"),
+const closeOptions = computed<SegmentOption<CloseBehavior>[]>(() => [
+  { value: "minimize", label: t("settings.closeMinimize") },
+  { value: "exit", label: t("settings.closeExit") },
+  { value: "ask", label: t("settings.closeAsk") },
 ]);
 
-const quietSummary = computed(() => {
-  const q = schedules.globalQuietHours;
-  if (!q || !q.active) return t("common.off");
-  const startTime = q.start_iso ?? "--:--";
-  const endTime = q.end_iso ?? "--:--";
-  const mask = q.days_mask;
-  let days = "";
-  if (mask === 127) days = t("common.everyDay");
-  else if (mask === (1 << 5) + (1 << 6)) days = t("common.weekends");
-  else if (mask === 0b0011111) days = t("common.weekdays");
-  else {
-    const enabled = dayNames.value.filter((_, i) => (mask & (1 << i)) !== 0);
-    days = enabled.join(", ");
+// Flipping the setting also (en|dis)ables the OS-level entry owned by the
+// plugin. The startup reconcile in src-tauri/src/lib.rs keeps the two in
+// sync on launch; this keeps them in sync at runtime.
+async function setAutostart(on: boolean): Promise<void> {
+  s.autostart.value = on;
+  try {
+    if (on) await enableAutostart();
+    else await disableAutostart();
+  } catch (e: unknown) {
+    const message = (e as { message?: string })?.message ?? String(e);
+    toast.push(t("settings.autostartFailed", { error: message }), "error");
   }
-  return t("downloads.scheduleSummaryRange", { start: startTime, end: endTime, days });
-});
-
-const closeOptions = computed<TileOption<CloseBehavior>[]>(() => [
-  { value: "minimize", label: t("settings.closeMinimize"), hint: t("settings.closeMinimizeHint"), icon: LayoutGrid },
-  { value: "exit", label: t("settings.closeExit"), hint: t("settings.closeExitHint"), icon: LogOut },
-  { value: "ask", label: t("settings.closeAsk"), hint: t("settings.closeAskHint"), icon: HelpCircle },
-]);
-
-// Wrap the autostart toggle so flipping it also (en|dis)ables the OS-level
-// state owned by the plugin. The startup reconcile in src-tauri/src/lib.rs
-// keeps the two in sync on launch; this keeps them in sync at runtime.
-const autostart = computed({
-  get: () => s.autostart.value,
-  set: async (v: boolean) => {
-    s.autostart.value = v;
-    try {
-      if (v) await enableAutostart();
-      else await disableAutostart();
-    } catch (e) {
-      console.warn("autostart toggle failed", e);
-    }
-  },
-});
-
-async function preview(kind: NotificationKind) {
-  await previewNotification(kind);
 }
+
+async function sendTest(): Promise<void> {
+  const allowed = await previewNotification("complete");
+  if (!allowed) toast.push(t("settings.notifyBlocked"), "error");
+}
+
+const notifications = computed(() => [
+  {
+    id: "behaviour/notify-complete",
+    label: t("settings.notifyComplete"),
+    description: t("settings.notifyCompleteDesc"),
+    model: s.notifyComplete,
+  },
+  {
+    id: "behaviour/notify-fail",
+    label: t("settings.notifyFail"),
+    description: t("settings.notifyFailDesc"),
+    model: s.notifyFail,
+  },
+  {
+    id: "behaviour/notify-queue-empty",
+    label: t("settings.notifyQueueEmpty"),
+    description: t("settings.notifyQueueEmptyDesc"),
+    model: s.notifyQueueEmpty,
+  },
+]);
 </script>
 
 <template>
   <SettingsSection
-    :eyebrow="t('downloads.settings')"
     :title="t('settings.sectionBehaviour')"
     :description="t('settings.sectionBehaviourDesc')"
   >
-    <SettingCard
-      :title="t('settings.cardStartup')"
-      :description="t('settings.cardStartupDesc')"
-    >
+    <SettingCard :title="t('settings.cardStartup')">
       <SettingRow
         id="behaviour/autostart"
+        v-slot="{ labelId }"
         :label="t('settings.startupAutostart')"
         :description="t('settings.startupAutostartDesc')"
-        :hidden="isHidden('behaviour/autostart')"
       >
-        <ToggleSwitch v-model="autostart" />
+        <ToggleSwitch
+          :model-value="s.autostart.value"
+          :labelledby="labelId"
+          @update:model-value="setAutostart"
+        />
       </SettingRow>
       <SettingRow
         id="behaviour/start-minimized"
+        v-slot="{ labelId }"
         :label="t('settings.startupMinimized')"
         :description="t('settings.startupMinimizedDesc')"
-        :hidden="isHidden('behaviour/start-minimized')"
       >
         <ToggleSwitch
           v-model="s.startMinimized.value"
-          :disabled="!autostart"
+          :labelledby="labelId"
+          :disabled="!s.autostart.value"
         />
       </SettingRow>
       <SettingRow
         id="behaviour/close-behavior"
+        v-slot="{ labelId }"
         :label="t('settings.closeBehaviour')"
         :description="t('settings.closeBehaviourDesc')"
-        :hidden="isHidden('behaviour/close-behavior')"
       >
-        <TileChoice
+        <SegmentedControl
           v-model="s.closeBehavior.value"
           :options="closeOptions"
+          :labelledby="labelId"
         />
       </SettingRow>
       <SettingRow
         id="behaviour/confirm-on-quit"
+        v-slot="{ labelId }"
         :label="t('settings.confirmOnQuit')"
         :description="t('settings.confirmOnQuitDesc')"
-        :hidden="isHidden('behaviour/confirm-on-quit')"
       >
-        <ToggleSwitch v-model="s.confirmOnQuit.value" />
+        <ToggleSwitch v-model="s.confirmOnQuit.value" :labelledby="labelId" />
       </SettingRow>
     </SettingCard>
 
-    <SettingCard
-      :title="t('settings.cardNotifications')"
-      :description="t('settings.cardNotificationsDesc')"
-    >
-      <SettingRow
-        id="behaviour/notify-complete"
-        :label="t('settings.notifyComplete')"
-        :description="t('settings.notifyCompleteDesc')"
-        :hidden="isHidden('behaviour/notify-complete')"
-      >
-        <Button size="sm" variant="secondary" @click="preview('complete')">
-          {{ t("settings.notifyPreview") }}
+    <SettingCard :title="t('settings.cardNotifications')" :note="t('settings.notifyPermissionNote')">
+      <template #actions>
+        <Button variant="ghost" size="sm" class="h-[30px] gap-1.5 px-2.5 text-dl-soft" @click="sendTest">
+          <Bell class="h-3.5 w-3.5" aria-hidden="true" />
+          {{ t("settings.notifyTest") }}
         </Button>
-        <ToggleSwitch v-model="s.notifyComplete.value" />
-      </SettingRow>
+      </template>
       <SettingRow
-        id="behaviour/notify-fail"
-        :label="t('settings.notifyFail')"
-        :description="t('settings.notifyFailDesc')"
-        :hidden="isHidden('behaviour/notify-fail')"
+        v-for="item in notifications"
+        :id="item.id"
+        :key="item.id"
+        v-slot="{ labelId }"
+        :label="item.label"
+        :description="item.description"
       >
-        <Button size="sm" variant="secondary" @click="preview('fail')">
-          {{ t("settings.notifyPreview") }}
-        </Button>
-        <ToggleSwitch v-model="s.notifyFail.value" />
-      </SettingRow>
-      <SettingRow
-        id="behaviour/notify-queue-empty"
-        :label="t('settings.notifyQueueEmpty')"
-        :description="t('settings.notifyQueueEmptyDesc')"
-        :hidden="isHidden('behaviour/notify-queue-empty')"
-      >
-        <Button size="sm" variant="secondary" @click="preview('queue-empty')">
-          {{ t("settings.notifyPreview") }}
-        </Button>
-        <ToggleSwitch v-model="s.notifyQueueEmpty.value" />
+        <ToggleSwitch v-model="item.model.value" :labelledby="labelId" />
       </SettingRow>
     </SettingCard>
 
-    <SettingCard
-      :title="t('settings.cardQuietHours')"
-      :description="t('settings.cardQuietHoursDesc')"
-    >
-      <div
-        :data-setting-id="'behaviour/quiet-hours'"
-        class="flex items-center justify-between gap-4 px-5 py-4"
-        :hidden="isHidden('behaviour/quiet-hours')"
-      >
-        <div class="flex items-center gap-3">
-          <span class="flex h-9 w-9 items-center justify-center rounded-md bg-muted">
-            <Moon class="h-4 w-4 text-muted-foreground" />
-          </span>
-          <div class="flex flex-col">
-            <span class="text-sm font-medium">{{ t("settings.cardQuietHours") }}</span>
-            <span class="text-xs text-muted-foreground">
-              {{ quietSummary }}
-            </span>
-          </div>
-        </div>
-        <Button variant="secondary" size="sm" @click="scheduleDialogOpen = true">
-          {{ t("settings.quietHoursEdit") }}
-        </Button>
-      </div>
-    </SettingCard>
-
-    <ScheduleDialog
-      :open="scheduleDialogOpen"
-      :scope="{ kind: 'global' }"
-      @close="scheduleDialogOpen = false"
-    />
-
-    <p class="px-1 pt-2 text-xs text-muted-foreground">
-      {{ t("common.saveHint") }}
-    </p>
+    <QuietHoursCard />
   </SettingsSection>
 </template>

@@ -50,7 +50,6 @@ function formatTimeout(ms: number): string {
 
 <template>
   <SettingsSection
-    :eyebrow="t('downloads.settings')"
     :title="t('settings.sectionMedia')"
     :description="t('settings.sectionMediaDesc')"
   >

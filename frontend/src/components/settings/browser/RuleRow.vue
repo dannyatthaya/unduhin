@@ -70,7 +70,7 @@ const matchLabel = computed(() =>
     <div class="flex min-w-0 flex-1 flex-col">
       <span class="truncate font-mono text-sm">{{ props.rule.pattern }}</span>
       <span class="text-xs text-muted-foreground">
-        {{ matchLabel }} · {{ addedLabel }}
+        {{ matchLabel }}, {{ addedLabel }}
       </span>
     </div>
     <button

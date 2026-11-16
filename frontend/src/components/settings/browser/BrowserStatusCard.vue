@@ -90,13 +90,13 @@ function handleTest() {
                 }}
               </span>
             </span>
-            <span aria-hidden="true">·</span>
+            <span class="h-3 w-px shrink-0 bg-border" aria-hidden="true" />
             <span>
               {{
                 t("settings.browserCapturedThisWeek", { n: handoffsThisWeek })
               }}
             </span>
-            <span aria-hidden="true">·</span>
+            <span class="h-3 w-px shrink-0 bg-border" aria-hidden="true" />
             <span>
               {{
                 t("settings.browserLastHandoff", {

@@ -65,6 +65,13 @@ const RAMP_INTERVAL: Duration = Duration::from_millis(500);
 const WRITE_BUFFER_BYTES: usize = 512 * 1024;
 const WRITE_MAX_DELAY: Duration = Duration::from_millis(250);
 
+/// Smallest remainder worth splitting when a finished connection goes to
+/// help another part. Each hand-over costs a new request, so a part with
+/// less than this left is quicker to finish as it is.
+const HELP_MIN_REMAINING: u64 = 4 * 1024 * 1024;
+/// Smallest remainder a manual or ramp split will divide.
+const SPLIT_MIN_REMAINING: u64 = 2;
+
 /// A worker that produced zero bytes for at least this long is reported
 /// as [`SegmentRuntimeState::Stalled`].
 const STALLED_AFTER: Duration = Duration::from_secs(5);
@@ -139,7 +146,10 @@ pub(crate) async fn run_transfer(
         );
     }
 
+    let (idle_tx, mut idle_rx) = mpsc::unbounded_channel::<usize>();
     let shared = Arc::new(SharedState {
+        idle_tx,
+        tuning: opts.tuning.clone(),
         meta: Mutex::new(meta),
         meta_path: meta_path.clone(),
         tx: tx.clone(),
@@ -195,6 +205,7 @@ pub(crate) async fn run_transfer(
         &cancel,
         &mut workers,
         &mut control_rx,
+        &mut idle_rx,
         ramp_target,
     )
     .await
@@ -296,6 +307,7 @@ async fn supervisor_loop(
     cancel: &CancellationToken,
     workers: &mut JoinSet<Result<()>>,
     control_rx: &mut Option<mpsc::Receiver<Control>>,
+    idle_rx: &mut mpsc::UnboundedReceiver<usize>,
     ramp_target: Option<usize>,
 ) -> Result<()> {
     // Auto-ramp state. Only active for range-capable fresh downloads that
@@ -340,9 +352,14 @@ async fn supervisor_loop(
                     }
                 }
             }
+            Some(idle) = idle_rx.recv() => {
+                help_slow_part(shared, client, url, cancel, workers, idle).await;
+            }
             _ = ramp_timer.tick(), if ramping => {
                 if active_worker_count(shared).await >= target
-                    || !try_probe_and_split(shared, client, url, cancel, workers).await
+                    || !try_probe_and_split(
+                        shared, client, url, cancel, workers, SPLIT_MIN_REMAINING,
+                    ).await
                 {
                     // Reached the target, or the host refused another
                     // connection (cap) / the probe failed — stop growing
@@ -413,6 +430,43 @@ async fn apply_set_segments(
     Ok(())
 }
 
+/// A connection finished its part while others still have work: hand it
+/// half of the part with the most left.
+///
+/// The finished worker is retired and a new one opened on the tail half of
+/// the donor, so the connection count stays the same. The split is
+/// confirm-before-commit ([`try_probe_and_split`]): a host that refuses the
+/// request costs nothing, and the donor carries on untouched.
+///
+/// Does nothing when the download has this turned off, when the host has no
+/// range support, or when no part has [`HELP_MIN_REMAINING`] left.
+async fn help_slow_part(
+    shared: &Arc<SharedState>,
+    client: &Client,
+    url: &Url,
+    cancel: &CancellationToken,
+    workers: &mut JoinSet<Result<()>>,
+    idle: usize,
+) {
+    if !shared.ranges_supported || !shared.tuning.helps_slow_parts() {
+        return;
+    }
+    {
+        let m = shared.meta.lock().await;
+        let mut senders = shared.senders.lock().await;
+        // Already retired (a join, or the transfer finishing) — it has no
+        // connection to give.
+        if !matches!(senders.get(idle), Some(Some(_))) {
+            return;
+        }
+        if pick_donor(&m, &senders, HELP_MIN_REMAINING).is_none() {
+            return;
+        }
+        senders[idle] = None;
+    }
+    try_probe_and_split(shared, client, url, cancel, workers, HELP_MIN_REMAINING).await;
+}
+
 async fn active_worker_count(shared: &Arc<SharedState>) -> usize {
     let senders = shared.senders.lock().await;
     senders.iter().filter(|s| s.is_some()).count()
@@ -428,7 +482,7 @@ async fn try_split_one(
     let (new_index, new_segment) = {
         let mut m = shared.meta.lock().await;
         let senders = shared.senders.lock().await;
-        let Some(donor_idx) = pick_donor(&m, &senders) else {
+        let Some(donor_idx) = pick_donor(&m, &senders, SPLIT_MIN_REMAINING) else {
             return Ok(false);
         };
         drop(senders);
@@ -499,12 +553,13 @@ async fn try_probe_and_split(
     url: &Url,
     cancel: &CancellationToken,
     workers: &mut JoinSet<Result<()>>,
+    min_remaining: u64,
 ) -> bool {
     // Pick a donor and a split point WITHOUT mutating the plan yet.
     let (donor_idx, midpoint, original_end, validator) = {
         let m = shared.meta.lock().await;
         let senders = shared.senders.lock().await;
-        let Some(donor_idx) = pick_donor(&m, &senders) else {
+        let Some(donor_idx) = pick_donor(&m, &senders, min_remaining) else {
             return false;
         };
         let s = &m.segments[donor_idx];
@@ -597,7 +652,13 @@ async fn try_probe_and_split(
     true
 }
 
-fn pick_donor(meta: &Meta, senders: &[Option<mpsc::Sender<Segment>>]) -> Option<usize> {
+/// The live part with the most left to fetch, if it has at least
+/// `min_remaining` bytes left.
+fn pick_donor(
+    meta: &Meta,
+    senders: &[Option<mpsc::Sender<Segment>>],
+    min_remaining: u64,
+) -> Option<usize> {
     let mut best: Option<(usize, u64)> = None;
     for (i, sender) in senders.iter().enumerate() {
         if sender.is_none() {
@@ -611,7 +672,7 @@ fn pick_donor(meta: &Meta, senders: &[Option<mpsc::Sender<Segment>>]) -> Option<
             .segment
             .end
             .saturating_sub(s.segment.start + s.bytes_downloaded);
-        if remaining < 2 {
+        if remaining < min_remaining.max(SPLIT_MIN_REMAINING) {
             continue;
         }
         match best {
@@ -651,6 +712,12 @@ async fn join_leavers(shared: &Arc<SharedState>, to_drop: usize) {
 }
 
 pub(crate) struct SharedState {
+    /// A worker reports its index here each time it finishes a part while
+    /// the transfer is still running; the supervisor may then give its
+    /// connection to another part ([`help_slow_part`]).
+    pub(crate) idle_tx: mpsc::UnboundedSender<usize>,
+    /// Per-download settings the caller can change mid-transfer.
+    pub(crate) tuning: crate::download::Tuning,
     pub(crate) meta: Mutex<Meta>,
     pub(crate) meta_path: PathBuf,
     pub(crate) tx: Option<broadcast::Sender<ProgressEvent>>,
@@ -882,6 +949,9 @@ async fn worker(
             for s in senders.iter_mut() {
                 *s = None;
             }
+        } else {
+            // Out of work while others are not: offer this connection up.
+            let _ = shared.idle_tx.send(worker_index);
         }
     }
     Ok(())
@@ -1161,6 +1231,10 @@ async fn consume_into_file(
         if let Some(rl) = shared.rate_limiter.as_ref() {
             rl.acquire(slice.len() as u64).await;
         }
+        // This download's own cap, on top of the shared one.
+        if let Some(rl) = shared.tuning.speed_limiter.as_ref() {
+            rl.acquire(slice.len() as u64).await;
+        }
         pending.extend_from_slice(slice);
 
         let reached_end = segment_len > 0
@@ -1344,7 +1418,28 @@ mod tests {
         // index 0: 100 remaining, index 1: 500 remaining, index 2: closed.
         let m = make_meta(vec![(0, 100, 0), (100, 1000, 500), (1000, 2000, 0)]);
         let senders = dummy_senders(&[true, true, false]);
-        assert_eq!(pick_donor(&m, &senders), Some(1));
+        assert_eq!(pick_donor(&m, &senders, SPLIT_MIN_REMAINING), Some(1));
+    }
+
+    #[test]
+    fn pick_donor_ignores_parts_below_the_requested_remainder() {
+        // 100 and 500 bytes left: neither is worth a hand-over at 1000.
+        let m = make_meta(vec![(0, 100, 0), (100, 1000, 500)]);
+        let senders = dummy_senders(&[true, true]);
+        assert_eq!(pick_donor(&m, &senders, 1000), None);
+        assert_eq!(pick_donor(&m, &senders, 400), Some(1));
+    }
+
+    #[test]
+    fn tuning_helps_slow_parts_unless_switched_off() {
+        use std::sync::atomic::AtomicBool;
+        let unset = crate::download::Tuning::default();
+        assert!(unset.helps_slow_parts());
+        let off = crate::download::Tuning {
+            speed_limiter: None,
+            help_slow_parts: Some(Arc::new(AtomicBool::new(false))),
+        };
+        assert!(!off.helps_slow_parts());
     }
 
     #[test]
@@ -1352,13 +1447,13 @@ mod tests {
         let m = make_meta(vec![(0, 1, 0), (1, 100, 99)]);
         let senders = dummy_senders(&[true, true]);
         // index 0 has remaining=1, index 1 has remaining=1; both skipped.
-        assert_eq!(pick_donor(&m, &senders), None);
+        assert_eq!(pick_donor(&m, &senders, SPLIT_MIN_REMAINING), None);
     }
 
     #[test]
     fn pick_donor_none_when_all_closed() {
         let m = make_meta(vec![(0, 1000, 0), (1000, 2000, 0)]);
         let senders = dummy_senders(&[false, false]);
-        assert_eq!(pick_donor(&m, &senders), None);
+        assert_eq!(pick_donor(&m, &senders, SPLIT_MIN_REMAINING), None);
     }
 }

@@ -32,28 +32,28 @@ const summary = computed(() => {
   <Dialog
     :open="open"
     :title="t('downloads.deleteTitle')"
-    size="md"
+    alert
     @close="answer('cancel')"
   >
-    <p class="text-sm text-muted-foreground">
+    <p class="leading-normal text-dl-soft">
       {{ t("downloads.deleteDescription", { summary }) }}
     </p>
-    <ul class="mt-3 space-y-1 text-xs text-muted-foreground">
+    <ul class="flex flex-col gap-1.5 text-xs leading-normal text-muted-foreground">
       <li>
-        <span class="font-medium text-foreground">{{ t("downloads.deleteOptionRowOnly") }}</span>
-        — {{ t("downloads.deleteOptionRowOnlyHint") }}
+        <span class="font-medium text-foreground">{{ t("downloads.deleteOptionRowOnly") }}:</span>
+        {{ t("downloads.deleteOptionRowOnlyHint") }}
       </li>
       <li>
-        <span class="font-medium text-foreground">{{ t("downloads.deleteOptionRowAndData") }}</span>
-        — {{ t("downloads.deleteOptionRowAndDataHint") }}
+        <span class="font-medium text-foreground">{{ t("downloads.deleteOptionRowAndData") }}:</span>
+        {{ t("downloads.deleteOptionRowAndDataHint") }}
       </li>
     </ul>
-    <p class="mt-3 text-[11px] text-muted-foreground">
+    <p class="text-xs text-muted-foreground">
       {{ t("downloads.deleteFooterHint") }}
     </p>
 
     <template #footer>
-      <Button variant="ghost" @click="answer('cancel')">{{ t("common.cancel") }}</Button>
+      <Button @click="answer('cancel')">{{ t("common.cancel") }}</Button>
       <Button variant="secondary" @click="answer('row_only')">
         {{ t("downloads.deleteOptionRowOnly") }}
       </Button>

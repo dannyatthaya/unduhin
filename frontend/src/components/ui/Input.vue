@@ -16,7 +16,7 @@ const attrs = useAttrs();
 
 const classes = computed(() =>
   cn(
-    "flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50",
+    "flex h-9 w-full rounded-[9px] border border-input bg-dl-field px-2.5 text-[13px] text-foreground transition-colors placeholder:text-muted-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-45 aria-invalid:border-danger aria-invalid:shadow-[0_0_0_1px_hsl(var(--danger))]",
     props.class,
   ),
 );

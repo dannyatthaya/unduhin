@@ -381,6 +381,7 @@ async fn run_category(db: Option<PathBuf>, cmd: CategoryCmd) -> anyhow::Result<(
                     icon: None,
                     default_output_path: None,
                     extension_rules: vec![],
+                    color: None,
                 })
                 .await?;
             println!("added category id={id}");

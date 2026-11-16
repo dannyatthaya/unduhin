@@ -1,6 +1,6 @@
 @import "tailwindcss";
 @import "tw-animate-css";
-/* Scoped palette + tokens for the downloads page only (`.dl-surface`). */
+/* Palette + tokens for the main window (`.dl-surface`, set on <body>). */
 @import "./downloads-theme.css";
 
 /* Tailwind v4: opt into the v3-style class-based `dark:` variant.
@@ -183,4 +183,16 @@
 
 *::-webkit-scrollbar-corner {
   background: hsl(var(--scrollbar-track));
+}
+
+/* Settings search. Results are the real section pages, embedded: a group
+   with no visible row disappears, and so does anything on a page that is
+   not a group (notes, info cards). Rows hide themselves (SettingRow). */
+.settings-searching
+  .settings-group:not(:has([data-setting-id]:not([hidden], [style*="display: none"]))) {
+  display: none;
+}
+
+.settings-embedded > :not(.settings-group) {
+  display: none;
 }

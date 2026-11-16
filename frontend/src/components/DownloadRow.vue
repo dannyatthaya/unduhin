@@ -41,6 +41,7 @@ import { useDetailStore } from "@/stores/detail";
 import { useDownloadsStore } from "@/stores/downloads";
 import { useSelectionStore } from "@/stores/selection";
 import { useDeleteConfirm } from "@/composables/useDeleteConfirm";
+import { useRenameDialog } from "@/composables/useRenameDialog";
 import { useRefreshLink } from "@/composables/useRefreshLink";
 import { useToast } from "@/composables/useToast";
 import {
@@ -295,7 +296,10 @@ const statusView = computed<StatusView>(() => {
 const metaLine = computed(() => {
   const d = props.download;
   if (d.status === "active" && stats.value) {
-    return `${formatSpeed(stats.value.speed_bps)} · ${formatEta(stats.value.eta)}`;
+    return t("downloads.rowSpeedEta", {
+      speed: formatSpeed(stats.value.speed_bps),
+      eta: formatEta(stats.value.eta),
+    });
   }
   if (d.status === "paused" && hasKnownSize.value && !compact.value) {
     return t("downloads.rowBytesOf", {
@@ -477,8 +481,9 @@ const isRenamable = computed(
     props.download.status !== "active" && props.download.status !== "muxing"
 );
 
+const rename = useRenameDialog();
 function renameFile() {
-  console.info(`Rename ${props.download.id} (todo)`);
+  rename.request(props.download.id);
 }
 
 const menuItems = computed(() => {
@@ -603,7 +608,7 @@ const QUIET_BUTTON = `flex h-8 items-center justify-center rounded-lg border tra
             />
             <span class="font-medium" :class="statusView.tone">{{ statusView.label }}</span>
             <template v-if="folderLabel">
-              <span class="text-dl-dim" aria-hidden="true">·</span>
+              <span class="h-3 w-px shrink-0 bg-border" aria-hidden="true" />
               <button
                 type="button"
                 class="min-w-0 truncate text-muted-foreground underline decoration-border underline-offset-[3px] hover:text-foreground"

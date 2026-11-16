@@ -175,10 +175,10 @@ async function exportNotice() {
 // ---- Helpers ---------------------------------------------------------------
 
 function formatBuildLabel(ts: string): string {
-  // "2026-05-14 10:42 UTC" -> "2026.05.14·1042"
+  // "2026-05-14 10:42 UTC" -> "2026.05.14 10:42"
   const m = ts.match(/^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})/);
   if (!m) return ts;
-  return `${m[1]}.${m[2]}.${m[3]}·${m[4]}${m[5]}`;
+  return `${m[1]}.${m[2]}.${m[3]} ${m[4]}:${m[5]}`;
 }
 
 function relativeTime(iso: string): string {
@@ -204,7 +204,6 @@ function formatBytes(n: number): string {
 
 <template>
   <SettingsSection
-    :eyebrow="t('downloads.settings')"
     :title="t('settings.sectionAbout')"
     :description="t('settings.sectionAboutDesc')"
   >

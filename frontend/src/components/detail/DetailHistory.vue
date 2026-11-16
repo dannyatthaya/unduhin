@@ -1,186 +1,135 @@
 <script setup lang="ts">
+// History tab: what happened to this download, oldest first, on a rail.
+// The entries are collected while the app runs, so a download from an
+// earlier session starts with an empty history.
+
 import { computed } from "vue";
 import { useI18n } from "vue-i18n";
-import { Check, Copy } from "lucide-vue-next";
+import { Copy } from "lucide-vue-next";
+
+import Button from "@/components/ui/Button.vue";
 
 import { useDownloadsStore, type TimelineEntry } from "@/stores/downloads";
 import { useToast } from "@/composables/useToast";
-import { useElapsedSeconds } from "@/composables/useElapsed";
-import { relativeTime } from "@/lib/format";
+import { timelineTone, useTimelineText, type TimelineTone } from "@/composables/useTimelineText";
 import type { DownloadRecord } from "@/types/tauri-bindings";
 
 const { t } = useI18n();
 const toast = useToast();
+const { describe } = useTimelineText();
 
 const props = defineProps<{ download: DownloadRecord }>();
 
 const store = useDownloadsStore();
 
+interface Row {
+  key: string;
+  title: string;
+  detail: string;
+  time: string;
+  tone: TimelineTone;
+}
+
+function pad(n: number): string {
+  return n.toString().padStart(2, "0");
+}
+
+/** `17:53:27` — the rail shows the time only; the day is in "Added". */
+function clockTime(iso: string): string {
+  const ms = Date.parse(iso);
+  if (Number.isNaN(ms)) return t("common.dash");
+  const d = new Date(ms);
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
 const entries = computed<TimelineEntry[]>(() => store.timelineFor(props.download.id));
 
-const stats = computed(() => {
-  const list = entries.value;
-  const failures = list.filter((e) => e.kind === "failed").length;
-  const retries = list.filter((e) => e.kind === "retry").length;
-  return { total: list.length, failures, retries };
-});
+const rows = computed<Row[]>(() =>
+  entries.value.map((entry, index) => {
+    const text = describe(entry);
+    return {
+      key: `${entry.at}-${index}`,
+      title: text.title,
+      detail: text.detail,
+      time: clockTime(entry.at),
+      tone: timelineTone(entry),
+    };
+  }),
+);
 
-function dotClass(e: TimelineEntry): string {
-  switch (e.kind) {
-    case "completed":
-    case "retry":
-      return "bg-success";
-    case "failed":
-      return "bg-danger";
-    case "started":
-      return "bg-muted-foreground";
-    default:
-      return "bg-primary";
-  }
-}
-
-function timeLabel(iso: string): string {
-  const t = Date.parse(iso);
-  if (Number.isNaN(t)) return "—";
-  const d = new Date(t);
-  const month = d.toLocaleString("en-US", { month: "short" });
-  const day = d.getDate();
-  const year = d.getFullYear();
-  const hh = d.getHours().toString().padStart(2, "0");
-  const mm = d.getMinutes().toString().padStart(2, "0");
-  const ss = d.getSeconds().toString().padStart(2, "0");
-  return `${month} ${day}, ${year} · ${hh}:${mm}:${ss}`;
-}
-
-function shortTime(iso: string): string {
-  const t = Date.parse(iso);
-  if (Number.isNaN(t)) return "—";
-  const d = new Date(t);
-  const hh = d.getHours().toString().padStart(2, "0");
-  const mm = d.getMinutes().toString().padStart(2, "0");
-  const ss = d.getSeconds().toString().padStart(2, "0");
-  return `${hh}:${mm}:${ss}`;
-}
-
-const elapsedSeconds = useElapsedSeconds(() => props.download);
-const elapsedLabel = computed(() => {
-  const s = elapsedSeconds.value;
-  if (s == null) return "—";
-  const mm = Math.floor(s / 60).toString().padStart(2, "0");
-  const ss = Math.floor(s % 60).toString().padStart(2, "0");
-  return `${mm}:${ss}`;
-});
-
-const startedLabel = computed(() => {
-  const t = Date.parse(props.download.created_at);
-  if (Number.isNaN(t)) return "—";
-  const d = new Date(t);
-  const hh = d.getHours().toString().padStart(2, "0");
-  const mm = d.getMinutes().toString().padStart(2, "0");
-  const ss = d.getSeconds().toString().padStart(2, "0");
-  return `${hh}:${mm}:${ss}`;
-});
+const DOT_TONE: Record<TimelineTone, string> = {
+  muted: "border-muted-foreground",
+  queue: "border-info",
+  accent: "border-primary",
+  ok: "border-success",
+  fail: "border-danger",
+};
 
 async function copyLog() {
-  // Plain-text timeline, one event per line. No URL or other metadata —
-  // the user is copying the *log*, not the download identity.
-  const lines = entries.value.map((e) => {
-    const detail = e.detail ? ` — ${e.detail}` : "";
-    return `[${timeLabel(e.at)}] ${e.title}${detail}`;
+  // Plain text, one event per line: the full timestamp, then what happened.
+  const lines = entries.value.map((entry) => {
+    const text = describe(entry);
+    const what = text.detail ? `${text.title}: ${text.detail}` : text.title;
+    return `[${entry.at}] ${what}`;
   });
   try {
     await navigator.clipboard.writeText(`${lines.join("\n")}\n`);
     toast.push(t("detail.copiedLogEntries", { n: lines.length }, lines.length), "success");
-  } catch (err) {
-    console.error("clipboard write failed", err);
+  } catch {
     toast.push(t("detail.copyFailed"), "error");
   }
 }
 </script>
 
 <template>
-  <div class="flex h-full flex-col">
-    <template v-if="entries.length > 0">
-      <!-- Stat pills -->
-      <div class="flex flex-wrap gap-1.5">
-        <span class="rounded-full border border-border bg-card px-2.5 py-0.5 text-xs font-medium text-foreground">
-          {{ t("detail.historyEvents", { n: stats.total }, stats.total) }}
+  <div v-if="rows.length > 0" class="flex flex-col gap-5">
+    <ol :aria-label="t('detail.timeline')" class="flex flex-col">
+      <li
+        v-for="(row, index) in rows"
+        :key="row.key"
+        class="grid grid-cols-[20px_minmax(0,1fr)_auto] items-start gap-x-2.5"
+      >
+        <span class="flex flex-col items-center self-stretch">
+          <span
+            class="mt-1 h-2.5 w-2.5 shrink-0 rounded-full border-2 bg-dl-chrome"
+            :class="DOT_TONE[row.tone]"
+          />
+          <span
+            class="mt-1 w-0.5 flex-1"
+            :class="index === rows.length - 1 ? 'bg-transparent' : 'bg-dl-line'"
+          />
         </span>
-        <span
-          v-if="stats.failures > 0"
-          class="rounded-full border border-danger/30 bg-danger/10 px-2.5 py-0.5 text-xs font-medium text-danger"
-        >
-          {{ t("detail.historyFailures", { n: stats.failures }, stats.failures) }}
-        </span>
-        <span
-          v-if="stats.retries > 0"
-          class="rounded-full border border-success/30 bg-success/10 px-2.5 py-0.5 text-xs font-medium text-success"
-        >
-          {{ t("detail.historyRetriesSucceeded", { n: stats.retries }) }}
-        </span>
-      </div>
-
-      <h3 class="mt-5 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-        {{ t("detail.timeline") }}
-      </h3>
-      <ol class="mt-2 space-y-3">
-        <li
-          v-for="(e, i) in entries"
-          :key="`${e.at}-${i}`"
-          class="flex gap-3"
-        >
-          <span class="relative mt-1.5 flex h-2.5 w-2.5 shrink-0 items-center justify-center">
-            <span class="absolute inset-0 rounded-full" :class="dotClass(e)" />
-          </span>
-          <div class="min-w-0 flex-1">
-            <p class="text-sm font-medium text-foreground">{{ e.title }}</p>
-            <p class="text-xs text-muted-foreground">
-              {{ timeLabel(e.at) }}
-              <span v-if="e.detail" class="block sm:inline">
-                <span class="hidden sm:inline"> · </span>{{ e.detail }}
-              </span>
-            </p>
-          </div>
-          <span class="shrink-0 font-mono text-[11px] text-muted-foreground">
-            {{ shortTime(e.at) }}
-          </span>
-        </li>
-      </ol>
-
-      <div class="mt-6 rounded-lg border border-border bg-card p-3">
-        <div class="flex items-center justify-between gap-3">
-          <div>
-            <p class="text-sm font-medium text-foreground">{{ t("detail.saveTimeline") }}</p>
-            <p class="text-xs text-muted-foreground">{{ t("detail.saveTimelineHint") }}</p>
-          </div>
-          <button
-            type="button"
-            class="inline-flex h-8 items-center gap-1.5 rounded-md border border-border bg-card px-3 text-xs font-medium text-foreground transition-colors hover:bg-accent"
-            @click="copyLog"
+        <span class="flex min-w-0 flex-col gap-[3px] pb-4">
+          <span class="font-medium">{{ row.title }}</span>
+          <span
+            v-if="row.detail"
+            class="break-words text-xs leading-[1.45] text-muted-foreground"
           >
-            <Copy class="h-3.5 w-3.5" />
-            {{ t("detail.copyLog") }}
-          </button>
-        </div>
-      </div>
-    </template>
-
-    <!-- Empty state -->
-    <template v-else>
-      <div class="flex flex-1 flex-col items-center justify-center px-6 py-12 text-center">
-        <span class="flex h-14 w-14 items-center justify-center rounded-full bg-success/15 text-success">
-          <Check class="h-6 w-6" />
+            {{ row.detail }}
+          </span>
         </span>
-        <p class="mt-4 text-base font-semibold text-foreground">
-          {{ t("detail.historyEmptyTitle") }}
-        </p>
-        <p class="mt-2 max-w-xs text-sm text-muted-foreground">
-          {{ t("detail.historyEmptyBody") }}
-        </p>
-        <p class="mt-6 text-xs text-muted-foreground">
-          {{ t("detail.historyEmptyFooter", { started: startedLabel, elapsed: elapsedLabel }) }}
-        </p>
-      </div>
-    </template>
+        <span class="pt-px font-mono text-xs text-muted-foreground">{{ row.time }}</span>
+      </li>
+    </ol>
+
+    <div class="flex items-center gap-3 rounded-xl border border-dl-line px-3.5 py-3">
+      <span class="flex min-w-0 flex-1 flex-col gap-0.5">
+        <span class="font-medium">{{ t("detail.saveTimeline") }}</span>
+        <span class="text-xs leading-[1.45] text-muted-foreground">
+          {{ t("detail.saveTimelineHint") }}
+        </span>
+      </span>
+      <Button size="sm" @click="copyLog">
+        <Copy class="h-[13px] w-[13px]" aria-hidden="true" />
+        {{ t("detail.copyLog") }}
+      </Button>
+    </div>
+  </div>
+
+  <div v-else class="flex flex-col gap-1 py-6">
+    <p class="font-medium">{{ t("detail.historyEmptyTitle") }}</p>
+    <p class="text-xs leading-[1.45] text-muted-foreground">
+      {{ t("detail.historyEmptyBody") }}
+    </p>
   </div>
 </template>

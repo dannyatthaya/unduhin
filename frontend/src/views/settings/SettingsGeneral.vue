@@ -1,251 +1,204 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+// Settings → General: defaults for new downloads and for the app itself.
+
+import { computed, useId } from "vue";
 import { useI18n } from "vue-i18n";
 
-import SettingsSection from "@/components/settings/SettingsSection.vue";
+import GeneralStorageCard from "@/components/settings/GeneralStorageCard.vue";
+import SavedTick from "@/components/settings/SavedTick.vue";
 import SettingCard from "@/components/settings/SettingCard.vue";
 import SettingRow from "@/components/settings/SettingRow.vue";
+import SettingsSection from "@/components/settings/SettingsSection.vue";
 import FolderPicker from "@/components/settings/controls/FolderPicker.vue";
-import SliderField from "@/components/settings/controls/SliderField.vue";
+import NumberStepper from "@/components/settings/controls/NumberStepper.vue";
 import SpeedLimitField from "@/components/settings/controls/SpeedLimitField.vue";
-import ThemeTriToggle from "@/components/settings/controls/ThemeTriToggle.vue";
 import ToggleSwitch from "@/components/settings/controls/ToggleSwitch.vue";
-import Button from "@/components/ui/Button.vue";
+import SegmentedControl, { type SegmentOption } from "@/components/ui/SegmentedControl.vue";
 import Select from "@/components/ui/Select.vue";
 
-import { useGeneralSettings } from "@/composables/useGeneralSettings";
-import { useSettingsFilter } from "@/composables/useSettingsFilter";
+import { useSettingsStore } from "@/stores/settings";
+import { useGeneralSettings, type DeleteAction } from "@/composables/useGeneralSettings";
 import { useLocale } from "@/composables/useLocale";
+import { useSavedFlash } from "@/composables/useSavedFlash";
+import type { ThemeMode } from "@/composables/useTheme";
 import { useToast } from "@/composables/useToast";
-import { formatBytes } from "@/lib/format";
-import { api } from "@/types/tauri-bindings";
 import type { LocaleSetting } from "@/i18n";
+import type { SettingValue } from "@/types/tauri-bindings";
 
 const { t } = useI18n();
+const store = useSettingsStore();
 const settings = useGeneralSettings();
-const filter = useSettingsFilter();
 const locale = useLocale();
 const toast = useToast();
-const isHidden = (id: string) => filter.isHidden(id);
+const saved = useSavedFlash();
 
-/** Reclaimable scratch, in bytes. `null` until the first read lands. */
-const tempBytes = ref<number | null>(null);
-const clearingTemp = ref(false);
+const folderId = useId();
+const languageId = useId();
 
-async function refreshTempSize() {
+const SEGMENTS_MAX = 32;
+const CONCURRENT_MAX = 16;
+
+/** Store a value and, once it is stored, say so beside the control. */
+async function save(rowId: string, key: string, value: SettingValue): Promise<void> {
   try {
-    tempBytes.value = await api.getTemporaryDataSize();
-  } catch {
-    // Purely informational; a failed size read shouldn't nag the user.
-    tempBytes.value = null;
-  }
-}
-
-onMounted(refreshTempSize);
-
-const tempDescription = computed(() => {
-  if (tempBytes.value === null) return t("settings.clearTempDataDesc");
-  return t("settings.clearTempDataDescWithSize", {
-    size: formatBytes(tempBytes.value),
-  });
-});
-
-async function onClearTemporaryData() {
-  clearingTemp.value = true;
-  try {
-    const result = await api.clearTemporaryData();
-    toast.push(
-      result.removedDirs === 0
-        ? t("settings.clearTempDataEmpty")
-        : t("settings.clearTempDataDone", {
-            size: formatBytes(result.freedBytes),
-          }),
-      "success",
-    );
-    await refreshTempSize();
+    await store.set(key, value);
+    saved.flash(rowId);
   } catch (e: unknown) {
-    toast.push(
-      (e as { message?: string })?.message ?? t("settings.clearTempDataFailed"),
-      "error",
-    );
-  } finally {
-    clearingTemp.value = false;
+    const message = (e as { message?: string })?.message ?? String(e);
+    toast.push(t("settings.saveFailed", { error: message }), "error");
   }
 }
 
-const languageOptions = computed(() => [
-  { value: "system", label: t("settings.languageSystem") },
-  { value: "en", label: t("settings.languageEnglish") },
-  { value: "id", label: t("settings.languageIndonesian") },
-]);
-
-const deleteActionOptions = computed(() => [
+const removeOptions = computed<SegmentOption<DeleteAction>[]>(() => [
   { value: "ask", label: t("settings.removeActionAsk") },
   { value: "row_only", label: t("settings.removeActionRowOnly") },
   { value: "row_and_data", label: t("settings.removeActionRowAndData") },
 ]);
 
-const showRestartHint = computed(
-  () => locale.resolved.value !== locale.bootLocale,
-);
+// The swatches show the two page backgrounds, whatever theme is on now.
+const LIGHT_PAGE = "#fbfaf6";
+const DARK_PAGE = "#0a0a0a";
+const themeOptions = computed<SegmentOption<ThemeMode>[]>(() => [
+  {
+    value: "system",
+    label: t("settings.themeSystem"),
+    swatch: `linear-gradient(135deg, ${LIGHT_PAGE} 0 50%, ${DARK_PAGE} 50% 100%)`,
+  },
+  { value: "light", label: t("settings.themeLight"), swatch: LIGHT_PAGE },
+  { value: "dark", label: t("settings.themeDark"), swatch: DARK_PAGE },
+]);
 
-function onLanguage(value: string) {
-  if (value === "en" || value === "id" || value === "system") {
-    locale.setLocale(value satisfies LocaleSetting);
-  }
-}
+const languageOptions = computed<{ value: LocaleSetting; label: string }[]>(() => [
+  { value: "system", label: t("settings.languageSystem") },
+  { value: "en", label: t("settings.languageEnglish") },
+  { value: "id", label: t("settings.languageIndonesian") },
+]);
+
+const showRestartHint = computed(() => locale.resolved.value !== locale.bootLocale);
 </script>
 
 <template>
   <SettingsSection
-    :eyebrow="t('downloads.settings')"
     :title="t('settings.sectionGeneral')"
-    description="Default behaviour for new downloads and the app shell. These values are used unless a specific download overrides them."
+    :description="t('settings.sectionGeneralDesc')"
   >
-    <SettingCard
-      :title="t('settings.cardFiles')"
-      :description="t('settings.cardFilesDesc')"
-    >
+    <SettingCard :title="t('settings.cardFiles')">
       <SettingRow
         id="general/default-output-path"
         :label="t('settings.fileDefaultFolder')"
         :description="t('settings.fileDefaultFolderDesc')"
-        :hidden="isHidden('general/default-output-path')"
+        :label-for="folderId"
+        stacked
       >
-        <FolderPicker v-model="settings.defaultOutputPath.value" />
-      </SettingRow>
-      <SettingRow
-        id="general/default-segments"
-        :label="t('settings.fileDefaultSegments')"
-        :description="t('settings.fileDefaultSegmentsDesc')"
-        :hidden="isHidden('general/default-segments')"
-      >
-        <SliderField
-          v-model="settings.defaultSegments.value"
-          :min="1"
-          :max="32"
-        />
-      </SettingRow>
-      <SettingRow
-        id="general/max-concurrent"
-        :label="t('settings.fileMaxConcurrent')"
-        :description="t('settings.fileMaxConcurrentDesc')"
-        :hidden="isHidden('general/max-concurrent')"
-      >
-        <SliderField
-          v-model="settings.maxConcurrent.value"
-          :min="1"
-          :max="16"
+        <FolderPicker
+          :id="folderId"
+          :model-value="settings.defaultOutputPath.value"
+          full
+          @update:model-value="save('general/default-output-path', 'default_output_path', $event)"
         />
       </SettingRow>
       <SettingRow
         id="general/always-ask-filename"
+        v-slot="{ labelId }"
         :label="t('settings.fileAlwaysAskFilename')"
         :description="t('settings.fileAlwaysAskFilenameDesc')"
-        :hidden="isHidden('general/always-ask-filename')"
       >
-        <ToggleSwitch
-          v-model="settings.alwaysAskFilename.value"
-          :aria-label="t('settings.fileAlwaysAskFilename')"
+        <ToggleSwitch v-model="settings.alwaysAskFilename.value" :labelledby="labelId" />
+      </SettingRow>
+      <SettingRow
+        id="general/delete-default-action"
+        v-slot="{ labelId }"
+        :label="t('settings.removeAction')"
+        :description="t('settings.removeActionDesc')"
+      >
+        <SegmentedControl
+          v-model="settings.deleteDefaultAction.value"
+          :options="removeOptions"
+          :labelledby="labelId"
         />
       </SettingRow>
     </SettingCard>
 
-    <SettingCard
-      :title="t('settings.cardRemoving')"
-      :description="t('settings.cardRemovingDesc')"
-    >
+    <SettingCard :title="t('settings.cardBandwidth')">
       <SettingRow
-        id="general/delete-default-action"
-        :label="t('settings.removeAction')"
-        :description="t('settings.removeActionDesc')"
-        :hidden="isHidden('general/delete-default-action')"
+        id="general/global-speed-limit"
+        v-slot="{ labelId }"
+        :label="t('settings.bandwidthLimit')"
+        :description="t('settings.bandwidthLimitDesc')"
       >
-        <div class="w-72">
+        <SavedTick :show="saved.isSaved('general/global-speed-limit')" />
+        <SpeedLimitField
+          :model-value="settings.globalSpeedBps.value"
+          :labelledby="labelId"
+          @update:model-value="save('general/global-speed-limit', 'global_speed_limit_bps', $event)"
+        />
+      </SettingRow>
+      <SettingRow
+        id="general/default-segments"
+        v-slot="{ labelId }"
+        :label="t('settings.fileDefaultSegments')"
+        :description="t('settings.fileDefaultSegmentsDesc')"
+      >
+        <SavedTick :show="saved.isSaved('general/default-segments')" />
+        <NumberStepper
+          :model-value="settings.defaultSegments.value"
+          :min="1"
+          :max="SEGMENTS_MAX"
+          :labelledby="labelId"
+          :decrease-label="t('addUrl.fewerConnections')"
+          :increase-label="t('addUrl.moreConnections')"
+          @update:model-value="save('general/default-segments', 'default_segments', $event)"
+        />
+      </SettingRow>
+      <SettingRow
+        id="general/max-concurrent"
+        v-slot="{ labelId }"
+        :label="t('settings.fileMaxConcurrent')"
+        :description="t('settings.fileMaxConcurrentDesc')"
+      >
+        <SavedTick :show="saved.isSaved('general/max-concurrent')" />
+        <NumberStepper
+          :model-value="settings.maxConcurrent.value"
+          :min="1"
+          :max="CONCURRENT_MAX"
+          :labelledby="labelId"
+          :decrease-label="t('settings.fewer')"
+          :increase-label="t('settings.more')"
+          @update:model-value="save('general/max-concurrent', 'max_concurrent_downloads', $event)"
+        />
+      </SettingRow>
+    </SettingCard>
+
+    <SettingCard :title="t('settings.cardAppearance')">
+      <SettingRow
+        id="general/theme"
+        v-slot="{ labelId }"
+        :label="t('settings.themeLabel')"
+        :description="t('settings.themeDesc')"
+      >
+        <SegmentedControl
+          v-model="settings.themeMode.value"
+          :options="themeOptions"
+          :labelledby="labelId"
+        />
+      </SettingRow>
+      <SettingRow
+        id="general/language"
+        :label="t('settings.languageLabel')"
+        :description="showRestartHint ? t('settings.languageRestartHint') : t('settings.languageDesc')"
+        :label-for="languageId"
+      >
+        <div class="w-[220px]">
           <Select
-            v-model="settings.deleteDefaultAction.value"
-            :options="deleteActionOptions"
+            :id="languageId"
+            :model-value="locale.setting.value"
+            :options="languageOptions"
+            @update:model-value="locale.setLocale($event)"
           />
         </div>
       </SettingRow>
     </SettingCard>
 
-    <SettingCard
-      :title="t('settings.cardBandwidth')"
-      :description="t('settings.cardBandwidthDesc')"
-    >
-      <SettingRow
-        id="general/global-speed-limit"
-        :label="t('settings.bandwidthLimit')"
-        :description="t('settings.bandwidthLimitDesc')"
-        :hidden="isHidden('general/global-speed-limit')"
-      >
-        <SpeedLimitField v-model="settings.globalSpeedBps.value" />
-      </SettingRow>
-    </SettingCard>
-
-    <SettingCard
-      :title="t('settings.cardAppearance')"
-      :description="t('settings.cardAppearanceDesc')"
-    >
-      <SettingRow
-        id="general/theme"
-        :label="t('settings.themeLabel')"
-        :description="t('settings.themeDesc')"
-        :hidden="isHidden('general/theme')"
-      >
-        <ThemeTriToggle v-model="settings.themeMode.value" />
-      </SettingRow>
-      <SettingRow
-        id="general/language"
-        :label="t('settings.languageLabel')"
-        :description="t('settings.languageDesc')"
-        :hidden="isHidden('general/language')"
-      >
-        <div class="space-y-2">
-          <div class="w-56">
-            <Select
-              :model-value="locale.setting.value"
-              :options="languageOptions"
-              @update:model-value="onLanguage"
-            />
-          </div>
-          <p
-            v-if="showRestartHint"
-            class="max-w-xs text-xs text-muted-foreground"
-          >
-            {{ t("settings.languageRestartHint") }}
-          </p>
-        </div>
-      </SettingRow>
-    </SettingCard>
-
-    <SettingCard
-      :title="t('settings.cardStorage')"
-      :description="t('settings.cardStorageDesc')"
-    >
-      <SettingRow
-        id="general/clear-temp-data"
-        :label="t('settings.clearTempData')"
-        :description="tempDescription"
-        :hidden="isHidden('general/clear-temp-data')"
-      >
-        <Button
-          variant="secondary"
-          :disabled="clearingTemp || tempBytes === 0"
-          @click="onClearTemporaryData"
-        >
-          {{
-            clearingTemp
-              ? t("settings.clearTempDataBusy")
-              : t("settings.clearTempDataAction")
-          }}
-        </Button>
-      </SettingRow>
-    </SettingCard>
-
-    <p class="px-1 pt-2 text-xs text-muted-foreground">
-      {{ t("common.saveHint") }}
-    </p>
+    <GeneralStorageCard />
   </SettingsSection>
 </template>

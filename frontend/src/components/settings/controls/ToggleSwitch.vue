@@ -5,6 +5,8 @@ defineProps<{
   modelValue: boolean;
   disabled?: boolean;
   ariaLabel?: string;
+  /** Id of the visible text that names this switch. */
+  labelledby?: string;
 }>();
 defineEmits<{ "update:modelValue": [value: boolean] }>();
 </script>
@@ -14,6 +16,7 @@ defineEmits<{ "update:modelValue": [value: boolean] }>();
     :model-value="modelValue"
     :disabled="disabled"
     :aria-label="ariaLabel"
+    :labelledby="labelledby"
     @update:model-value="$emit('update:modelValue', $event)"
   />
 </template>

@@ -1,15 +1,16 @@
 <script setup lang="ts">
+// Settings → Categories: the list, and a short note on how sorting works.
+
 import { computed, ref } from "vue";
 import { useI18n } from "vue-i18n";
-import { Plus, Info } from "lucide-vue-next";
+import { Info, Plus } from "lucide-vue-next";
 
-import SettingsSection from "@/components/settings/SettingsSection.vue";
 import SettingCard from "@/components/settings/SettingCard.vue";
-import Button from "@/components/ui/Button.vue";
-
+import SettingsSection from "@/components/settings/SettingsSection.vue";
 import CategoriesTable from "@/components/settings/categories/CategoriesTable.vue";
-import RulesEditor from "@/components/settings/categories/RulesEditor.vue";
 import CategoryDialog from "@/components/settings/categories/CategoryDialog.vue";
+import DeleteCategoryDialog from "@/components/settings/categories/DeleteCategoryDialog.vue";
+import Button from "@/components/ui/Button.vue";
 
 import { useCategoriesStore } from "@/stores/categories";
 import { useDownloadsStore } from "@/stores/downloads";
@@ -20,106 +21,83 @@ const { t } = useI18n();
 const store = useCategoriesStore();
 const downloads = useDownloadsStore();
 const filter = useSettingsFilter();
-const isHidden = (id: string) => filter.isHidden(id);
 
 const dialogOpen = ref(false);
 const editing = ref<Category | null>(null);
+const deleting = ref<Category | null>(null);
 
 function openAdd() {
   editing.value = null;
   dialogOpen.value = true;
 }
-function openEdit(cat: Category) {
-  editing.value = cat;
+function openEdit(category: Category) {
+  editing.value = category;
   dialogOpen.value = true;
 }
 function closeDialog() {
   dialogOpen.value = false;
   editing.value = null;
 }
-
-async function confirmRemove(cat: Category) {
-  if (cat.name === "Other") return;
-  const ok = window.confirm(
-    `${t("settings.categoriesDeleteConfirm", { name: cat.name })} ${t("settings.categoriesDeleteHint")}`,
-  );
-  if (!ok) return;
-  await store.remove(cat.id);
+/** Delete asked from inside the edit dialog: one dialog at a time. */
+function deleteFromDialog(category: Category) {
+  closeDialog();
+  deleting.value = category;
 }
 
-const counts = computed(() => ({
-  categories: store.list.length,
-  downloads: downloads.all.length,
-}));
-
-const ruleCount = computed(
-  () =>
-    store.list.filter((c) => c.name !== "Other" && c.extension_rules.length > 0)
-      .length + 1, // +1 for the locked "everything else" rule
+const summary = computed(() =>
+  t("settings.categoriesCounts", {
+    downloads: t("settings.categoriesCountDownloads", { n: downloads.all.length }, downloads.all.length),
+    categories: t("settings.categoriesCountCategories", { n: store.list.length }, store.list.length),
+  }),
 );
 </script>
 
 <template>
   <SettingsSection
-    :eyebrow="t('downloads.settings')"
     :title="t('settings.sectionCategories')"
     :description="t('settings.sectionCategoriesDesc')"
   >
     <template #actions>
-      <Button variant="primary" @click="openAdd">
-        <Plus class="h-4 w-4" />
+      <Button @click="openAdd">
+        <Plus class="h-[15px] w-[15px]" aria-hidden="true" />
         {{ t("settings.categoriesAdd") }}
       </Button>
     </template>
 
     <SettingCard
       :title="t('settings.categoriesListTitle')"
-      :description="t('settings.categoriesListDesc')"
+      :note="t('settings.categoriesReorderNote')"
     >
       <template #actions>
-        <div class="text-right text-xs text-muted-foreground">
-          {{ t("settings.categoriesCounts", { categories: counts.categories, downloads: counts.downloads }) }}
-        </div>
+        <span class="whitespace-nowrap font-mono text-xs text-muted-foreground">{{ summary }}</span>
       </template>
-      <div
-        :data-setting-id="'categories/list'"
-        v-show="!isHidden('categories/list')"
-      >
-        <CategoriesTable @edit="openEdit" @remove="confirmRemove" />
+      <div v-show="!filter.isHidden('categories/list')" data-setting-id="categories/list">
+        <CategoriesTable @edit="openEdit" @remove="deleting = $event" />
       </div>
     </SettingCard>
 
-    <SettingCard
-      :title="t('settings.categoriesRulesLabel')"
-      :description="t('settings.categoriesRulesDesc')"
-    >
-      <template #actions>
-        <div class="text-right text-xs text-muted-foreground">
-          {{ t("settings.categoriesRulesCount", { n: ruleCount }) }}
-        </div>
-      </template>
-      <div
-        :data-setting-id="'categories/rules'"
-        v-show="!isHidden('categories/rules')"
+    <section class="flex flex-col gap-2.5" aria-labelledby="categories-how">
+      <h2
+        id="categories-how"
+        class="px-0.5 text-xs font-semibold uppercase tracking-[0.06em] text-muted-foreground"
       >
-        <RulesEditor />
+        {{ t("settings.categoriesHowTitle") }}
+      </h2>
+      <div class="flex items-start gap-3 rounded-xl border border-dl-line bg-card px-[18px] py-3.5">
+        <Info class="mt-px h-[18px] w-[18px] shrink-0 text-muted-foreground" aria-hidden="true" />
+        <span class="flex flex-col gap-1 leading-normal">
+          <span>{{ t("settings.categoriesHowBody") }}</span>
+          <span class="text-muted-foreground">{{ t("settings.categoriesHowClash") }}</span>
+        </span>
       </div>
-    </SettingCard>
-
-    <div
-      class="flex items-start gap-2 rounded-md border border-primary/30 bg-primary/5 px-4 py-3 text-xs text-primary"
-    >
-      <Info class="mt-0.5 h-4 w-4 shrink-0" />
-      <p>
-        <strong class="font-semibold">{{ t("settings.categoriesRulesOrderTitle") }}</strong>
-        {{ t("settings.categoriesRulesOrderBody") }}
-      </p>
-    </div>
+    </section>
 
     <CategoryDialog
       :open="dialogOpen"
       :category="editing"
       @close="closeDialog"
+      @delete="deleteFromDialog"
     />
+    <DeleteCategoryDialog :category="deleting" @close="deleting = null" @deleted="deleting = null" />
   </SettingsSection>
 </template>

@@ -109,6 +109,12 @@ pub mod settings_keys {
     /// the extension's `chrome.storage`) because the clipboard belongs
     /// to the OS, not the browser. Default `false`.
     pub const WATCH_CLIPBOARD: &str = "watch_clipboard";
+
+    /// Whether a failed download still raises a notification while quiet
+    /// hours are active. Failures need the user; everything else can wait
+    /// until the window ends. Default `true`; read by the frontend's
+    /// notification gate.
+    pub const QUIET_HOURS_NOTIFY_FAILURES: &str = "quiet_hours_notify_failures";
 }
 
 /// Thin wrapper around [`serde_json::Value`] so consumers don't have to

@@ -1,9 +1,8 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted } from "vue";
-import { useRoute, useRouter } from "vue-router";
+import { onBeforeUnmount, onMounted } from "vue";
+import { useRouter } from "vue-router";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 
-import AppTitleBar from "@/components/AppTitleBar.vue";
 import Toaster from "@/components/ui/Toaster.vue";
 import DeleteConfirmDialog from "@/components/DeleteConfirmDialog.vue";
 import RefreshLinkDialog from "@/components/RefreshLinkDialog.vue";
@@ -20,11 +19,6 @@ import { useClipboardCapture } from "@/composables/useClipboardCapture";
 import { onCheckUpdates } from "@/types/tauri-bindings";
 
 const router = useRouter();
-const route = useRoute();
-
-// The downloads page draws its own title bar (brand + search + window
-// controls in one strip); every other route keeps the shared one.
-const usesSharedTitleBar = computed(() => route.path.startsWith("/settings"));
 
 // Wire the theme at the app shell so the persisted `theme_mode` setting
 // always propagates to the DOM, even when the user toggles it from the
@@ -83,7 +77,6 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="flex h-screen w-screen flex-col bg-background text-foreground">
-    <AppTitleBar v-if="usesSharedTitleBar" />
     <RouterView />
 
     <ConfirmOnQuitDialog />

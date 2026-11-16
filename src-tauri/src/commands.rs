@@ -651,6 +651,9 @@ pub struct NewCategoryInput {
     pub icon: Option<String>,
     pub default_output_path: Option<String>,
     pub extension_rules: Option<Vec<String>>,
+    /// One of `unduhin_core::category::CATEGORY_COLORS`, or absent.
+    #[serde(default)]
+    pub color: Option<String>,
 }
 
 #[tauri::command]
@@ -664,6 +667,7 @@ pub async fn add_category(
             icon: input.icon,
             default_output_path: input.default_output_path.map(PathBuf::from),
             extension_rules: input.extension_rules.unwrap_or_default(),
+            color: input.color,
         })
         .await?)
 }
@@ -682,6 +686,7 @@ pub async fn update_category(
                 icon: input.icon,
                 default_output_path: input.default_output_path.map(PathBuf::from),
                 extension_rules: input.extension_rules.unwrap_or_default(),
+                color: input.color,
             },
         )
         .await?)

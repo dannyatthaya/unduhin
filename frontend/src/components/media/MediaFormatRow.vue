@@ -32,6 +32,15 @@ const sizeLabel = computed(() => {
   return mb < 1 ? `${(s / 1024).toFixed(0)} KB` : `${mb.toFixed(1)} MB`;
 });
 
+/** "mp4, avc1, mp4a, 1080p": container, codecs, then the site's note. */
+const detailLine = computed(() => {
+  const codec = (value: string | null | undefined) =>
+    value && value !== "none" ? value : null;
+  return [props.format.ext, codec(props.format.vcodec), codec(props.format.acodec), props.format.note]
+    .filter(Boolean)
+    .join(", ");
+});
+
 const blocked = computed(
   () => (props.requiresFfmpeg ?? false) && !props.ffmpegAvailable
 );
@@ -54,19 +63,11 @@ const blocked = computed(
     <div class="flex min-w-0 flex-col">
       <div class="flex items-center gap-2 font-medium">
         <span>{{ format.resolution ?? format.format_id }}</span>
-        <span class="text-muted-foreground">·</span>
         <span class="text-muted-foreground">{{ kind }}</span>
         <span v-if="format.fps" class="text-muted-foreground">{{ format.fps }}fps</span>
       </div>
       <div class="truncate text-muted-foreground">
-        {{ format.ext }}
-        <template v-if="format.vcodec && format.vcodec !== 'none'">
-          · {{ format.vcodec }}
-        </template>
-        <template v-if="format.acodec && format.acodec !== 'none'">
-          · {{ format.acodec }}
-        </template>
-        <template v-if="format.note"> · {{ format.note }}</template>
+        {{ detailLine }}
       </div>
     </div>
     <div class="shrink-0 text-right text-muted-foreground">

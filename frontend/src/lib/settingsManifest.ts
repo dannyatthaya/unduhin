@@ -1,10 +1,9 @@
-// Static index used by the settings search/filter. Hand-maintained:
-// every visible setting in the Settings views appears here so the
-// sidebar filter can match against label + description + keywords and
-// jump to the row on click.
+// Static index used by the settings search. Hand-maintained: every setting
+// a row shows appears here, pointing at the same strings the row renders,
+// so search matches what is on screen in the current language.
 //
-// Adding a setting: drop a new entry below, then make sure the
-// `<SettingRow>` in its section component uses the same `id`.
+// Adding a setting: add an entry below, then make sure the `<SettingRow>`
+// in its section uses the same `id`.
 
 export type SettingsSectionKey =
   | "general"
@@ -20,21 +19,24 @@ export interface SettingsIndexEntry {
   section: SettingsSectionKey;
   /** Stable anchor id; the SettingRow stamps this on `data-setting-id`. */
   id: string;
-  label: string;
-  description: string;
-  keywords?: string[];
-  route: string;
+  /** i18n key of the row's label. */
+  labelKey: string;
+  /** i18n key of the row's description. */
+  descKey: string;
+  /** Extra English words people search by that the strings do not contain. */
+  keywords: string[];
 }
 
-export const SECTION_LABELS: Record<SettingsSectionKey, string> = {
-  general: "General",
-  categories: "Categories",
-  behaviour: "Behaviour",
-  network: "Network",
-  torrent: "Torrent",
-  media: "Media",
-  browser: "Browser",
-  about: "About",
+/** i18n keys of the section names. */
+export const SECTION_LABEL_KEYS: Record<SettingsSectionKey, string> = {
+  general: "settings.sectionGeneral",
+  categories: "settings.sectionCategories",
+  behaviour: "settings.sectionBehaviour",
+  network: "settings.sectionNetwork",
+  torrent: "settings.sectionTorrent",
+  media: "settings.sectionMedia",
+  browser: "settings.sectionBrowser",
+  about: "settings.sectionAbout",
 };
 
 export const SECTION_ROUTES: Record<SettingsSectionKey, string> = {
@@ -48,395 +50,93 @@ export const SECTION_ROUTES: Record<SettingsSectionKey, string> = {
   about: "/settings/about",
 };
 
-export const SETTINGS_INDEX: SettingsIndexEntry[] = [
-  // -- General -------------------------------------------------------------
-  {
-    section: "general",
-    id: "general/default-output-path",
-    label: "Default download folder",
-    description: "Used when a category doesn't specify its own folder.",
-    keywords: ["folder", "directory", "path", "location", "files"],
-    route: SECTION_ROUTES.general,
-  },
-  {
-    section: "general",
-    id: "general/default-segments",
-    label: "Default segment count",
-    description:
-      "How many parallel connections per download. More segments = faster on healthy servers, but rude on small ones.",
-    keywords: ["parallel", "connections", "threads", "segments"],
-    route: SECTION_ROUTES.general,
-  },
-  {
-    section: "general",
-    id: "general/max-concurrent",
-    label: "Max concurrent downloads",
-    description: "Anything past this number waits in queue until a slot frees up.",
-    keywords: ["queue", "limit", "concurrent"],
-    route: SECTION_ROUTES.general,
-  },
-  {
-    section: "general",
-    id: "general/global-speed-limit",
-    label: "Global speed limit",
-    description: "Caps the combined download rate across every active segment.",
-    keywords: ["bandwidth", "throttle", "speed"],
-    route: SECTION_ROUTES.general,
-  },
-  {
-    section: "general",
-    id: "general/theme",
-    label: "Theme",
-    description: "Light, dark, or follow the system.",
-    keywords: ["appearance", "dark mode", "light mode", "colour"],
-    route: SECTION_ROUTES.general,
-  },
-  {
-    section: "general",
-    id: "general/language",
-    label: "Language",
-    description: "Coming in a later release.",
-    keywords: ["i18n", "translation", "locale"],
-    route: SECTION_ROUTES.general,
-  },
-  {
-    section: "general",
-    id: "general/clear-temp-data",
-    label: "Temporary data",
-    description:
-      "Delete leftover partial files from downloads that no longer exist.",
-    keywords: ["temp", "cache", "cleanup", "scratch", "part", "disk space"],
-    route: SECTION_ROUTES.general,
-  },
-
-  // -- Categories ----------------------------------------------------------
-  {
-    section: "categories",
-    id: "categories/list",
-    label: "Categories",
-    description: "Add, edit, reorder, and delete categories.",
-    keywords: ["folder", "rules", "icon"],
-    route: SECTION_ROUTES.categories,
-  },
-  {
-    section: "categories",
-    id: "categories/rules",
-    label: "Auto-categorize rules",
-    description:
-      "If a download's file extension matches one of these, it's filed into that category.",
-    keywords: ["extension", "match", "auto"],
-    route: SECTION_ROUTES.categories,
-  },
-
-  // -- Behaviour -----------------------------------------------------------
-  {
-    section: "behaviour",
-    id: "behaviour/autostart",
-    label: "Launch at startup",
-    description:
-      "Start Unduhin when you sign in. Required if you want queued downloads to run unattended.",
-    keywords: ["startup", "boot", "login"],
-    route: SECTION_ROUTES.behaviour,
-  },
-  {
-    section: "behaviour",
-    id: "behaviour/start-minimized",
-    label: "Start minimized to tray",
-    description:
-      "Skip showing the main window on startup. Persisted now; activates once the tray ships.",
-    keywords: ["tray", "background"],
-    route: SECTION_ROUTES.behaviour,
-  },
-  {
-    section: "behaviour",
-    id: "behaviour/close-behavior",
-    label: "When I close the window",
-    description:
-      "What the × button does. Active downloads keep running either way.",
-    keywords: ["close", "quit", "exit", "minimize"],
-    route: SECTION_ROUTES.behaviour,
-  },
-  {
-    section: "behaviour",
-    id: "behaviour/confirm-on-quit",
-    label: "Confirm before quitting with active downloads",
-    description:
-      'A short "3 downloads in progress — quit anyway?" dialog.',
-    keywords: ["confirm", "quit"],
-    route: SECTION_ROUTES.behaviour,
-  },
-  {
-    section: "behaviour",
-    id: "behaviour/notify-complete",
-    label: "Notify when a download completes",
-    description: 'Toast with the filename and an "Open folder" action.',
-    keywords: ["notification", "toast", "complete"],
-    route: SECTION_ROUTES.behaviour,
-  },
-  {
-    section: "behaviour",
-    id: "behaviour/notify-fail",
-    label: "Notify when a download fails",
-    description: 'Toast with the reason and a "Retry" action.',
-    keywords: ["notification", "toast", "fail", "error"],
-    route: SECTION_ROUTES.behaviour,
-  },
-  {
-    section: "behaviour",
-    id: "behaviour/notify-queue-empty",
-    label: "Notify when the whole queue empties",
-    description: "One summary toast after the last active download finishes.",
-    keywords: ["notification", "queue", "summary"],
-    route: SECTION_ROUTES.behaviour,
-  },
-  {
-    section: "behaviour",
-    id: "behaviour/quiet-hours",
-    label: "Quiet hours",
-    description:
-      "Mute notifications during a recurring window. Coming in a later release.",
-    keywords: ["mute", "silence", "schedule"],
-    route: SECTION_ROUTES.behaviour,
-  },
-
-  // -- Network -------------------------------------------------------------
-  {
-    section: "network",
-    id: "network/connect-timeout",
-    label: "Connect timeout",
-    description:
-      "How long to wait for the initial TCP/TLS handshake before giving up on a host.",
-    keywords: ["timeout", "tcp", "tls", "handshake"],
-    route: SECTION_ROUTES.network,
-  },
-  {
-    section: "network",
-    id: "network/read-timeout",
-    label: "Read timeout",
-    description:
-      "After connecting, how long a segment can stall with zero bytes before Unduhin retries.",
-    keywords: ["timeout", "stall", "read"],
-    route: SECTION_ROUTES.network,
-  },
-  {
-    section: "network",
-    id: "network/max-retries",
-    label: "Max retries per segment",
-    description:
-      "A segment that fails this many times in a row is marked dead.",
-    keywords: ["retry", "fail", "attempts"],
-    route: SECTION_ROUTES.network,
-  },
-  {
-    section: "network",
-    id: "network/retry-backoff",
-    label: "Retry backoff base",
-    description:
-      "Doubles after each failure with full jitter. Keep modest to avoid hammering servers.",
-    keywords: ["backoff", "retry", "jitter"],
-    route: SECTION_ROUTES.network,
-  },
-  {
-    section: "network",
-    id: "network/user-agent",
-    label: "User-agent",
-    description: "The identifier Unduhin sends with every HTTP request.",
-    keywords: ["ua", "header", "browser", "identify"],
-    route: SECTION_ROUTES.network,
-  },
-
-  // -- Torrent -------------------------------------------------------------
-  {
-    section: "torrent",
-    id: "torrent/listen-port",
-    label: "Listen port",
-    description:
-      "TCP/UDP port for inbound peer connections. 0 lets the OS pick a random port.",
-    keywords: ["port", "listen", "incoming", "peers", "bittorrent"],
-    route: SECTION_ROUTES.torrent,
-  },
-  {
-    section: "torrent",
-    id: "torrent/enable-dht",
-    label: "Enable DHT",
-    description:
-      "Distributed hash table — required to resolve trackerless magnet links.",
-    keywords: ["dht", "magnet", "trackerless", "mainline", "peers"],
-    route: SECTION_ROUTES.torrent,
-  },
-  {
-    section: "torrent",
-    id: "torrent/enable-upnp",
-    label: "Enable UPnP port mapping",
-    description:
-      "Ask the router to forward the listen port so remote peers can reach you.",
-    keywords: ["upnp", "port", "forward", "nat", "router"],
-    route: SECTION_ROUTES.torrent,
-  },
-  {
-    section: "torrent",
-    id: "torrent/max-peers",
-    label: "Max peers per torrent",
-    description: "Upper bound on simultaneous peer connections for one torrent.",
-    keywords: ["peers", "connections", "limit", "budget"],
-    route: SECTION_ROUTES.torrent,
-  },
-  {
-    section: "torrent",
-    id: "torrent/download-dir",
-    label: "Torrent download folder",
-    description:
-      "Where torrent content lands. Empty falls back to the default download folder.",
-    keywords: ["folder", "directory", "path", "torrent", "location"],
-    route: SECTION_ROUTES.torrent,
-  },
-  {
-    section: "torrent",
-    id: "torrent/seed-ratio",
-    label: "Seed ratio",
-    description:
-      "Keep seeding until this upload/download ratio. 0 stops at 100% (no seeding).",
-    keywords: ["seed", "ratio", "upload", "share"],
-    route: SECTION_ROUTES.torrent,
-  },
-
-  // -- Media ---------------------------------------------------------------
-  {
-    section: "media",
-    id: "media/ytdlp-status",
-    label: "yt-dlp",
-    description:
-      "Install or update the yt-dlp binary used to download from YouTube, Vimeo, Twitter, TikTok and other media sites.",
-    keywords: ["youtube", "vimeo", "twitter", "tiktok", "video", "media", "ytdlp"],
-    route: SECTION_ROUTES.media,
-  },
-  {
-    section: "media",
-    id: "media/ytdlp-custom-path",
-    label: "Custom yt-dlp path",
-    description: "Point to an existing yt-dlp.exe instead of the managed install.",
-    keywords: ["override", "path", "binary", "exe", "ytdlp"],
-    route: SECTION_ROUTES.media,
-  },
-  {
-    section: "media",
-    id: "media/probe-timeout",
-    label: "Probe timeout",
-    description:
-      "How long Unduhin waits for yt-dlp to recognize a URL before falling through to the regular engine.",
-    keywords: ["timeout", "probe", "detect", "media"],
-    route: SECTION_ROUTES.media,
-  },
-  {
-    section: "media",
-    id: "media/default-format",
-    label: "Default format selector",
-    description: "Default yt-dlp format expression used when the formats dialog opens.",
-    keywords: ["format", "quality", "selector", "ytdlp", "preset"],
-    route: SECTION_ROUTES.media,
-  },
-  {
-    section: "media",
-    id: "media/ffmpeg-status",
-    label: "FFmpeg",
-    description: "Install or update FFmpeg, used to combine separate video and audio streams.",
-    keywords: ["ffmpeg", "merge", "mux", "audio", "video"],
-    route: SECTION_ROUTES.media,
-  },
-  {
-    section: "media",
-    id: "media/ffmpeg-custom-path",
-    label: "Custom FFmpeg path",
-    description: "Point to an existing ffmpeg.exe instead of the managed install.",
-    keywords: ["override", "path", "binary", "exe", "ffmpeg"],
-    route: SECTION_ROUTES.media,
-  },
-
-  // -- Browser -------------------------------------------------------------
-  {
-    section: "browser",
-    id: "browser/status",
-    label: "Handoff bridge status",
-    description: "Live pipe status and round-trip test.",
-    keywords: ["bridge", "pipe", "handoff", "extension", "ping"],
-    route: SECTION_ROUTES.browser,
-  },
-  {
-    section: "browser",
-    id: "browser/extensions",
-    label: "Browser extensions",
-    description:
-      "Which browsers have the Unduhin extension registered.",
-    keywords: ["chrome", "edge", "brave", "firefox", "extension"],
-    route: SECTION_ROUTES.browser,
-  },
-  {
-    section: "browser",
-    id: "browser/behaviour",
-    label: "Handoff behaviour",
-    description:
-      "How Unduhin reacts when the browser starts a download.",
-    keywords: ["catch-all", "ask-first", "rules", "passthrough", "mode"],
-    route: SECTION_ROUTES.browser,
-  },
-  {
-    section: "browser",
-    id: "browser/file-types",
-    label: "File types to capture",
-    description: "Which file extensions Unduhin intercepts.",
-    keywords: ["extensions", "mime", "filter", "types"],
-    route: SECTION_ROUTES.browser,
-  },
-  {
-    section: "browser",
-    id: "browser/domain-rules",
-    label: "Domain rules",
-    description: "Per-host allow/block list with drag-to-reorder.",
-    keywords: ["domain", "rules", "allowlist", "blocklist", "host"],
-    route: SECTION_ROUTES.browser,
-  },
-
-  // -- About ---------------------------------------------------------------
-  {
-    section: "about",
-    id: "about/hero",
-    label: "Version & build",
-    description:
-      "Version, build timestamp, commit hash, channel, and host OS.",
-    keywords: ["version", "build", "commit", "channel", "os"],
-    route: SECTION_ROUTES.about,
-  },
-  {
-    section: "about",
-    id: "about/update-channel",
-    label: "Update channel",
-    description:
-      "Switch between stable and beta release channels.",
-    keywords: ["channel", "release", "beta", "stable", "update"],
-    route: SECTION_ROUTES.about,
-  },
-  {
-    section: "about",
-    id: "about/update-check-on-startup",
-    label: "Check for updates on startup",
-    description: "One quick check on launch.",
-    keywords: ["update", "auto", "startup"],
-    route: SECTION_ROUTES.about,
-  },
-  {
-    section: "about",
-    id: "about/send-crash-reports",
-    label: "Send anonymous crash reports",
-    description: "Stack trace + OS version; never URLs or filenames.",
-    keywords: ["telemetry", "crash", "report", "privacy"],
-    route: SECTION_ROUTES.about,
-  },
-  {
-    section: "about",
-    id: "about/send-usage-stats",
-    label: "Send anonymous usage statistics",
-    description: "Feature counts and timing.",
-    keywords: ["telemetry", "usage", "stats", "privacy"],
-    route: SECTION_ROUTES.about,
-  },
+/** Sidebar order; search results follow it. */
+export const SECTION_ORDER: SettingsSectionKey[] = [
+  "general",
+  "categories",
+  "behaviour",
+  "network",
+  "torrent",
+  "media",
+  "browser",
+  "about",
 ];
+
+/** `[row id suffix, label key suffix, keywords, description key suffix]`.
+ *  The description key defaults to the label key plus "Desc". */
+type Row = [id: string, label: string, keywords: string[], desc?: string];
+
+const ROWS: Record<SettingsSectionKey, Row[]> = {
+  general: [
+    ["default-output-path", "fileDefaultFolder", ["directory", "path", "location", "files"]],
+    ["always-ask-filename", "fileAlwaysAskFilename", ["rename", "prompt"]],
+    ["delete-default-action", "removeAction", ["delete", "trash", "disk"]],
+    ["global-speed-limit", "bandwidthLimit", ["bandwidth", "throttle", "cap"]],
+    ["default-segments", "fileDefaultSegments", ["parallel", "threads", "segments", "parts"]],
+    ["max-concurrent", "fileMaxConcurrent", ["queue", "limit", "concurrent", "simultaneous"]],
+    ["theme", "themeLabel", ["appearance", "dark mode", "light mode", "colour", "color"], "themeDesc"],
+    ["language", "languageLabel", ["i18n", "translation", "locale", "bahasa"], "languageDesc"],
+    ["clear-temp-data", "clearTempData", ["temp", "cache", "cleanup", "scratch", "disk space"]],
+    ["history", "historyLabel", ["export", "csv", "json", "clear", "list"]],
+  ],
+  categories: [
+    ["list", "sectionCategories", ["folder", "rules", "icon", "extension", "sort"]],
+  ],
+  behaviour: [
+    ["autostart", "startupAutostart", ["startup", "boot", "login", "launch"]],
+    ["start-minimized", "startupMinimized", ["tray", "background", "minimized"]],
+    ["close-behavior", "closeBehaviour", ["close", "quit", "exit", "minimize", "tray"]],
+    ["confirm-on-quit", "confirmOnQuit", ["confirm", "quit", "exit"]],
+    ["notify-complete", "notifyComplete", ["notification", "toast", "done"]],
+    ["notify-fail", "notifyFail", ["notification", "toast", "error"]],
+    ["notify-queue-empty", "notifyQueueEmpty", ["notification", "queue", "summary"]],
+    ["quiet-hours", "quietUse", ["mute", "silence", "schedule", "do not disturb", "night"]],
+  ],
+  network: [
+    ["connect-timeout", "connectTimeout", ["timeout", "tcp", "tls", "handshake"]],
+    ["read-timeout", "readTimeout", ["timeout", "stall"]],
+    ["max-retries", "maxRetries", ["retry", "fail", "attempts"]],
+    ["retry-backoff", "retryBackoff", ["backoff", "retry", "jitter"]],
+    ["user-agent", "cardUserAgent", ["ua", "header", "browser", "identify"]],
+  ],
+  torrent: [
+    ["listen-port", "torrentListenPort", ["port", "incoming", "peers", "bittorrent"]],
+    ["enable-dht", "torrentEnableDht", ["dht", "magnet", "trackerless", "peers"]],
+    ["enable-upnp", "torrentEnableUpnp", ["upnp", "port", "forward", "nat", "router"]],
+    ["max-peers", "torrentMaxPeers", ["peers", "connections", "limit"]],
+    ["download-dir", "torrentDownloadDir", ["folder", "directory", "path", "location"]],
+    ["seed-ratio", "torrentSeedRatio", ["seed", "ratio", "upload", "share"]],
+  ],
+  media: [
+    ["ytdlp-status", "cardYtdlp", ["youtube", "vimeo", "tiktok", "video", "yt-dlp", "ytdlp"]],
+    ["ytdlp-custom-path", "ytdlpBinaryPath", ["override", "path", "binary", "exe"]],
+    ["probe-timeout", "ytdlpProbeTimeout", ["timeout", "probe", "detect"]],
+    ["default-format", "ytdlpDefaultFormat", ["format", "quality", "selector", "preset"]],
+    ["impersonate", "ytdlpImpersonate", ["impersonate", "browser", "cloudflare"]],
+    ["ffmpeg-status", "cardFfmpeg", ["ffmpeg", "merge", "mux", "audio", "video"]],
+    ["ffmpeg-custom-path", "ffmpegBinaryPath", ["override", "path", "binary", "exe"]],
+  ],
+  browser: [
+    ["install-context-menu", "browserContextMenu", ["right-click", "menu", "extension"]],
+    ["hide-shelf", "browserHideShelf", ["shelf", "bubble", "chrome"]],
+    ["forward-cookies", "browserForwardCookies", ["cookies", "login", "session"]],
+    ["watch-clipboard", "browserClipboardToggle", ["clipboard", "copy", "paste"]],
+    ["min-size", "browserMinSize", ["size", "minimum", "small files"]],
+  ],
+  about: [
+    ["update-channel", "aboutUpdateChannel", ["channel", "release", "beta", "stable", "update"]],
+    ["update-check-on-startup", "aboutCheckOnStartup", ["update", "auto", "startup"]],
+    ["send-crash-reports", "aboutCrashReports", ["telemetry", "crash", "privacy"]],
+    ["send-usage-stats", "aboutUsageStats", ["telemetry", "usage", "stats", "privacy"]],
+  ],
+};
+
+export const SETTINGS_INDEX: SettingsIndexEntry[] = SECTION_ORDER.flatMap((section) =>
+  ROWS[section].map(([id, label, keywords, desc]) => ({
+    section,
+    id: `${section}/${id}`,
+    labelKey: `settings.${label}`,
+    descKey: `settings.${desc ?? `${label}Desc`}`,
+    keywords,
+  })),
+);

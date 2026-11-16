@@ -17,7 +17,17 @@ pub struct Category {
     pub default_output_path: Option<PathBuf>,
     /// Lower-cased file extensions, no leading dot.
     pub extension_rules: Vec<String>,
+    /// Named tint for the icon tile, one of [`CATEGORY_COLORS`]. `None` for
+    /// rows predating the column; the UI then derives one from the icon.
+    #[serde(default)]
+    pub color: Option<String>,
 }
+
+/// The tints a category can carry. Names, not hex values: the UI maps each
+/// to a light and a dark pair.
+pub const CATEGORY_COLORS: &[&str] = &[
+    "violet", "orange", "green", "blue", "pink", "yellow", "neutral",
+];
 
 /// Inputs to [`crate::Core::add_category`] / [`crate::Core::update_category`].
 #[derive(Debug, Clone)]
@@ -26,6 +36,46 @@ pub struct NewCategory {
     pub icon: Option<String>,
     pub default_output_path: Option<PathBuf>,
     pub extension_rules: Vec<String>,
+    /// One of [`CATEGORY_COLORS`], or `None` to leave the tint to the UI.
+    pub color: Option<String>,
+}
+
+/// Reject a colour name the UI has no pair for, so the column never holds
+/// free-form text.
+fn validated_color(color: Option<&str>) -> Result<Option<&str>> {
+    match color {
+        None => Ok(None),
+        Some(c) if CATEGORY_COLORS.contains(&c) => Ok(Some(c)),
+        Some(other) => Err(CoreError::InvalidArgument(format!(
+            "unknown category colour: {other}"
+        ))),
+    }
+}
+
+/// A category name must be unique ignoring case and surrounding space:
+/// "video" and "Video" would be two rows the user cannot tell apart.
+async fn ensure_name_free(
+    pool: &SqlitePool,
+    name: &str,
+    except: Option<CategoryId>,
+) -> Result<()> {
+    let wanted = name.trim().to_lowercase();
+    if wanted.is_empty() {
+        return Err(CoreError::InvalidArgument(
+            "a category needs a name".to_string(),
+        ));
+    }
+    let taken = list(pool)
+        .await?
+        .into_iter()
+        .any(|c| Some(c.id) != except && c.name.trim().to_lowercase() == wanted);
+    if taken {
+        return Err(CoreError::InvalidArgument(format!(
+            "there is already a category called {}",
+            name.trim()
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) async fn list(pool: &SqlitePool) -> Result<Vec<Category>> {
@@ -53,20 +103,24 @@ pub(crate) async fn find_by_name(pool: &SqlitePool, name: &str) -> Result<Option
 }
 
 pub(crate) async fn insert(pool: &SqlitePool, input: NewCategory) -> Result<CategoryId> {
+    let color = validated_color(input.color.as_deref())?;
+    ensure_name_free(pool, &input.name, None).await?;
     let exts = serde_json::to_string(&normalize_extensions(&input.extension_rules))?;
     let folder = input
         .default_output_path
         .as_ref()
         .map(|p| p.to_string_lossy().into_owned());
     let row = sqlx::query(
-        "INSERT INTO categories (name, icon, default_output_path, extension_rules, display_order) \
-         VALUES (?, ?, ?, ?, (SELECT COALESCE(MAX(display_order), 0) + 1 FROM categories)) \
+        "INSERT INTO categories \
+         (name, icon, default_output_path, extension_rules, color, display_order) \
+         VALUES (?, ?, ?, ?, ?, (SELECT COALESCE(MAX(display_order), 0) + 1 FROM categories)) \
          RETURNING id",
     )
-    .bind(&input.name)
+    .bind(input.name.trim())
     .bind(&input.icon)
     .bind(folder)
     .bind(exts)
+    .bind(color)
     .fetch_one(pool)
     .await?;
     Ok(row.get("id"))
@@ -104,19 +158,22 @@ pub(crate) async fn set_order(pool: &SqlitePool, ids: &[CategoryId]) -> Result<(
 }
 
 pub(crate) async fn update(pool: &SqlitePool, id: CategoryId, input: NewCategory) -> Result<()> {
+    let color = validated_color(input.color.as_deref())?;
+    ensure_name_free(pool, &input.name, Some(id)).await?;
     let exts = serde_json::to_string(&normalize_extensions(&input.extension_rules))?;
     let folder = input
         .default_output_path
         .as_ref()
         .map(|p| p.to_string_lossy().into_owned());
     let res = sqlx::query(
-        "UPDATE categories SET name = ?, icon = ?, default_output_path = ?, extension_rules = ? \
-         WHERE id = ?",
+        "UPDATE categories SET name = ?, icon = ?, default_output_path = ?, \
+         extension_rules = ?, color = ? WHERE id = ?",
     )
-    .bind(&input.name)
+    .bind(input.name.trim())
     .bind(&input.icon)
     .bind(folder)
     .bind(exts)
+    .bind(color)
     .bind(id)
     .execute(pool)
     .await?;
@@ -126,16 +183,39 @@ pub(crate) async fn update(pool: &SqlitePool, id: CategoryId, input: NewCategory
     Ok(())
 }
 
+/// Delete a category. Its downloads are re-filed under the "Other" catch-all
+/// in the same transaction, so nothing is left without a category; their
+/// files on disk are not touched. The catch-all itself cannot be deleted.
 pub(crate) async fn remove(pool: &SqlitePool, id: CategoryId) -> Result<()> {
+    let target = get(pool, id).await?;
+    if target.name == FALLBACK_NAME {
+        return Err(CoreError::InvalidArgument(
+            "the fallback category cannot be deleted".to_string(),
+        ));
+    }
+    let fallback = other_category_id(pool).await.ok();
+
+    let mut tx = pool.begin().await?;
+    if let Some(fallback_id) = fallback {
+        sqlx::query("UPDATE downloads SET category_id = ? WHERE category_id = ?")
+            .bind(fallback_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
     let res = sqlx::query("DELETE FROM categories WHERE id = ?")
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     if res.rows_affected() == 0 {
         return Err(CoreError::CategoryNotFound(id));
     }
+    tx.commit().await?;
     Ok(())
 }
+
+/// Name of the seeded catch-all category.
+const FALLBACK_NAME: &str = "Other";
 
 /// Resolve a filename to a category id by extension match. Returns `None`
 /// if no rules match — the caller falls back to "Other" (which always
@@ -220,6 +300,8 @@ fn category_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Category> {
         icon: row.get("icon"),
         default_output_path: folder.map(PathBuf::from),
         extension_rules: exts,
+        // `try_get`: a database that predates the column still reads.
+        color: row.try_get::<Option<String>, _>("color").ok().flatten(),
     })
 }
 
@@ -296,6 +378,7 @@ mod tests {
                 icon: Some("book".into()),
                 default_output_path: None,
                 extension_rules: vec!["epub".into(), "mobi".into()],
+                color: Some("blue".into()),
             },
         )
         .await
@@ -306,6 +389,98 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(order, max_before + 1);
+    }
+
+    fn new_category(name: &str, color: Option<&str>) -> NewCategory {
+        NewCategory {
+            name: name.into(),
+            icon: Some("book".into()),
+            default_output_path: None,
+            extension_rules: vec![],
+            color: color.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn color_round_trips() {
+        let pool = fresh_pool().await;
+
+        let id = insert(&pool, new_category("eBooks", Some("blue")))
+            .await
+            .unwrap();
+
+        assert_eq!(get(&pool, id).await.unwrap().color.as_deref(), Some("blue"));
+    }
+
+    #[tokio::test]
+    async fn insert_rejects_an_unknown_color() {
+        let pool = fresh_pool().await;
+
+        let res = insert(&pool, new_category("eBooks", Some("#ff0000"))).await;
+
+        assert!(matches!(res, Err(CoreError::InvalidArgument(_))));
+    }
+
+    #[tokio::test]
+    async fn insert_rejects_a_name_that_differs_only_by_case() {
+        let pool = fresh_pool().await;
+
+        let res = insert(&pool, new_category("  video ", None)).await;
+
+        assert!(matches!(res, Err(CoreError::InvalidArgument(_))));
+    }
+
+    #[tokio::test]
+    async fn update_may_keep_its_own_name() {
+        let pool = fresh_pool().await;
+        let video = find_by_name(&pool, "Video").await.unwrap().unwrap();
+
+        let res = update(&pool, video.id, new_category("Video", Some("violet"))).await;
+
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn seeded_categories_get_a_color_from_their_icon() {
+        let pool = fresh_pool().await;
+
+        let video = find_by_name(&pool, "Video").await.unwrap().unwrap();
+
+        assert_eq!(video.color.as_deref(), Some("violet"));
+    }
+
+    #[tokio::test]
+    async fn remove_refiles_downloads_under_other() {
+        let pool = fresh_pool().await;
+        let video = find_by_name(&pool, "Video").await.unwrap().unwrap();
+        let other = find_by_name(&pool, "Other").await.unwrap().unwrap();
+        sqlx::query(
+            "INSERT INTO downloads (url, filename, output_path, status, category_id, created_at) \
+             VALUES ('https://example.com/a.mp4', 'a.mp4', '/tmp/a.mp4', 'completed', ?, \
+             '2026-11-15T00:00:00Z')",
+        )
+        .bind(video.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        remove(&pool, video.id).await.unwrap();
+
+        let filed: Option<i64> = sqlx::query_scalar("SELECT category_id FROM downloads")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(filed, Some(other.id));
+    }
+
+    #[tokio::test]
+    async fn remove_refuses_the_fallback_category() {
+        let pool = fresh_pool().await;
+        let other = find_by_name(&pool, "Other").await.unwrap().unwrap();
+
+        let res = remove(&pool, other.id).await;
+
+        assert!(matches!(res, Err(CoreError::InvalidArgument(_))));
     }
 
     #[test]
@@ -342,6 +517,7 @@ mod tests {
                 icon: video.icon.clone(),
                 default_output_path: Some(custom.clone()),
                 extension_rules: video.extension_rules.clone(),
+                color: video.color.clone(),
             },
         )
         .await
@@ -382,6 +558,7 @@ mod tests {
                 icon: music.icon.clone(),
                 default_output_path: None,
                 extension_rules: music.extension_rules.clone(),
+                color: music.color.clone(),
             },
         )
         .await

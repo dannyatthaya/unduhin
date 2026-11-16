@@ -104,7 +104,8 @@ export function useNotifications() {
 
   async function handleFailed(id: number, error: string) {
     if (!readBool(settings.values, "notify_fail", true)) return;
-    if (isQuiet()) return;
+    // Failures need the user, so by default they get through quiet hours.
+    if (isQuiet() && !readBool(settings.values, "quiet_hours_notify_failures", true)) return;
     if (!(await ensurePermission())) return;
     const rec = downloads.records.get(id);
     const title = tGlobal("notify.failedTitle");

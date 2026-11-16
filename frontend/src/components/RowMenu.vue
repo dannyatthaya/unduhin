@@ -4,13 +4,24 @@
 // Hand-rolled for now — when the shared right-click context menu
 // lands, we can lift both into a shared `Menu` primitive.
 
-import { nextTick, onBeforeUnmount, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, ref, watch, type Component } from "vue";
 import { onClickOutside, useEventListener } from "@vueuse/core";
 import { useI18n } from "vue-i18n";
 
 import { useOverlaysStore } from "@/stores/overlays";
 
-const props = defineProps<{ items: { label: string; danger?: boolean; onSelect: () => void }[] }>();
+export interface RowMenuItem {
+  label: string;
+  danger?: boolean;
+  icon?: Component;
+  /** Keyboard shortcut shown at the right edge, e.g. "F2". */
+  shortcut?: string;
+  /** Draw a divider above this item. */
+  separatorBefore?: boolean;
+  onSelect: () => void;
+}
+
+const props = defineProps<{ items: RowMenuItem[] }>();
 
 const { t } = useI18n();
 
@@ -19,7 +30,11 @@ const triggerRef = ref<HTMLButtonElement | null>(null);
 const menuRef = ref<HTMLDivElement | null>(null);
 const menuStyle = ref<Record<string, string>>({});
 
-const MENU_WIDTH = 200;
+const PLAIN_MENU_WIDTH = 200;
+/** Menus with icons or shortcuts need the room the design gives them. */
+const RICH_MENU_WIDTH = 248;
+const isRich = computed(() => props.items.some((item) => item.icon || item.shortcut));
+const menuWidth = computed(() => (isRich.value ? RICH_MENU_WIDTH : PLAIN_MENU_WIDTH));
 
 // Coordinate with other transient overlays — when something else
 // claims the slot, close ourselves.
@@ -44,19 +59,19 @@ async function toggle() {
   await nextTick();
   if (!triggerRef.value) return;
   const r = triggerRef.value.getBoundingClientRect();
-  const left = `${Math.max(8, r.right - MENU_WIDTH)}px`;
+  const left = `${Math.max(8, r.right - menuWidth.value)}px`;
   // Estimate menu height from item count; refined below once mounted.
-  // ~32px per item + 8px py-1 padding.
-  const estimated = props.items.length * 32 + 8;
+  // 34px per item + 12px padding.
+  const estimated = props.items.length * 34 + 12;
   const margin = 8;
   const placeAbove = r.bottom + estimated + margin > window.innerHeight;
   menuStyle.value = placeAbove
     ? {
         bottom: `${window.innerHeight - r.top + 4}px`,
         left,
-        width: `${MENU_WIDTH}px`,
+        width: `${menuWidth.value}px`,
       }
-    : { top: `${r.bottom + 4}px`, left, width: `${MENU_WIDTH}px` };
+    : { top: `${r.bottom + 4}px`, left, width: `${menuWidth.value}px` };
 
   // Once the actual menu is in the DOM, re-check with the real height
   // — fixes the case where item labels wrap and the estimate is off.
@@ -69,7 +84,7 @@ async function toggle() {
     menuStyle.value = {
       bottom: `${window.innerHeight - trig.top + 4}px`,
       left,
-      width: `${MENU_WIDTH}px`,
+      width: `${menuWidth.value}px`,
     };
   } else if (placeAbove && !flipNow) {
     // Estimate said "above" but the real height fits below — switch
@@ -77,7 +92,7 @@ async function toggle() {
     menuStyle.value = {
       top: `${trig.bottom + 4}px`,
       left,
-      width: `${MENU_WIDTH}px`,
+      width: `${menuWidth.value}px`,
     };
   }
 }
@@ -130,18 +145,36 @@ onBeforeUnmount(close);
         ref="menuRef"
         role="menu"
         data-state="open"
-        class="dl-surface fixed z-50 overflow-hidden rounded-lg border border-border bg-card text-card-foreground shadow-lg"
+        class="dl-surface fixed z-50 overflow-hidden rounded-xl border border-border bg-card text-[13px] text-card-foreground shadow-dl-menu"
         :style="menuStyle"
       >
-        <ul class="py-1">
+        <ul class="flex flex-col p-1.5">
           <li v-for="(item, i) in props.items" :key="i">
+            <div
+              v-if="item.separatorBefore"
+              role="separator"
+              class="my-1 h-px bg-dl-line"
+            />
             <button
               type="button"
-              class="flex w-full items-center px-3 py-1.5 text-left transition-colors hover:bg-accent"
-              :class="item.danger ? 'text-danger hover:text-danger' : ''"
+              role="menuitem"
+              class="flex h-[34px] w-full items-center gap-2.5 rounded-[7px] px-2.5 text-left transition-colors hover:bg-accent focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring"
+              :class="item.danger ? 'text-danger' : ''"
               @click="pick(item.onSelect)"
             >
-              {{ item.label }}
+              <component
+                :is="item.icon"
+                v-if="item.icon"
+                class="h-[15px] w-[15px] shrink-0"
+                aria-hidden="true"
+              />
+              <span class="min-w-0 flex-1 truncate">{{ item.label }}</span>
+              <kbd
+                v-if="item.shortcut"
+                class="shrink-0 font-mono text-xs text-muted-foreground"
+              >
+                {{ item.shortcut }}
+              </kbd>
             </button>
           </li>
         </ul>

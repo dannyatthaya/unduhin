@@ -6,19 +6,23 @@ import { Primitive, type PrimitiveProps } from "reka-ui";
 import { cn } from "@/lib/utils";
 
 const buttonVariants = cva(
-  "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background disabled:pointer-events-none disabled:opacity-50",
+  "inline-flex shrink-0 items-center justify-center gap-2 whitespace-nowrap rounded-[9px] font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:pointer-events-none disabled:opacity-40",
   {
     variants: {
       variant: {
-        primary: "bg-primary text-primary-foreground hover:bg-primary/90",
+        // The solid yellow action: one per dialog or page.
+        primary: "bg-dl-accent font-semibold text-dl-on-accent hover:brightness-95",
         secondary:
-          "border border-border bg-card text-foreground hover:bg-accent hover:text-accent-foreground",
-        ghost: "text-foreground hover:bg-accent hover:text-accent-foreground",
-        danger: "bg-danger text-white hover:bg-danger/90",
+          "border border-input bg-dl-raised text-foreground hover:bg-accent",
+        ghost: "text-foreground hover:bg-accent",
+        danger: "bg-danger font-semibold text-dl-on-fail hover:bg-danger/90",
+        // A destructive action that is not the dialog's main one.
+        dangerGhost: "text-danger hover:bg-dl-fail-soft",
       },
       size: {
+        xs: "h-7 rounded-[7px] px-2.5 text-xs",
         sm: "h-8 px-3 text-xs",
-        md: "h-9 px-3.5 text-sm",
+        md: "h-9 px-3.5 text-[13px]",
         icon: "h-9 w-9 p-0",
       },
     },

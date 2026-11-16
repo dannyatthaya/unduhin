@@ -25,17 +25,17 @@ interface UAPreset {
 const PRESETS: UAPreset[] = [
   { label: "Unduhin/0.3", value: "" },
   {
-    label: "Chrome · Windows",
+    label: "Chrome on Windows",
     value:
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
   },
   {
-    label: "Firefox · Windows",
+    label: "Firefox on Windows",
     value:
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
   },
   {
-    label: "Edge · Windows",
+    label: "Edge on Windows",
     value:
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
   },
@@ -59,7 +59,6 @@ function formatBackoff(ms: number): string {
 
 <template>
   <SettingsSection
-    :eyebrow="t('downloads.settings')"
     :title="t('settings.sectionNetwork')"
     :description="t('settings.sectionNetworkDesc')"
   >

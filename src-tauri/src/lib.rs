@@ -8,6 +8,7 @@
 
 pub mod browser_integration;
 pub mod commands;
+pub mod file_commands;
 pub mod error;
 pub mod extension_sync;
 pub mod i18n;
@@ -223,6 +224,16 @@ pub fn run() {
             commands::start_handoff_download,
             commands::discard_handoff,
             commands::extension_folder_path,
+            file_commands::set_download_speed_limit,
+            file_commands::set_help_slow_parts,
+            file_commands::compute_checksum,
+            file_commands::rename_download,
+            file_commands::move_download,
+            file_commands::probe_link,
+            file_commands::export_history,
+            file_commands::clear_history,
+            file_commands::open_with,
+            file_commands::check_folder,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build tauri app")

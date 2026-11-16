@@ -32,7 +32,6 @@ function formatPort(port: number): string {
 
 <template>
   <SettingsSection
-    :eyebrow="t('downloads.settings')"
     :title="t('settings.sectionTorrent')"
     :description="t('settings.sectionTorrentDesc')"
   >

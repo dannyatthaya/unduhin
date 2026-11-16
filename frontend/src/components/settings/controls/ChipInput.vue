@@ -1,83 +1,120 @@
 <script setup lang="ts">
+// A field of removable chips with a text box at the end. Enter or a comma
+// turns what was typed into a chip; Backspace on an empty box removes the
+// last one. Used for a category's file extensions.
+
 import { ref } from "vue";
-import { X } from "lucide-vue-next";
+import { useI18n } from "vue-i18n";
+import { AlertTriangle, X } from "lucide-vue-next";
 
 const props = defineProps<{
   modelValue: string[];
   placeholder?: string;
   disabled?: boolean;
-  /** Prefix each new chip with this string after trimming (e.g. "."). */
+  /** Shown before each chip (e.g. "."); stored values do not include it. */
   prefix?: string;
+  /** Chips to draw as "needs a decision": warning tint and icon. */
+  flagged?: readonly string[];
+  /** Accessible name of the text box. */
+  inputLabel?: string;
+  /** Id of the hint that says how to add a chip. */
+  describedby?: string;
 }>();
 const emit = defineEmits<{ "update:modelValue": [value: string[]] }>();
 
+const { t } = useI18n();
 const draft = ref("");
 
+/** Stored form: lower-case, without the prefix or surrounding space. */
 function normalize(raw: string): string {
-  let s = raw.trim().toLowerCase();
-  if (!s) return s;
-  if (props.prefix && !s.startsWith(props.prefix)) s = props.prefix + s.replace(/^\.+/, "");
-  return s;
+  const trimmed = raw.trim().toLowerCase();
+  if (!props.prefix) return trimmed;
+  let value = trimmed;
+  while (value.startsWith(props.prefix)) value = value.slice(props.prefix.length);
+  return value;
 }
 
+/** Several values may arrive at once (a paste of "mp4, mkv webm"). */
 function commit(raw: string) {
-  const v = normalize(raw);
-  if (!v) return;
-  if (props.modelValue.includes(v)) return;
-  emit("update:modelValue", [...props.modelValue, v]);
-}
-
-function remove(index: number) {
-  const next = props.modelValue.slice();
-  next.splice(index, 1);
-  emit("update:modelValue", next);
-}
-
-function onKey(event: KeyboardEvent) {
-  if (event.key === "Enter" || event.key === ",") {
-    event.preventDefault();
-    commit(draft.value);
-    draft.value = "";
-  } else if (event.key === "Backspace" && draft.value === "" && props.modelValue.length > 0) {
-    remove(props.modelValue.length - 1);
+  const additions = raw
+    .split(/[\s,]+/)
+    .map(normalize)
+    .filter((value) => value !== "");
+  const next = [...props.modelValue];
+  for (const value of additions) {
+    if (!next.includes(value)) next.push(value);
   }
+  if (next.length !== props.modelValue.length) emit("update:modelValue", next);
 }
 
-function onBlur() {
-  if (draft.value) {
-    commit(draft.value);
-    draft.value = "";
+function remove(value: string) {
+  emit(
+    "update:modelValue",
+    props.modelValue.filter((chip) => chip !== value),
+  );
+}
+
+function commitDraft() {
+  if (draft.value.trim() === "") return;
+  commit(draft.value);
+  draft.value = "";
+}
+
+function onKeydown(event: KeyboardEvent) {
+  if (event.key === "Enter" || event.key === ",") {
+    // Always swallow Enter here: in a dialog it must add the chip, never
+    // submit the form around it.
+    event.preventDefault();
+    commitDraft();
+  } else if (event.key === "Backspace" && draft.value === "" && props.modelValue.length > 0) {
+    remove(props.modelValue[props.modelValue.length - 1]);
   }
 }
 </script>
 
 <template>
   <div
-    class="flex min-h-9 flex-wrap items-center gap-1.5 rounded-md border border-input bg-background px-2 py-1.5 focus-within:ring-2 focus-within:ring-ring"
-    :class="disabled ? 'cursor-not-allowed opacity-50' : ''"
+    class="flex min-h-10 flex-wrap items-center gap-1.5 rounded-[9px] border border-input bg-dl-field px-1.5 py-[5px] focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-ring"
+    :class="disabled ? 'cursor-not-allowed opacity-45' : ''"
   >
     <span
-      v-for="(chip, i) in modelValue"
+      v-for="chip in modelValue"
       :key="chip"
-      class="inline-flex items-center gap-1 rounded bg-muted px-2 py-0.5 font-mono text-[11px]"
+      class="flex h-7 items-center gap-0.5 rounded-[7px] pr-0.5 font-mono text-xs text-foreground"
+      :class="
+        flagged?.includes(chip)
+          ? 'bg-dl-warn-soft pl-[7px] shadow-[inset_0_0_0_1px_hsl(var(--warning))]'
+          : 'bg-muted pl-[9px]'
+      "
     >
-      {{ chip }}
+      <AlertTriangle
+        v-if="flagged?.includes(chip)"
+        class="mr-1 h-3 w-3 text-warning"
+        aria-hidden="true"
+      />
+      {{ prefix }}{{ chip }}
       <button
         v-if="!disabled"
         type="button"
-        class="rounded p-0.5 text-muted-foreground hover:bg-background hover:text-foreground"
-        @click="remove(i)"
+        class="flex h-6 w-6 items-center justify-center rounded-[5px] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring"
+        :aria-label="t('settings.chipRemove', { value: `${prefix ?? ''}${chip}` })"
+        @click="remove(chip)"
       >
-        <X class="h-3 w-3" />
+        <X class="h-[11px] w-[11px]" aria-hidden="true" />
       </button>
     </span>
     <input
       v-model="draft"
-      :placeholder="modelValue.length === 0 ? placeholder ?? 'add…' : 'add…'"
+      type="text"
+      spellcheck="false"
+      autocomplete="off"
+      :placeholder="placeholder"
       :disabled="disabled"
-      class="min-w-[5rem] flex-1 bg-transparent text-sm placeholder:text-muted-foreground focus:outline-none disabled:cursor-not-allowed"
-      @keydown="onKey"
-      @blur="onBlur"
+      :aria-label="inputLabel"
+      :aria-describedby="describedby"
+      class="h-7 min-w-[90px] flex-1 border-0 bg-transparent px-1 font-mono text-xs text-foreground outline-none placeholder:text-muted-foreground disabled:cursor-not-allowed"
+      @keydown="onKeydown"
+      @blur="commitDraft"
     />
   </div>
 </template>

@@ -12,11 +12,11 @@ export type NotificationKind = "complete" | "fail" | "queue-empty";
 const SAMPLES: Record<NotificationKind, { title: string; body: string }> = {
   complete: {
     title: "Download complete",
-    body: "sample-archive.zip · 124 MB",
+    body: "sample-archive.zip (124 MB)",
   },
   fail: {
     title: "Download failed",
-    body: "sample-archive.zip · network error",
+    body: "sample-archive.zip: network error",
   },
   "queue-empty": {
     title: "Queue empty",

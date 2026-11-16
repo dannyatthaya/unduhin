@@ -103,13 +103,12 @@ function pauseAll() {
       <span class="whitespace-nowrap font-mono text-[17px] font-medium tracking-[-0.02em]">
         {{ speed.value }}<span class="text-xs text-muted-foreground">{{ speed.unit }}</span>
       </span>
-      <div
-        v-if="!dense && !idle"
-        role="img"
-        :aria-label="t('downloads.sparkAria')"
-        class="w-[72px]"
-      >
-        <SpeedSparkline :samples="speedSamples" :height="24" />
+      <div v-if="!dense && !idle" class="w-[72px]">
+        <SpeedSparkline
+          :samples="speedSamples"
+          :height="24"
+          :label="t('downloads.sparkAria')"
+        />
       </div>
       <button
         type="button"

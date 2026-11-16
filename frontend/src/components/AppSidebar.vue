@@ -258,7 +258,7 @@ const FOCUS_RING =
         ]"
         :aria-current="item.current ? 'page' : undefined"
         :aria-label="rail ? `${item.label}, ${countLabel(item.count)}` : undefined"
-        :title="rail ? `${item.label} · ${countLabel(item.count)}` : undefined"
+        :title="rail ? `${item.label}, ${countLabel(item.count)}` : undefined"
         @click="emit('select-category', item.id)"
         @dragenter="onDragOver($event, item)"
         @dragover="onDragOver($event, item)"

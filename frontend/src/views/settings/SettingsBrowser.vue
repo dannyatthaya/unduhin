@@ -48,7 +48,6 @@ async function onTestHandoff() {
 
 <template>
   <SettingsSection
-    :eyebrow="t('downloads.settings')"
     :title="t('settings.sectionBrowser')"
     :description="t('settings.sectionBrowserDesc')"
   >

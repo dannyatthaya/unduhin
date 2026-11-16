@@ -14,6 +14,8 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 
 import Dialog from "@/components/ui/Dialog.vue";
 import Button from "@/components/ui/Button.vue";
+import Field from "@/components/ui/Field.vue";
+import { Link } from "lucide-vue-next";
 
 import { useRefreshLink } from "@/composables/useRefreshLink";
 import { formatBytes } from "@/lib/format";
@@ -109,34 +111,33 @@ onBeforeUnmount(() => {
   <Dialog
     :open="isOpen"
     :title="t('downloads.refreshLinkTitle')"
-    size="md"
     @close="close"
   >
-    <p class="text-sm text-muted-foreground">
+    <p class="leading-normal text-dl-soft">
       {{ t("downloads.refreshLinkDescription", { filename: pending?.filename ?? "" }) }}
     </p>
 
     <!-- The size mismatch is the one case that needs a real decision. Show it
          alone so the paste field cannot distract from the question. -->
     <template v-if="phase === 'changed'">
-      <p class="mt-4 text-sm text-foreground">{{ t("downloads.refreshChangedTitle") }}</p>
-      <dl class="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
+      <p class="leading-normal">{{ t("downloads.refreshChangedTitle") }}</p>
+      <dl class="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
         <dt class="text-muted-foreground">{{ t("downloads.refreshChangedWas") }}</dt>
         <dd class="text-foreground">{{ mismatchSizes.was }}</dd>
         <dt class="text-muted-foreground">{{ t("downloads.refreshChangedNow") }}</dt>
         <dd class="text-foreground">{{ mismatchSizes.now }}</dd>
       </dl>
-      <p class="mt-3 text-xs text-muted-foreground">
+      <p class="text-xs text-muted-foreground">
         {{ t("downloads.refreshChangedHint") }}
       </p>
     </template>
 
     <template v-else-if="phase === 'done'">
-      <p class="mt-4 text-sm text-foreground">{{ doneMessage }}</p>
+      <p class="leading-normal">{{ doneMessage }}</p>
     </template>
 
     <template v-else>
-      <ol class="mt-4 space-y-2 text-sm text-muted-foreground">
+      <ol class="flex flex-col gap-2 leading-normal text-dl-soft">
         <li v-if="!browserPathUnavailable">
           <span class="font-medium text-foreground">1.</span>
           {{ t("downloads.refreshStepBrowser") }}
@@ -147,26 +148,31 @@ onBeforeUnmount(() => {
         </li>
       </ol>
 
-      <p v-if="browserPathUnavailable" class="mt-2 text-xs text-warning">
+      <p v-if="browserPathUnavailable" class="text-xs text-warning">
         {{ t("downloads.refreshNoExtension") }}
       </p>
 
-      <input
+      <Field
         v-model="url"
+        mono
         type="url"
         inputmode="url"
         spellcheck="false"
         :placeholder="t('downloads.refreshUrlPlaceholder')"
-        class="mt-3 w-full rounded-md border border-border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
+        :aria-label="t('downloads.refreshUrlAria')"
         @keydown.enter.prevent="onSubmit"
-      />
+      >
+        <template #leading>
+          <Link class="h-[15px] w-[15px] shrink-0 text-muted-foreground" aria-hidden="true" />
+        </template>
+      </Field>
     </template>
 
-    <p v-if="error" class="mt-3 text-xs text-danger">{{ error }}</p>
+    <p v-if="error" class="text-xs text-danger">{{ error }}</p>
 
     <template #footer>
       <template v-if="phase === 'changed'">
-        <Button variant="ghost" @click="close">{{ t("common.cancel") }}</Button>
+        <Button @click="close">{{ t("common.cancel") }}</Button>
         <Button variant="danger" :disabled="!canForceRestart" @click="confirmRestart">
           {{ t("downloads.refreshRestartAnyway") }}
         </Button>
@@ -175,8 +181,8 @@ onBeforeUnmount(() => {
         <Button variant="secondary" @click="close">{{ t("common.close") }}</Button>
       </template>
       <template v-else>
-        <Button variant="ghost" @click="close">{{ t("common.cancel") }}</Button>
-        <Button variant="secondary" :disabled="!canSubmit" @click="onSubmit">
+        <Button @click="close">{{ t("common.cancel") }}</Button>
+        <Button variant="primary" :disabled="!canSubmit" @click="onSubmit">
           {{ phase === "working" ? t("downloads.refreshWorking") : t("downloads.refreshApply") }}
         </Button>
       </template>

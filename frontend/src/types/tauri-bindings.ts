@@ -176,7 +176,42 @@ export interface DownloadRecord {
   /** Persisted torrent state when `kind === "torrent"`. Null for HTTP/media
    * rows and rows predating the torrent migration. */
   torrent: TorrentMeta | null;
+  /** Which surface added the row. */
+  source: DownloadSource;
+  /** This download's own byte-rate cap, on top of the global one. Null
+   * means no cap of its own. HTTP and media rows. */
+  speed_limit_bps: number | null;
+  /** Whether a connection that finishes its part takes over half of the
+   * part with the most left. HTTP rows; on by default. */
+  help_slow_parts: boolean;
+  /** Lower-case hex SHA-256 of the finished file, once asked for. */
+  sha256: string | null;
 }
+
+/** Mirrors `core::download::DownloadSource`. */
+export type DownloadSource = "manual" | "extension_pipe" | "cli";
+
+/** Result of `probeLink`. Mirrors `core::file_ops::LinkProbe`. */
+export interface LinkProbe {
+  filename: string | null;
+  total_bytes: number | null;
+  /** The server accepts byte ranges: it can resume and split into parts. */
+  resumable: boolean;
+  /** Host of the final URL, after redirects. */
+  host: string | null;
+}
+
+/** The tints a category can carry. Mirrors `core::category::CATEGORY_COLORS`. */
+export const CATEGORY_COLORS = [
+  "violet",
+  "orange",
+  "green",
+  "blue",
+  "pink",
+  "yellow",
+  "neutral",
+] as const;
+export type CategoryColor = (typeof CATEGORY_COLORS)[number];
 
 // ---------------------------------------------------------------------------
 // Media (yt-dlp) shapes — mirror crates/core/src/ytdlp/mod.rs
@@ -269,6 +304,8 @@ export interface Category {
   icon: string | null;
   default_output_path: string | null;
   extension_rules: string[];
+  /** Named tint; null on rows predating the column. */
+  color: CategoryColor | null;
 }
 
 export type SettingValue = string | number | boolean | null | Record<string, unknown> | unknown[];
@@ -476,6 +513,7 @@ export interface NewCategoryInput {
   icon?: string | null;
   default_output_path?: string | null;
   extension_rules?: string[] | null;
+  color?: CategoryColor | null;
 }
 
 export interface SetSettingInput {
@@ -608,6 +646,40 @@ export const api = {
    */
   previewFilename: (url: string) =>
     invoke<string | null>("preview_filename", { url }),
+  /**
+   * Ask the server for a link's name, size and range support without
+   * downloading it. Rejects when the server cannot be reached, so the
+   * caller can say so (unlike `previewFilename`, which hides failures).
+   */
+  probeLink: (url: string) => invoke<LinkProbe>("probe_link", { url }),
+  /** Set one download's own speed cap (bytes/sec); `null` removes it.
+   *  Resolves to the updated row. */
+  setDownloadSpeedLimit: (id: DownloadId, bps: number | null) =>
+    invoke<DownloadRecord>("set_download_speed_limit", { id, bps }),
+  /** Turn "help slow parts" on or off for one download. */
+  setHelpSlowParts: (id: DownloadId, enabled: boolean) =>
+    invoke<DownloadRecord>("set_help_slow_parts", { id, enabled }),
+  /** SHA-256 of a finished download's file, lower-case hex. */
+  computeChecksum: (id: DownloadId) =>
+    invoke<string>("compute_checksum", { id }),
+  /** Rename a download's file in place. Never overwrites: a taken name
+   *  gets " (n)" appended, and the returned row has the name used. */
+  renameDownload: (id: DownloadId, name: string) =>
+    invoke<DownloadRecord>("rename_download", { id, name }),
+  /** Move a download's file into another folder. Rejected while running. */
+  moveDownload: (id: DownloadId, folder: string) =>
+    invoke<DownloadRecord>("move_download", { id, folder }),
+  /** Write the download list to `path` (`.csv` or JSON); resolves to the
+   *  number of rows written. */
+  exportHistory: (path: string) => invoke<number>("export_history", { path }),
+  /** Forget every finished download; files stay on disk. Resolves to the
+   *  number of rows removed. */
+  clearHistory: () => invoke<number>("clear_history"),
+  /** Show the system "Open with" chooser for a download's file. Windows only. */
+  openWith: (id: DownloadId) => invoke<void>("open_with", { id }),
+  /** Whether `path` can be a download folder: it exists, or can be created
+   *  under a folder that does. False for a drive that is not connected. */
+  checkFolder: (path: string) => invoke<boolean>("check_folder", { path }),
   pauseAll: () => invoke<number>("pause_all"),
   resumeAll: () => invoke<number>("resume_all"),
 

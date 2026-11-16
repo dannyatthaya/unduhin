@@ -42,8 +42,8 @@ const confirmVariant = computed<"primary" | "danger">(() =>
 </script>
 
 <template>
-  <Dialog :open="open" :title="title" size="md" @close="respond(false)">
-    <p class="text-sm text-muted-foreground">{{ message }}</p>
+  <Dialog :open="open" :title="title" alert @close="respond(false)">
+    <p class="leading-normal text-dl-soft">{{ message }}</p>
 
     <template #footer>
       <Button variant="secondary" @click="respond(false)">{{ t("common.cancel") }}</Button>

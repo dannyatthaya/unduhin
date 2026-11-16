@@ -1,97 +1,86 @@
-import { computed, ref } from "vue";
-import { useRouter } from "vue-router";
+// Settings search state. The title bar owns the input; the sidebar, the
+// results view and every row read the same instance, so one query drives
+// all of them. Matching runs on the translated strings the rows show.
 
+import { computed, ref } from "vue";
+
+import { tGlobal } from "@/i18n";
 import {
+  SECTION_LABEL_KEYS,
+  SECTION_ORDER,
   SETTINGS_INDEX,
-  SECTION_LABELS,
-  type SettingsIndexEntry,
   type SettingsSectionKey,
 } from "@/lib/settingsManifest";
+import {
+  matchesQuery,
+  normalizeQuery,
+  suggestQuery,
+  type SearchableSetting,
+} from "@/lib/settingsSearch";
 
-let _instance: ReturnType<typeof create> | null = null;
-
-/**
- * Settings search/filter state. The Settings layout owns the input; every
- * section uses the same instance so the filter persists across navigation
- * within Settings. Singleton scope is fine here — the index is static.
- */
-export function useSettingsFilter() {
-  if (!_instance) _instance = create();
-  return _instance;
+interface IndexedSetting extends SearchableSetting {
+  section: SettingsSectionKey;
 }
 
 function create() {
-  const router = useRouter();
   const query = ref("");
 
-  function matches(entry: SettingsIndexEntry): boolean {
-    const q = query.value.trim().toLowerCase();
-    if (!q) return true;
-    if (entry.label.toLowerCase().includes(q)) return true;
-    if (entry.description.toLowerCase().includes(q)) return true;
-    if (SECTION_LABELS[entry.section].toLowerCase().includes(q)) return true;
-    if (entry.keywords?.some((k) => k.toLowerCase().includes(q))) return true;
-    return false;
-  }
+  const searchable = computed<IndexedSetting[]>(() =>
+    SETTINGS_INDEX.map((entry) => ({
+      id: entry.id,
+      section: entry.section,
+      texts: [
+        tGlobal(entry.labelKey),
+        tGlobal(entry.descKey),
+        tGlobal(SECTION_LABEL_KEYS[entry.section]),
+        ...entry.keywords,
+      ],
+    })),
+  );
 
-  const filtered = computed(() => SETTINGS_INDEX.filter(matches));
+  /** True while a query is typed: the results view replaces the section. */
+  const active = computed(() => normalizeQuery(query.value) !== "");
 
-  const matchedSections = computed<Set<SettingsSectionKey>>(() => {
-    const out = new Set<SettingsSectionKey>();
-    for (const entry of filtered.value) out.add(entry.section);
-    return out;
+  const matched = computed(() =>
+    active.value ? searchable.value.filter((s) => matchesQuery(s, query.value)) : [],
+  );
+  const matchedIds = computed(() => new Set(matched.value.map((s) => s.id)));
+
+  const countBySection = computed(() => {
+    const counts = new Map<SettingsSectionKey, number>();
+    for (const s of matched.value) counts.set(s.section, (counts.get(s.section) ?? 0) + 1);
+    return counts;
   });
 
+  /** Sections with at least one match, in sidebar order. */
+  const matchedSections = computed(() =>
+    SECTION_ORDER.filter((section) => countBySection.value.has(section)),
+  );
+
+  /** For a query with no results: the word it most likely meant. */
+  const suggestion = computed(() => {
+    if (!active.value || matched.value.length > 0) return null;
+    const word = suggestQuery(query.value, searchable.value);
+    if (!word) return null;
+    const count = searchable.value.filter((s) => matchesQuery(s, word)).length;
+    return count > 0 ? { word, count } : null;
+  });
+
+  /** A row is hidden while a search is on and it is not among the matches. */
   function isHidden(id: string): boolean {
-    if (!query.value.trim()) return false;
-    return !filtered.value.some((e) => e.id === id);
+    return active.value && !matchedIds.value.has(id);
   }
 
-  async function gotoAndHighlight(entry: SettingsIndexEntry) {
-    await router.push(entry.route);
-    // The view may mount on the next tick; let the DOM settle.
-    await nextRaf();
-    await nextRaf();
-    const el = document.querySelector<HTMLElement>(
-      `[data-setting-id="${cssEscape(entry.id)}"]`,
-    );
-    if (!el) return;
-    el.scrollIntoView({ block: "center", behavior: "smooth" });
-    el.dataset.settingsHighlight = "true";
-    el.style.setProperty(
-      "box-shadow",
-      "inset 0 0 0 2px hsl(var(--ring, var(--primary)))",
-    );
-    setTimeout(() => {
-      el.style.removeProperty("box-shadow");
-      delete el.dataset.settingsHighlight;
-    }, 1500);
-  }
-
-  function reset() {
+  function reset(): void {
     query.value = "";
   }
 
-  return {
-    query,
-    matches,
-    filtered,
-    matchedSections,
-    isHidden,
-    gotoAndHighlight,
-    reset,
-  };
+  return { query, active, matched, countBySection, matchedSections, suggestion, isHidden, reset };
 }
 
-function nextRaf(): Promise<void> {
-  return new Promise((r) => requestAnimationFrame(() => r()));
-}
+let instance: ReturnType<typeof create> | null = null;
 
-function cssEscape(s: string): string {
-  // CSS.escape is widely available in modern browsers; fall back to a
-  // conservative replacement for older runtimes.
-  if (typeof CSS !== "undefined" && typeof CSS.escape === "function") {
-    return CSS.escape(s);
-  }
-  return s.replace(/["\\]/g, "\\$&");
+export function useSettingsFilter() {
+  instance ??= create();
+  return instance;
 }

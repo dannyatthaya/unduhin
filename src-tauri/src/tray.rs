@@ -773,6 +773,9 @@ mod tests {
             speed_samples: None,
             kind: DownloadKind::Http,
             torrent: None,
+            speed_limit_bps: None,
+            help_slow_parts: true,
+            sha256: None,
         }
     }
 

@@ -1,176 +1,127 @@
 <script setup lang="ts">
-// Overview tab of the details panel. The headline progress and the stat
-// tiles live in the panel header (DetailPane); this tab carries the speed
-// chart, the segments preview, and where the file comes from and goes to.
+// Overview tab. Top to bottom: anything the download is waiting on, its
+// speed, the settings it can override, then the facts. The headline
+// progress is pinned above the tabs (DetailProgress), so nothing here
+// repeats it.
 
-import { computed } from "vue";
+import { computed, ref } from "vue";
 import { useI18n } from "vue-i18n";
-import { Copy } from "lucide-vue-next";
 
+import DetailAttention from "./DetailAttention.vue";
+import DetailFacts from "./DetailFacts.vue";
+import DetailTuning from "./DetailTuning.vue";
 import SpeedSparkline from "./SpeedSparkline.vue";
-import SegmentBars from "./SegmentBars.vue";
 
-import { useCategoriesStore } from "@/stores/categories";
 import { useDownloadsStore } from "@/stores/downloads";
-import { useToast } from "@/composables/useToast";
-import { formatBytes, formatSpeed, relativeTime } from "@/lib/format";
+import { formatSpeed, splitSpeed } from "@/lib/format";
 import type { DownloadRecord } from "@/types/tauri-bindings";
 
-const { t, locale } = useI18n();
 const props = defineProps<{ download: DownloadRecord }>();
-const emit = defineEmits<{ "view-segments": [] }>();
+defineEmits<{ "edit-schedule": [] }>();
 
+const { t, locale } = useI18n();
 const store = useDownloadsStore();
-const categories = useCategoriesStore();
-const toast = useToast();
 
-const samples = computed(() => store.speedHistoryFor(props.download.id));
-const live = computed(() => store.liveSegmentsFor(props.download.id));
+const isCompleted = computed(() => props.download.status === "completed");
+const isLive = computed(
+  () => props.download.status === "active" || props.download.status === "muxing",
+);
 
-const isMedia = computed(() => props.download.media_info != null);
-
-/** Torrent rows have no HTTP segments — the per-segment preview + "view all
- *  segments" affordance don't apply. The detail pane offers a Torrent tab
- *  instead, so the overview just hides the segments preview here. */
-const isTorrent = computed(() => props.download.kind === "torrent");
-const showSegmentsPreview = computed(() => !isMedia.value && !isTorrent.value);
-
-const peakSpeed = computed(() => {
-  let m = 0;
-  for (const v of samples.value) if (v > m) m = v;
-  return m;
-});
-
-/** First segment the engine reports as slow or stalled. The engine
- *  owns this verdict — see `transfer.rs::SegmentSampler::classify`. */
-const slowSegmentIndex = computed(() => {
-  const liveMap = live.value;
-  if (!liveMap) return null;
-  for (const seg of liveMap.values()) {
-    if (seg.state === "slow" || seg.state === "stalled") {
-      return seg.index;
-    }
+/** Live samples while it runs; the saved series once it has finished. */
+const samples = computed(() => {
+  const live = store.speedHistoryFor(props.download.id);
+  if (isCompleted.value) {
+    return props.download.speed_samples?.length ? props.download.speed_samples : live;
   }
-  return null;
+  return live;
+});
+const showSpeed = computed(
+  () => (isLive.value || isCompleted.value) && samples.value.some((v) => v > 0),
+);
+
+const peak = computed(() => samples.value.reduce((max, v) => Math.max(max, v), 0));
+const average = computed(() => {
+  const moving = samples.value.filter((v) => v > 0);
+  return moving.length === 0 ? 0 : moving.reduce((sum, v) => sum + v, 0) / moving.length;
 });
 
-const slowLabel = computed(() => {
-  if (slowSegmentIndex.value == null) return null;
-  return t("detail.overviewSlowWarning", { index: slowSegmentIndex.value + 1 });
+/** "Avg 38.2 MB/s, peak 46.0": the unit is said once when both share it. */
+const speedSummary = computed(() => {
+  const avg = splitSpeed(average.value);
+  const top = splitSpeed(peak.value);
+  return t("detail.avgPeak", {
+    avg: formatSpeed(average.value),
+    peak: avg.unit === top.unit ? top.value : formatSpeed(peak.value),
+  });
 });
 
-const categoryName = computed(() => categories.nameOf(props.download.category_id));
+const chartLabel = computed(() =>
+  t(isCompleted.value ? "detail.speedChartAriaDone" : "detail.speedChartAria", {
+    avg: formatSpeed(average.value),
+    peak: formatSpeed(peak.value),
+  }),
+);
 
-const addedAt = computed(() => {
-  const ms = Date.parse(props.download.created_at);
-  if (Number.isNaN(ms)) return "—";
-  return new Date(ms).toLocaleString(locale.value, {
-    day: "numeric",
-    month: "short",
-    year: "numeric",
+function clock(iso: string | null): string {
+  const ms = iso ? Date.parse(iso) : Number.NaN;
+  if (Number.isNaN(ms)) return "";
+  return new Date(ms).toLocaleTimeString(locale.value, {
     hour: "2-digit",
     minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
   });
-});
-
-const sizeLine = computed(() => {
-  const bytes = props.download.total_bytes;
-  if (bytes == null) return formatBytes(bytes);
-  const exact = t("detail.bytesSuffix", {
-    bytes: Number(bytes).toLocaleString("en-US"),
-  });
-  return `${formatBytes(bytes)} · ${exact}`;
-});
-
-async function copyLink() {
-  try {
-    await navigator.clipboard.writeText(props.download.url);
-    toast.push(t("downloads.linksCopied", { n: 1 }, 1), "success");
-  } catch {
-    toast.push(t("detail.copyFailed"), "error");
-  }
 }
+
+/** A torrent has no settings of its own; a finished file has none left. */
+const showTuning = computed(
+  () => props.download.kind !== "torrent" && !isCompleted.value,
+);
+
+const attentionRef = ref<InstanceType<typeof DetailAttention> | null>(null);
+defineExpose({ focusFreshLink: () => attentionRef.value?.focusFreshLink() });
 </script>
 
 <template>
-  <div class="flex flex-col gap-[18px]">
-    <section class="flex flex-col gap-2">
-      <div class="flex items-baseline justify-between text-xs text-muted-foreground">
-        <h3>{{ t("detail.speedLast60s") }}</h3>
-        <span class="font-mono">
-          {{ t("detail.peakShort") }}
-          <span class="text-foreground">{{ formatSpeed(peakSpeed) }}</span>
+  <div class="flex flex-col gap-5">
+    <DetailAttention
+      ref="attentionRef"
+      :download="download"
+      @edit-schedule="$emit('edit-schedule')"
+    />
+
+    <section v-if="showSpeed" :aria-label="t('detail.metricSpeed')" class="flex flex-col gap-2">
+      <div class="flex min-h-6 items-center justify-between gap-2">
+        <span class="text-xs font-semibold text-dl-soft">
+          {{ isCompleted ? t("detail.speedWhole") : t("detail.speedLast60s") }}
+        </span>
+        <span class="whitespace-nowrap font-mono text-xs text-muted-foreground">
+          {{ speedSummary }}
         </span>
       </div>
-      <SpeedSparkline :samples="samples" :height="64" />
-    </section>
-
-    <!-- Segments preview — hidden for yt-dlp (single-stream) and torrent
-         downloads (no HTTP segments; use the Torrent tab instead). -->
-    <section v-if="showSegmentsPreview" class="flex flex-col gap-2">
-      <header class="flex items-baseline justify-between text-xs">
-        <h3 class="text-muted-foreground">{{ t("detail.tabSegments") }}</h3>
-        <button
-          type="button"
-          class="font-medium text-primary hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
-          @click="emit('view-segments')"
-        >
-          {{ t("detail.viewAllSegments", { n: download.segments }) }}
-        </button>
-      </header>
-      <SegmentBars
-        :segments="download.segments_meta ?? []"
-        :bars="download.segments"
-        :slow-segment="slowSegmentIndex"
-        :height="44"
+      <SpeedSparkline
+        :samples="samples"
+        :fill="!isCompleted"
+        :height="isCompleted ? 72 : 88"
+        :tone="isCompleted ? 'success' : 'accent'"
+        :label="chartLabel"
+        :average-label="isCompleted ? undefined : t('detail.avgShort')"
       />
-      <p v-if="slowLabel" class="flex items-start gap-1.5 text-xs text-warning">
-        <span aria-hidden="true">⚠</span>
-        <span>{{ slowLabel }}</span>
-      </p>
-    </section>
-
-    <section class="flex flex-col gap-1.5">
-      <h3 class="text-xs text-muted-foreground">{{ t("detail.sourceLink") }}</h3>
-      <div
-        class="flex items-center gap-2 rounded-[9px] border border-input bg-dl-field py-2 pl-2.5 pr-2"
-      >
-        <span class="min-w-0 flex-1 truncate font-mono text-xs" :title="download.url">
-          {{ download.url }}
-        </span>
-        <button
-          type="button"
-          class="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
-          :aria-label="t('detail.copyLink')"
-          :title="t('detail.copyLink')"
-          @click="copyLink"
-        >
-          <Copy class="h-3.5 w-3.5" aria-hidden="true" />
-        </button>
+      <div class="flex justify-between font-mono text-xs text-muted-foreground">
+        <template v-if="isCompleted">
+          <span>{{ clock(download.created_at) }}</span>
+          <span>{{ clock(download.completed_at) }}</span>
+        </template>
+        <template v-else>
+          <span>{{ t("detail.axisMinus60") }}</span>
+          <span>{{ t("detail.axisMinus30") }}</span>
+          <span>{{ t("detail.now") }}</span>
+        </template>
       </div>
     </section>
 
-    <section class="flex flex-col gap-1.5">
-      <h3 class="text-xs text-muted-foreground">{{ t("detail.savingTo") }}</h3>
-      <span class="break-all font-mono text-xs">{{ download.output_path }}</span>
-    </section>
+    <DetailTuning v-if="showTuning" :download="download" />
 
-    <dl class="grid grid-cols-2 gap-x-4 gap-y-[18px]">
-      <div class="flex flex-col gap-1.5">
-        <dt class="text-xs text-muted-foreground">{{ t("detail.metricSize") }}</dt>
-        <dd>{{ sizeLine }}</dd>
-      </div>
-      <div class="flex flex-col gap-1.5">
-        <dt class="text-xs text-muted-foreground">{{ t("detail.metricCategory") }}</dt>
-        <dd>{{ categoryName }}</dd>
-      </div>
-      <div class="col-span-2 flex flex-col gap-1.5">
-        <dt class="text-xs text-muted-foreground">{{ t("detail.added") }}</dt>
-        <dd>
-          {{ addedAt }}
-          <span class="text-muted-foreground">· {{ relativeTime(download.created_at) }}</span>
-        </dd>
-      </div>
-    </dl>
+    <DetailFacts :download="download" />
   </div>
 </template>

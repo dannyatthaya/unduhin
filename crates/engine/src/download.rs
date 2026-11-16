@@ -3,6 +3,7 @@
 //! ticker + per-segment telemetry) lives in [`crate::transfer`].
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,6 +21,29 @@ use crate::retry::Backoff;
 use crate::segment::{split, Segment};
 use crate::throttle::TokenBucket;
 use crate::transfer::{run_transfer, Control};
+
+/// Settings for one download that the caller can change while it runs.
+///
+/// Both handles are shared: the caller keeps a clone and flips the value;
+/// the transfer reads it on its next write or its next finished part. The
+/// default (`None` for both) is "no cap of its own, help slow parts on".
+#[derive(Debug, Clone, Default)]
+pub struct Tuning {
+    /// Byte-rate cap for this download alone, applied on top of the shared
+    /// [`DownloadOptions::rate_limiter`]. A rate of `0` means no cap.
+    pub speed_limiter: Option<Arc<TokenBucket>>,
+    /// When `true` (or absent), a connection that finishes its part takes
+    /// over half of the part with the most left to fetch.
+    pub help_slow_parts: Option<Arc<AtomicBool>>,
+}
+
+impl Tuning {
+    pub(crate) fn helps_slow_parts(&self) -> bool {
+        self.help_slow_parts
+            .as_ref()
+            .map_or(true, |flag| flag.load(Ordering::Relaxed))
+    }
+}
 
 /// Tunable inputs for a fresh download.
 #[derive(Debug, Clone)]
@@ -53,6 +77,8 @@ pub struct DownloadOptions {
     /// (the default) means unthrottled. The `core` queue feeds each worker a
     /// clone of one process-wide bucket driven by `global_speed_limit_bps`.
     pub rate_limiter: Option<Arc<TokenBucket>>,
+    /// Per-download settings the caller can change mid-transfer.
+    pub tuning: Tuning,
 }
 
 impl DownloadOptions {
@@ -68,6 +94,7 @@ impl DownloadOptions {
             headers: Vec::new(),
             channel_capacity: DEFAULT_CHANNEL_CAPACITY,
             rate_limiter: None,
+            tuning: Tuning::default(),
         }
     }
 }
@@ -331,6 +358,7 @@ pub async fn resume_at(
         tx,
         None,
         rate_limiter,
+        Tuning::default(),
     )
     .await
 }
@@ -349,6 +377,7 @@ pub async fn resume_at_with_control(
     tx: Option<broadcast::Sender<ProgressEvent>>,
     control_rx: Option<mpsc::Receiver<Control>>,
     rate_limiter: Option<Arc<TokenBucket>>,
+    tuning: Tuning,
 ) -> Result<DownloadSummary> {
     let meta = Meta::load(&meta_path).await?;
     let url: Url = meta
@@ -383,6 +412,7 @@ pub async fn resume_at_with_control(
         headers,
         channel_capacity: DEFAULT_CHANNEL_CAPACITY,
         rate_limiter,
+        tuning,
     };
 
     if !opts.output.exists() {

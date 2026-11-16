@@ -56,7 +56,7 @@ pub mod transfer;
 
 pub use download::{
     download, download_with_control, resume_at, resume_at_with_control, DownloadOptions,
-    DownloadSummary,
+    DownloadSummary, Tuning,
 };
 pub use error::{EngineError, Result};
 pub use filename::{derive_filename, from_url as filename_from_url};

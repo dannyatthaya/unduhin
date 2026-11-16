@@ -11,10 +11,11 @@ import DownloadGroup from "@/components/DownloadGroup.vue";
 import DownloadRow from "@/components/DownloadRow.vue";
 import EmptyState, { type EmptyVariant } from "@/components/EmptyState.vue";
 import DetailPane from "@/components/detail/DetailPane.vue";
+import RenameDialog from "@/components/RenameDialog.vue";
 import SkeletonRow from "@/components/SkeletonRow.vue";
 import BulkBar, { type SelectScope } from "@/components/downloads/BulkBar.vue";
 import DownloadsListHeader from "@/components/downloads/DownloadsListHeader.vue";
-import DownloadsTitleBar from "@/components/downloads/DownloadsTitleBar.vue";
+import WindowTitleBar from "@/components/WindowTitleBar.vue";
 import DownloadsToolbar, {
   type ToolbarTab,
 } from "@/components/downloads/DownloadsToolbar.vue";
@@ -24,6 +25,7 @@ import { useCategoriesStore } from "@/stores/categories";
 import { useDetailStore } from "@/stores/detail";
 import { useDownloadsStore } from "@/stores/downloads";
 import { useSelectionStore } from "@/stores/selection";
+import { useRenameDialog } from "@/composables/useRenameDialog";
 import { useAggregateSpeedHistory } from "@/composables/useAggregateSpeedHistory";
 import {
   useGroupedDownloads,
@@ -69,8 +71,14 @@ const isNarrow = useMediaQuery(NARROW_QUERY);
 const detailOpen = computed(
   () => detail.openId != null && downloads.records.has(detail.openId),
 );
-// The list drops Size and Added whenever it is short on width.
-const compact = computed(() => isNarrow.value || detailOpen.value);
+// The list drops Size and Added when the window is narrow. The details
+// panel opens on top of the list, so it never costs the list a column.
+const compact = computed(() => isNarrow.value);
+
+const rename = useRenameDialog();
+const renameRecord = computed(() =>
+  rename.targetId.value == null ? null : downloads.records.get(rename.targetId.value) ?? null,
+);
 
 const { groups, matching, sortedMatching } = useGroupedDownloads(
   () => search.value,
@@ -286,7 +294,7 @@ watch(
 
 // ── Keyboard and paste ──────────────────────────────────────────────────────
 
-const titleBarRef = ref<InstanceType<typeof DownloadsTitleBar> | null>(null);
+const titleBarRef = ref<InstanceType<typeof WindowTitleBar> | null>(null);
 const listRef = ref<HTMLElement | null>(null);
 
 /** Inputs that take typed text — checkboxes and buttons do not count. */
@@ -408,13 +416,13 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="dl-surface flex min-h-0 flex-1 flex-col bg-background text-foreground">
-    <DownloadsTitleBar
+    <WindowTitleBar
       ref="titleBarRef"
       v-model:search="search"
       :compact="isNarrow"
     />
 
-    <div class="flex min-h-0 flex-1">
+    <div class="relative flex min-h-0 flex-1">
       <AppSidebar
         :selected-category-id="selectedCategoryId"
         :loading="downloads.loading"
@@ -514,6 +522,12 @@ onBeforeUnmount(() => {
       :open="showAddUrl"
       :initial-url="pastedUrl"
       @close="showAddUrl = false"
+    />
+    <RenameDialog
+      v-if="renameRecord"
+      open
+      :download="renameRecord"
+      @close="rename.close()"
     />
   </div>
 </template>

@@ -1,11 +1,12 @@
 <script setup lang="ts">
-// Title bar for the downloads page: brand, the search field, and the
-// window controls in one 44px strip. The Settings routes keep the shared
-// `AppTitleBar`.
+// The window's title bar: brand, a search field, and the window controls
+// in one 44px strip. Downloads searches the list with it; Settings passes
+// a subtitle and searches settings.
 //
-// Platform handling mirrors `AppTitleBar`: on macOS the system draws its
-// traffic lights over the left edge, so our own buttons are hidden and
-// the brand is inset to clear them. Dragging is Tauri's
+// On Windows `decorations` is false, so this is the only place the window
+// controls live. On macOS the system draws its traffic lights over the
+// left edge, so our own buttons are hidden and the brand is inset to
+// clear them. Dragging is Tauri's
 // `data-tauri-drag-region`, which applies to the marked element only —
 // the search field stays clickable.
 
@@ -20,6 +21,14 @@ const props = defineProps<{
   search: string;
   /** Narrow window: the brand collapses to its mark. */
   compact?: boolean;
+  /** Muted word after the brand, e.g. "Settings". Widens the brand to the
+   *  240px settings sidebar. */
+  subtitle?: string;
+  /** Placeholder and accessible name of the search field. */
+  searchPlaceholder?: string;
+  searchLabel?: string;
+  /** Tooltip of the clear button. */
+  clearHint?: string;
 }>();
 
 const emit = defineEmits<{ "update:search": [value: string] }>();
@@ -65,7 +74,7 @@ const WINDOW_BUTTON =
     <div
       data-tauri-drag-region
       class="flex shrink-0 items-center gap-2.5 font-semibold tracking-[-0.01em]"
-      :class="compact ? 'basis-6' : 'basis-[200px]'"
+      :class="compact ? 'basis-6' : subtitle ? 'basis-[224px]' : 'basis-[200px]'"
     >
       <span
         class="pointer-events-none flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-[7px] bg-dl-accent text-dl-on-accent"
@@ -84,6 +93,12 @@ const WINDOW_BUTTON =
         </svg>
       </span>
       <span v-if="!compact" class="pointer-events-none">Unduhin</span>
+      <span
+        v-if="!compact && subtitle"
+        class="pointer-events-none font-normal text-muted-foreground"
+      >
+        {{ subtitle }}
+      </span>
     </div>
 
     <label
@@ -95,8 +110,8 @@ const WINDOW_BUTTON =
         ref="inputRef"
         type="search"
         :value="search"
-        :placeholder="t('downloads.searchPlaceholder')"
-        :aria-label="t('downloads.searchAria')"
+        :placeholder="searchPlaceholder ?? t('downloads.searchPlaceholder')"
+        :aria-label="searchLabel ?? t('downloads.searchAria')"
         class="min-w-0 flex-1 select-text border-0 bg-transparent text-foreground outline-none placeholder:text-muted-foreground [&::-webkit-search-cancel-button]:appearance-none"
         @input="emit('update:search', ($event.target as HTMLInputElement).value)"
         @keydown.esc="onEscape"
@@ -106,7 +121,7 @@ const WINDOW_BUTTON =
         type="button"
         class="flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-md bg-muted text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
         :aria-label="t('downloads.searchClear')"
-        :title="t('downloads.searchClearHint')"
+        :title="clearHint ?? t('downloads.searchClearHint')"
         @click="clearSearch"
       >
         <X class="h-[11px] w-[11px]" aria-hidden="true" />

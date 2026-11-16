@@ -27,6 +27,7 @@ mod db;
 pub mod download;
 pub mod error;
 pub mod event;
+mod file_ops;
 pub mod logging;
 mod motw;
 mod queue;
@@ -47,6 +48,7 @@ pub use download::{
 };
 pub use error::{CoreError, Result};
 pub use event::CoreEvent;
+pub use file_ops::LinkProbe;
 pub use schedule::{NewSchedule, QuietHoursState, Schedule, ScheduleId, ScheduleKind};
 pub use settings::{parse_user_value, settings_keys, SettingValue};
 pub use speed::TokenBucket;

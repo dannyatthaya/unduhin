@@ -16,6 +16,8 @@ import {
 export interface SelectOption<V> {
   value: V;
   label: string;
+  /** Text for the closed control when it should differ from the list item. */
+  triggerLabel?: string;
   icon?: string;
   disabled?: boolean;
 }
@@ -25,6 +27,9 @@ const props = defineProps<{
   options: SelectOption<T>[];
   disabled?: boolean;
   placeholder?: string;
+  /** Id for a <label for>. */
+  id?: string;
+  ariaLabel?: string;
 }>();
 
 const emit = defineEmits<{ "update:modelValue": [value: T] }>();
@@ -56,7 +61,7 @@ const selectedLabel = computed(() => {
   const match = props.options.find(
     (o) => String(o.value) === String(props.modelValue),
   );
-  return match ? match.label : (props.placeholder ?? "");
+  return match ? (match.triggerLabel ?? match.label) : (props.placeholder ?? "");
 });
 </script>
 
@@ -67,11 +72,14 @@ const selectedLabel = computed(() => {
     @update:model-value="(v) => v != null && emitValue(v as string)"
   >
     <SelectTrigger
-      class="inline-flex h-9 w-full items-center justify-between rounded-md border border-input bg-background px-3 text-sm transition-colors hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring data-disabled:cursor-not-allowed data-disabled:opacity-50"
+      :id="id"
+      :aria-label="ariaLabel"
+      class="inline-flex h-9 w-full items-center justify-between gap-2 rounded-[9px] border border-input bg-dl-field px-2.5 text-[13px] text-foreground transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring data-disabled:cursor-not-allowed data-disabled:opacity-45"
     >
-      <span class="truncate text-left">{{ selectedLabel }}</span>
+      <span class="min-w-0 flex-1 truncate text-left">{{ selectedLabel }}</span>
+      <slot name="tag" />
       <SelectIcon as-child>
-        <ChevronDown class="h-4 w-4 shrink-0 text-muted-foreground" />
+        <ChevronDown class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
       </SelectIcon>
     </SelectTrigger>
 
@@ -79,7 +87,7 @@ const selectedLabel = computed(() => {
       <SelectContent
         position="popper"
         :side-offset="4"
-        class="z-50 min-w-(--reka-select-trigger-width) overflow-hidden rounded-md border border-border bg-card text-card-foreground shadow-lg data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0"
+        class="dl-surface z-[60] min-w-(--reka-select-trigger-width) overflow-hidden rounded-[10px] border border-border bg-card text-card-foreground shadow-dl-menu data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0"
       >
         <SelectViewport class="max-h-70 overflow-auto p-1">
           <SelectItem
@@ -87,7 +95,7 @@ const selectedLabel = computed(() => {
             :key="String(opt.value)"
             :value="String(opt.value)"
             :disabled="opt.disabled"
-            class="relative flex w-full cursor-pointer select-none items-center gap-2 rounded-sm py-1.5 pl-2 pr-7 text-sm outline-none transition-colors data-highlighted:bg-accent data-highlighted:text-accent-foreground data-disabled:cursor-not-allowed data-disabled:opacity-50"
+            class="relative flex h-8 w-full cursor-pointer select-none items-center gap-2 rounded-[7px] pl-2.5 pr-7 text-[13px] outline-none transition-colors data-highlighted:bg-accent data-highlighted:text-accent-foreground data-disabled:cursor-not-allowed data-disabled:opacity-45"
           >
             <SelectItemText>{{ opt.label }}</SelectItemText>
             <SelectItemIndicator

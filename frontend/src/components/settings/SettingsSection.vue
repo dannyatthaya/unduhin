@@ -1,37 +1,36 @@
 <script setup lang="ts">
+// One settings page: a heading, one line of what the page is for, then
+// its groups. Embedded in search results it renders the groups only.
+
+import { useSettingsEmbed } from "./settingsEmbed";
+
 defineProps<{
-  eyebrow?: string;
   title: string;
   description?: string;
 }>();
+
+const embed = useSettingsEmbed();
 </script>
 
 <template>
-  <section class="mx-auto flex max-w-3xl flex-col gap-6 px-8 py-8">
-    <header class="flex flex-col gap-2 border-b border-border pb-6">
-      <span
-        v-if="eyebrow"
-        class="text-[10px] font-semibold uppercase tracking-[0.18em] text-primary"
-        >{{ eyebrow }}</span
-      >
-      <div class="flex items-start justify-between gap-4">
-        <div class="flex flex-col gap-1.5">
-          <h1 class="text-2xl font-semibold leading-tight">{{ title }}</h1>
-          <p
-            v-if="description"
-            class="max-w-2xl text-sm text-muted-foreground"
-          >
-            {{ description }}
-          </p>
-        </div>
-        <div v-if="$slots.actions" class="shrink-0">
-          <slot name="actions" />
-        </div>
+  <div v-if="embed" class="settings-embedded contents">
+    <slot />
+  </div>
+  <div v-else class="flex flex-col gap-7">
+    <header
+      class="flex gap-6"
+      :class="$slots.actions ? 'items-end justify-between' : 'flex-col'"
+    >
+      <div class="flex flex-col gap-1.5">
+        <h1 class="text-2xl font-semibold tracking-[-0.02em]">{{ title }}</h1>
+        <p v-if="description" class="max-w-[620px] text-sm leading-normal text-muted-foreground">
+          {{ description }}
+        </p>
+      </div>
+      <div v-if="$slots.actions" class="shrink-0">
+        <slot name="actions" />
       </div>
     </header>
-
-    <div class="flex flex-col gap-5">
-      <slot />
-    </div>
-  </section>
+    <slot />
+  </div>
 </template>

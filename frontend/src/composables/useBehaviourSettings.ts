@@ -43,5 +43,7 @@ export function useBehaviourSettings() {
     notifyComplete: typedBool("notify_complete", true),
     notifyFail: typedBool("notify_fail", true),
     notifyQueueEmpty: typedBool("notify_queue_empty", false),
+    /** While quiet hours are on, a failed download still notifies. */
+    quietHoursNotifyFailures: typedBool("quiet_hours_notify_failures", true),
   };
 }

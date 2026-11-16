@@ -225,6 +225,14 @@ impl QueueHandle {
         active.get(&id).and_then(|h| h.control.clone())
     }
 
+    /// The live per-download settings of a running HTTP download, so a
+    /// change made in the details panel applies without a restart. `None`
+    /// when the download is not running.
+    pub(crate) async fn tuning_for(&self, id: DownloadId) -> Option<engine::Tuning> {
+        let active = self.active.lock().await;
+        active.get(&id).map(|h| h.tuning.clone())
+    }
+
     /// Cancel the worker for `id` (if any) and synchronously wait for
     /// its task to exit. No-op when no worker is in flight.
     ///
@@ -285,6 +293,9 @@ struct ActiveHandle {
     /// downloads (yt-dlp paths leave this `None` since they don't honor
     /// live re-segmentation).
     control: Option<mpsc::Sender<Control>>,
+    /// This download's own speed cap and "help slow parts" switch, shared
+    /// with its engine transfer. Empty for yt-dlp and torrent workers.
+    tuning: engine::Tuning,
     /// Reconcile ticks observed since this worker was first told to stop.
     /// `0` means "not cancelled". Purely diagnostic — see
     /// [`CANCEL_LINGER_TICKS`].
@@ -530,6 +541,7 @@ impl QueueManager {
             } else {
                 (None, None)
             };
+            let tuning = tuning_for_record(&record);
             let join = spawn_worker(
                 self.pool.clone(),
                 self.events.clone(),
@@ -538,6 +550,7 @@ impl QueueManager {
                 control_rx,
                 self.torrent_engine.clone(),
                 self.rate_limiter.clone(),
+                tuning.clone(),
             );
             // Guarded by the `contains_key` check at the top of the loop —
             // an occupied slot here would mean a second worker for one
@@ -548,6 +561,7 @@ impl QueueManager {
                     cancel,
                     join,
                     control: control_tx,
+                    tuning,
                     cancel_ticks: 0,
                 },
             ) {
@@ -604,7 +618,34 @@ async fn max_concurrent(pool: &SqlitePool) -> crate::error::Result<u64> {
     )
 }
 
+/// The live settings handed to a download's engine transfer. Only the HTTP
+/// engine reads them; other backends get an empty set.
+fn tuning_for_record(record: &DownloadRecord) -> engine::Tuning {
+    if record.kind != DownloadKind::Http {
+        return engine::Tuning::default();
+    }
+    engine::Tuning {
+        speed_limiter: Some(engine::TokenBucket::new(
+            record.speed_limit_bps.unwrap_or(0),
+        )),
+        help_slow_parts: Some(Arc::new(std::sync::atomic::AtomicBool::new(
+            record.help_slow_parts,
+        ))),
+    }
+}
+
+/// The rate yt-dlp is started with: the lower of the global cap and the
+/// download's own, where `0` means "no cap".
+fn effective_limit_bps(global: u64, own: Option<u64>) -> u64 {
+    match (global, own.unwrap_or(0)) {
+        (0, own) => own,
+        (global, 0) => global,
+        (global, own) => global.min(own),
+    }
+}
+
 /// Spawn the per-download worker task.
+#[allow(clippy::too_many_arguments)]
 fn spawn_worker(
     pool: SqlitePool,
     events: broadcast::Sender<CoreEvent>,
@@ -613,6 +654,7 @@ fn spawn_worker(
     control_rx: Option<mpsc::Receiver<Control>>,
     torrent_engine: Arc<TorrentEngineCell>,
     rate_limiter: Arc<engine::TokenBucket>,
+    tuning: engine::Tuning,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         run_worker(
@@ -623,11 +665,13 @@ fn spawn_worker(
             control_rx,
             torrent_engine,
             rate_limiter,
+            tuning,
         )
         .await;
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_worker(
     pool: SqlitePool,
     events: broadcast::Sender<CoreEvent>,
@@ -636,6 +680,7 @@ async fn run_worker(
     control_rx: Option<mpsc::Receiver<Control>>,
     torrent_engine: Arc<TorrentEngineCell>,
     rate_limiter: Arc<engine::TokenBucket>,
+    tuning: engine::Tuning,
 ) {
     let id = record.id;
     let output_path = record.output_path.clone();
@@ -968,8 +1013,9 @@ async fn run_worker(
                         user_agent.clone(),
                         cancel.clone(),
                         tx.clone(),
-                        // Current global cap (live value from the shared bucket).
-                        rate_limiter.rate().await,
+                        // Current global cap (live value from the shared
+                        // bucket), tightened by this download's own.
+                        effective_limit_bps(rate_limiter.rate().await, record.speed_limit_bps),
                     )
                     .await
                 }
@@ -994,6 +1040,7 @@ async fn run_worker(
                 control_rx,
                 // Global speed cap also applies to resumed transfers.
                 Some(rate_limiter.clone()),
+                tuning,
             )
             .await
         }
@@ -1010,6 +1057,7 @@ async fn run_worker(
             opts.headers = record.headers.clone().unwrap_or_default();
             // Global speed cap: all HTTP workers share this one bucket.
             opts.rate_limiter = Some(rate_limiter.clone());
+            opts.tuning = tuning;
             engine::download_with_control(opts, cancel.clone(), Some(tx.clone()), control_rx).await
         }
     };
@@ -1941,6 +1989,15 @@ mod tests {
     }
 
     #[test]
+    fn effective_limit_takes_the_lower_cap_and_treats_zero_as_none() {
+        assert_eq!(effective_limit_bps(0, None), 0);
+        assert_eq!(effective_limit_bps(0, Some(500)), 500);
+        assert_eq!(effective_limit_bps(800, None), 800);
+        assert_eq!(effective_limit_bps(800, Some(500)), 500);
+        assert_eq!(effective_limit_bps(300, Some(500)), 300);
+    }
+
+    #[test]
     fn downsample_trims_trailing_zeros() {
         assert_eq!(downsample_speeds(&[10, 20, 0, 0], 60), vec![10, 20]);
         // All-zero (or empty) signal yields nothing to plot.
@@ -2025,6 +2082,7 @@ mod tests {
                 cancel,
                 join: tokio::spawn(async move { stop.cancelled().await }),
                 control: None,
+                tuning: engine::Tuning::default(),
                 cancel_ticks: 1,
             },
         );
@@ -2067,6 +2125,7 @@ mod tests {
                 cancel,
                 join: tokio::spawn(async move { stop.cancelled().await }),
                 control: None,
+                tuning: engine::Tuning::default(),
                 cancel_ticks: 0,
             },
         );

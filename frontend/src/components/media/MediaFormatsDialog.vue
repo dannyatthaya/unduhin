@@ -136,7 +136,7 @@ async function submit() {
         <div class="min-w-0 flex-1">
           <div class="flex items-center gap-2 text-[10px] uppercase tracking-wider text-muted-foreground">
             <span>{{ probe.extractor }}</span>
-            <span v-if="durationLabel">· {{ durationLabel }}</span>
+            <span v-if="durationLabel">{{ durationLabel }}</span>
             <span v-if="probe.is_live" class="rounded bg-danger/15 px-1 text-danger">LIVE</span>
             <span v-if="probe.age_limit && probe.age_limit >= 18" class="rounded bg-amber-500/15 px-1 text-amber-500">18+</span>
           </div>

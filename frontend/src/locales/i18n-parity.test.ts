@@ -75,6 +75,7 @@ describe("i18n locale parity", () => {
       "errors",
       "notify",
       "settings",
+      "start",
       "tray",
     ];
     expect(Object.keys(en).sort()).toEqual(expected);

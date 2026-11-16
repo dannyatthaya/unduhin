@@ -7,6 +7,8 @@ const props = defineProps<{
   modelValue: boolean;
   disabled?: boolean;
   ariaLabel?: string;
+  /** Id of the visible text that names this switch. */
+  labelledby?: string;
   class?: string;
 }>();
 
@@ -18,16 +20,17 @@ const emit = defineEmits<{ "update:modelValue": [value: boolean] }>();
     :model-value="modelValue"
     :disabled="disabled"
     :aria-label="ariaLabel"
+    :aria-labelledby="labelledby"
     :class="
       cn(
-        'peer relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full border-2 border-transparent shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background disabled:cursor-not-allowed disabled:opacity-50 data-[state=checked]:bg-primary data-[state=unchecked]:bg-muted',
+        'relative inline-flex h-6 w-10 shrink-0 cursor-pointer items-center rounded-full px-[3px] transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-45 data-[state=checked]:bg-primary data-[state=unchecked]:bg-input',
         props.class,
       )
     "
     @update:model-value="(v) => emit('update:modelValue', v)"
   >
     <SwitchThumb
-      class="pointer-events-none block h-4 w-4 rounded-full bg-white shadow-lg ring-0 transition-transform data-[state=checked]:translate-x-4 data-[state=unchecked]:translate-x-0"
+      class="pointer-events-none block h-[18px] w-[18px] rounded-full transition-transform data-[state=checked]:translate-x-4 data-[state=checked]:bg-(--dl-switch-knob) data-[state=unchecked]:translate-x-0 data-[state=unchecked]:bg-dl-knob-off"
     />
   </SwitchRoot>
 </template>

@@ -371,6 +371,22 @@ pub struct DownloadRecord {
     /// media rows and rows predating the torrent migration.
     #[serde(default)]
     pub torrent: Option<TorrentMeta>,
+    /// This download's own byte-rate cap, on top of the global one. `None`
+    /// means no cap of its own. Applies to HTTP and media rows.
+    #[serde(default)]
+    pub speed_limit_bps: Option<u64>,
+    /// Whether a connection that finishes its part takes over half of the
+    /// part with the most left. HTTP rows only; on by default.
+    #[serde(default = "default_help_slow_parts")]
+    pub help_slow_parts: bool,
+    /// Lower-case hex SHA-256 of the finished file, once the user has asked
+    /// for it. Cleared when the file is downloaded again.
+    #[serde(default)]
+    pub sha256: Option<String>,
+}
+
+fn default_help_slow_parts() -> bool {
+    true
 }
 
 /// Inputs to [`crate::Core::add_download`].
@@ -2175,7 +2191,7 @@ async fn move_into_folder(from: &Path, dest_dir: &Path) -> PathBuf {
 /// Never overwrites anything: each candidate name is claimed with
 /// [`move_no_clobber`], and a name that turns out to be taken — even one
 /// that appeared a moment ago — just moves on to the next ` (n)`.
-async fn move_renamed(from: &Path, dest_dir: &Path, new_name: &std::ffi::OsStr) -> PathBuf {
+pub(crate) async fn move_renamed(from: &Path, dest_dir: &Path, new_name: &std::ffi::OsStr) -> PathBuf {
     if tokio::fs::create_dir_all(dest_dir).await.is_err() {
         return from.to_path_buf();
     }
@@ -2341,8 +2357,8 @@ where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
     sqlx::query(
-        "UPDATE downloads SET downloaded_bytes = 0, completed_at = NULL, error = NULL \
-         WHERE id = ?",
+        "UPDATE downloads SET downloaded_bytes = 0, completed_at = NULL, error = NULL, \
+         sha256 = NULL WHERE id = ?",
     )
     .bind(id)
     .execute(exec)
@@ -2682,6 +2698,18 @@ fn record_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<DownloadRecord> {
         speed_samples,
         kind,
         torrent,
+        // Defensive `try_get` (migration 20261115000001): an absent column
+        // reads as "no cap, help slow parts on, no checksum".
+        speed_limit_bps: row
+            .try_get::<Option<i64>, _>("speed_limit_bps")
+            .ok()
+            .flatten()
+            .filter(|n| *n > 0)
+            .map(|n| n as u64),
+        help_slow_parts: row
+            .try_get::<i64, _>("help_slow_parts")
+            .map_or(true, |n| n != 0),
+        sha256: row.try_get::<Option<String>, _>("sha256").ok().flatten(),
     })
 }
 
@@ -2818,7 +2846,7 @@ fn safe_join(folder: &Path, filename: &str) -> Result<PathBuf> {
 /// single, identically-named download. A pure on-disk check is not enough: at
 /// add time the file usually doesn't exist yet, so we also reserve against
 /// other rows' paths.
-async fn resolve_unique_output_path(
+pub(crate) async fn resolve_unique_output_path(
     pool: &SqlitePool,
     folder: &Path,
     filename: &str,

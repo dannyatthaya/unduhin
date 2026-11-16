@@ -25,6 +25,7 @@ import type {
   CoreEvent,
   DownloadId,
   DownloadRecord,
+  DownloadSource,
   SegmentLive,
   Status,
 } from "@/types/tauri-bindings";
@@ -63,12 +64,25 @@ export type TimelineKind =
   | "failed"
   | "retry";
 
+/**
+ * One notable moment in a download's life, as facts rather than prose: the
+ * details panel words each entry in the user's language
+ * (`useTimelineText`).
+ */
 export interface TimelineEntry {
   kind: TimelineKind;
   at: string; // ISO timestamp
-  title: string;
-  detail?: string;
-  meta?: string;
+  /** `started`: connections the download was added with. */
+  segments?: number;
+  /** `started`: which surface added it. */
+  source?: DownloadSource;
+  /** `status`: the status it left and the one it entered. */
+  from?: Status;
+  to?: Status;
+  /** `failed`: the engine's error text. */
+  error?: string;
+  /** `completed`: the file name at the time. */
+  filename?: string;
 }
 
 const SPEED_HISTORY_LEN = 60;
@@ -337,10 +351,8 @@ export const useDownloadsStore = defineStore("downloads", () => {
         pushTimeline(event.id, {
           kind: "started",
           at: new Date().toISOString(),
-          title: "Download started",
-          detail: `${event.snapshot.segments} segment${
-            event.snapshot.segments === 1 ? "" : "s"
-          } allocated`,
+          segments: event.snapshot.segments,
+          source: event.snapshot.source,
         });
         break;
       case "status_changed":
@@ -348,15 +360,13 @@ export const useDownloadsStore = defineStore("downloads", () => {
           pushTimeline(event.id, {
             kind: "retry",
             at: new Date().toISOString(),
-            title: "Retry succeeded",
-            detail: "Transfer resumed after a previous failure",
           });
         } else if (event.from !== event.to) {
           pushTimeline(event.id, {
             kind: "status",
             at: new Date().toISOString(),
-            title: `Status changed to ${event.to}`,
-            detail: `Previous: ${event.from}`,
+            from: event.from,
+            to: event.to,
           });
         }
         break;
@@ -367,16 +377,14 @@ export const useDownloadsStore = defineStore("downloads", () => {
         pushTimeline(event.id, {
           kind: "completed",
           at: new Date().toISOString(),
-          title: "Download completed",
-          detail: prev?.filename,
+          filename: prev?.filename,
         });
         break;
       case "failed":
         pushTimeline(event.id, {
           kind: "failed",
           at: new Date().toISOString(),
-          title: "Download failed",
-          detail: event.error,
+          error: event.error,
         });
         break;
       case "removed":
@@ -399,6 +407,18 @@ export const useDownloadsStore = defineStore("downloads", () => {
 
   async function add(input: Parameters<typeof api.addDownload>[0]) {
     return api.addDownload(input);
+  }
+
+  /**
+   * Replace one row with the copy a command returned (rename, move, a
+   * per-download setting). Those commands answer with the updated row
+   * rather than an event, so the caller hands it back here.
+   */
+  function putRecord(record: DownloadRecord) {
+    if (!records.value.has(record.id)) return;
+    const next = new Map(records.value);
+    next.set(record.id, record);
+    records.value = next;
   }
 
   return {
@@ -425,6 +445,7 @@ export const useDownloadsStore = defineStore("downloads", () => {
     refresh,
     handleEvent,
     add,
+    putRecord,
     pause: api.pauseDownload,
     resume: api.resumeDownload,
     retry: api.retryDownload,

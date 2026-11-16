@@ -28,6 +28,10 @@ function rec(over: Partial<DownloadRecord>): DownloadRecord {
     speed_samples: null,
     kind: "http",
     torrent: null,
+    source: "manual",
+    speed_limit_bps: null,
+    help_slow_parts: true,
+    sha256: null,
     ...over,
   };
 }

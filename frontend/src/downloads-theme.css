@@ -1,16 +1,16 @@
 /*
- * Scoped theme for the downloads page (design "Option A3": yellow + black,
- * paper + yellow in light mode).
+ * Theme for the main window (design "Option A3": yellow + black, paper +
+ * yellow in light mode).
  *
- * Everything hangs off `.dl-surface`, so the Settings routes and the shared
- * dialogs keep the app-wide palette from `style.css`. Inside the scope the
- * shadcn-style HSL channels are remapped, which re-skins every existing
- * utility (`bg-background`, `text-muted-foreground`, `bg-primary`, …) and
- * every reused component without touching them. Tokens the shared set has no
- * slot for are declared as `--dl-*` and exposed as `*-dl-*` utilities below.
+ * Everything hangs off `.dl-surface`, which `index.html` puts on <body>: the
+ * downloads page, Settings, and every dialog, menu and popover teleported to
+ * <body> share it. The tray popover is a separate document without the
+ * class, so it keeps the base palette from `style.css`.
  *
- * Menus and popovers opened from the page are teleported to <body>; they
- * carry the `dl-surface` class themselves so the scope follows them.
+ * Inside the scope the shadcn-style HSL channels are remapped, which
+ * re-skins every existing utility (`bg-background`, `text-muted-foreground`,
+ * `bg-primary`, …). Tokens the shared set has no slot for are declared as
+ * `--dl-*` and exposed as `*-dl-*` utilities below.
  *
  * `--primary` is the accent as a *line or text* colour (dark yellow on
  * paper, yellow on black). The solid yellow fill is `--dl-accent`.
@@ -40,6 +40,7 @@
   --sidebar-foreground: 51.4 18.9% 7.3%;
 
   --success: 129.9 49.2% 36.3%;
+  --warning: 30 100% 30.2%;
   --danger: 4.2 76.5% 40%;
   --info: 224.3 76.3% 48%;
 
@@ -60,8 +61,33 @@
   --dl-accent-ring: #7a5c0066;
   --dl-bulk: #fff6cc;
   --dl-fail-soft: #b4231814;
+  --dl-on-fail: #ffffff;
+  --dl-warn-soft: #9a4d0014;
+  --dl-ok-soft: #2a753614;
+  --dl-queue-soft: #1d4ed814;
+  --dl-mark: #ffd60a80;
   --dl-switch-knob: #ffffff;
+  --dl-knob-off: #ffffff;
   --dl-scrollbar: #7a5c00;
+  --dl-scrim: rgba(22, 21, 15, 0.38);
+  --dl-shadow-dialog: 0 24px 64px rgba(22, 21, 15, 0.18), 0 2px 6px rgba(22, 21, 15, 0.08);
+  --dl-shadow-menu: 0 14px 40px rgba(22, 21, 15, 0.16);
+  --dl-shadow-panel: -18px 0 48px rgba(22, 21, 15, 0.16);
+
+  --dl-cat-violet-bg: #efe9ff;
+  --dl-cat-violet-fg: #5a3cc2;
+  --dl-cat-orange-bg: #fdeae2;
+  --dl-cat-orange-fg: #a8380e;
+  --dl-cat-green-bg: #e3f4e6;
+  --dl-cat-green-fg: #1f6b2c;
+  --dl-cat-blue-bg: #e3eefc;
+  --dl-cat-blue-fg: #1d4ed8;
+  --dl-cat-pink-bg: #fbe6f1;
+  --dl-cat-pink-fg: #a1235f;
+  --dl-cat-yellow-bg: #fff3c4;
+  --dl-cat-yellow-fg: #7a5c00;
+  --dl-cat-neutral-bg: #eeece4;
+  --dl-cat-neutral-fg: #47453c;
 
   --dl-kind-video-bg: #efe9ff;
   --dl-kind-video-fg: #5a3cc2;
@@ -104,6 +130,7 @@
   --sidebar-foreground: 60 23.1% 94.9%;
 
   --success: 135.4 58.5% 59.4%;
+  --warning: 37 91.3% 55.1%;
   --danger: 7.2 100% 73.9%;
   --info: 207 100% 74.3%;
 
@@ -124,8 +151,33 @@
   --dl-accent-ring: #ffd60a4d;
   --dl-bulk: #1b180a;
   --dl-fail-soft: #ff8a7a22;
+  --dl-on-fail: #0a0a0a;
+  --dl-warn-soft: #f5a5241f;
+  --dl-ok-soft: #5bd47a1f;
+  --dl-queue-soft: #7cc4ff1f;
+  --dl-mark: #ffd60a40;
   --dl-switch-knob: #0a0a0a;
+  --dl-knob-off: #d6d6cc;
   --dl-scrollbar: #ffd60a;
+  --dl-scrim: rgba(0, 0, 0, 0.62);
+  --dl-shadow-dialog: 0 24px 64px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.02);
+  --dl-shadow-menu: 0 14px 40px rgba(0, 0, 0, 0.5);
+  --dl-shadow-panel: -18px 0 48px rgba(0, 0, 0, 0.55);
+
+  --dl-cat-violet-bg: #211c33;
+  --dl-cat-violet-fg: #c9bcff;
+  --dl-cat-orange-bg: #2b1913;
+  --dl-cat-orange-fg: #ffa27f;
+  --dl-cat-green-bg: #122419;
+  --dl-cat-green-fg: #8fe0a6;
+  --dl-cat-blue-bg: #10202f;
+  --dl-cat-blue-fg: #8cc8ff;
+  --dl-cat-pink-bg: #2d1424;
+  --dl-cat-pink-fg: #ff9ccf;
+  --dl-cat-yellow-bg: #2a240a;
+  --dl-cat-yellow-fg: #ffd60a;
+  --dl-cat-neutral-bg: #1f1f1f;
+  --dl-cat-neutral-fg: #cfcfc6;
 
   --dl-kind-video-bg: #211c33;
   --dl-kind-video-fg: #c9bcff;
@@ -159,6 +211,16 @@
   --color-dl-accent-ring: var(--dl-accent-ring);
   --color-dl-bulk: var(--dl-bulk);
   --color-dl-fail-soft: var(--dl-fail-soft);
+  --color-dl-on-fail: var(--dl-on-fail);
+  --color-dl-warn-soft: var(--dl-warn-soft);
+  --color-dl-ok-soft: var(--dl-ok-soft);
+  --color-dl-queue-soft: var(--dl-queue-soft);
+  --color-dl-mark: var(--dl-mark);
+  --color-dl-knob-off: var(--dl-knob-off);
+  --color-dl-scrim: var(--dl-scrim);
+  --shadow-dl-dialog: var(--dl-shadow-dialog);
+  --shadow-dl-menu: var(--dl-shadow-menu);
+  --shadow-dl-panel: var(--dl-shadow-panel);
 }
 
 /* Geist replaces the app-wide Open Sans / JetBrains Mono / Merriweather
@@ -196,10 +258,66 @@
   border-radius: 3px;
 }
 
-/* The shared Switch has a white thumb; on the yellow track it needs the
-   dark knob from the design. */
-.dl-surface [role="switch"][data-state="checked"] > span {
-  background: var(--dl-switch-knob);
+/* Category tints: the icon tile in the sidebar, Settings and the category
+   dialogs. `currentColor` is the foreground of the pair. */
+.dl-cat-violet {
+  background: var(--dl-cat-violet-bg);
+  color: var(--dl-cat-violet-fg);
+}
+
+.dl-cat-orange {
+  background: var(--dl-cat-orange-bg);
+  color: var(--dl-cat-orange-fg);
+}
+
+.dl-cat-green {
+  background: var(--dl-cat-green-bg);
+  color: var(--dl-cat-green-fg);
+}
+
+.dl-cat-blue {
+  background: var(--dl-cat-blue-bg);
+  color: var(--dl-cat-blue-fg);
+}
+
+.dl-cat-pink {
+  background: var(--dl-cat-pink-bg);
+  color: var(--dl-cat-pink-fg);
+}
+
+.dl-cat-yellow {
+  background: var(--dl-cat-yellow-bg);
+  color: var(--dl-cat-yellow-fg);
+}
+
+.dl-cat-neutral {
+  background: var(--dl-cat-neutral-bg);
+  color: var(--dl-cat-neutral-fg);
+}
+
+/* A slow part: striped, so it reads without relying on colour alone. */
+.dl-stripes-warn {
+  background: repeating-linear-gradient(
+    135deg,
+    hsl(var(--warning)) 0 3px,
+    transparent 3px 7px
+  );
+}
+
+/* Native date and time fields inside a `Field`: drop the browser chrome so
+   the field's own border and icon are the only frame. */
+.dl-surface input[type="date"],
+.dl-surface input[type="time"] {
+  color-scheme: light;
+}
+
+.dark .dl-surface input[type="date"],
+.dark .dl-surface input[type="time"] {
+  color-scheme: dark;
+}
+
+.dl-surface input[type="search"]::-webkit-search-cancel-button {
+  appearance: none;
 }
 
 /* One column template for the header row and every list row; the list
